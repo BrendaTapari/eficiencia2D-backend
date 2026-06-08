@@ -1,1 +1,20 @@
 .env
+# Entornos virtuales
+venv/
+env/
+
+# Variables de entorno (¡Seguridad vital!)
+.env
+
+# Archivos temporales y de caché de Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Carpetas de nuestro proyecto que son basura temporal
+temp/
+
+# Archivos del sistema operativo
+.DS_Store
+Thumbs.db
