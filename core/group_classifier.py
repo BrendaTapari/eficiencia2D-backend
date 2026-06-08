@@ -4,7 +4,7 @@ from typing import List, Dict, Set, Optional, Literal, Tuple
 from dataclasses import dataclass
 
 # Importamos nuestros tipos y helpers
-from core.types import (
+from core.services.types import (
     Face3D,
     Vec3,
     cross,

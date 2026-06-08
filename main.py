@@ -1,29 +1,22 @@
-import os
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
-from api.routes import uploads
+# main.py
+from core.pipeline import parse_pipeline
+from core.services.obj_parser import parse_obj
 
-load_dotenv()
+def run_test():
+    file_name = "demo.obj"
+    with open(file_name, "r") as f:
+        text = f.read()
+    
+    # 1. Parsear el OBJ
+    parsed = parse_obj(text)
+    
+    # 2. Correr el pipeline con las caras obtenidas
+    # (Asegúrate de importar parse_pipeline de tu nuevo pipeline.py)
+    result = parse_pipeline(file_name, parsed["faces"], parsed["warnings"])
+    
+    print(f"Éxito: Se procesaron {len(result.groups)} grupos estructurales.")
+    for g in result.groups:
+        print(f"-> {g.label}: {g.total_area:.2f} m²")
 
-app = FastAPI(title="3D a 2D")
-
-FRONTEND_URL = os.getenv("FRONTEND_URL",)
-
-# Configuración del Middleware de CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[FRONTEND_URL],            # Permite peticiones solo desde los orígenes de la lista
-    allow_credentials=True,           # Permite el envío de cookies/tokens si fuera necesario
-    allow_methods=["*"],              # Permite todos los métodos HTTP (GET, POST, PUT, DELETE, etc.)
-    allow_headers=["*"],              # Permite todos los encabezados HTTP
-)
-
-app.include_router(uploads.router, prefix="/api", tags=["Procesamiento de Modelos"])
-
-@app.get("/")
-def read_root():
-    return {
-        "mensaje": "Servidor láser inicializado.",
-        "cors_configurado_para": FRONTEND_URL
-    }
+if __name__ == "__main__":
+    run_test()

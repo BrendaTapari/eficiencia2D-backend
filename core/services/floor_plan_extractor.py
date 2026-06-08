@@ -3,7 +3,15 @@ import numpy as np
 from typing import List, Dict, Tuple, Literal, Set, Optional
 
 # Importamos nuestros tipos y helpers vectoriales
-from types import Face3D, FloorPlan, FloorPlanSegment, Vec2, Vec3, cross, sub
+from core.services.types import (
+    Face3D,
+    FloorPlan,
+    FloorPlanSegment,
+    Vec2,
+    Vec3,
+    cross,
+    sub,
+)
 
 # Importamos el extractor de puertas
 from core.services.floor_extractor import is_door_group, extract_doors_for_level

@@ -3,7 +3,7 @@ from typing import List, Dict, Literal, Set, Optional
 from dataclasses import dataclass
 
 # Importamos nuestros tipos y helpers
-from types import Face3D, Vec3, ElementFilter, sub, cross, vlength
+from core.services.types import Face3D, Vec3, ElementFilter, sub, cross, vlength
 
 # ============================================================================
 # Geometry Classifier

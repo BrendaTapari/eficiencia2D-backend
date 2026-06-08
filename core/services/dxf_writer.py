@@ -1,5 +1,5 @@
 from typing import Dict, List
-from types import Facade, FloorPlan
+from core.services.types import Facade, FloorPlan
 
 # ============================================================================
 # DXF Writer

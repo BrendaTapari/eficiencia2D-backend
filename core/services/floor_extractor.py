@@ -3,7 +3,7 @@ import re
 from typing import List, Optional, Dict, Literal
 
 # Importamos los tipos y helpers matemáticos que creamos en types.py
-from types import Face3D, Vec2, Vec3, Door2D, sub, cross
+from core.services.types import Face3D, Vec2, Vec3, Door2D, sub, cross
 
 # ============================================================================
 # Constantes
