@@ -92,6 +92,9 @@ FRONTEND_URL=http://localhost:3000
 ```bash
 uvicorn main:app --reload
 ```
+```bash
+venv\Scripts\python.exe -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+```
 
 ---
 
