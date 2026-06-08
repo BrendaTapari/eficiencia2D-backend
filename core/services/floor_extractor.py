@@ -3,7 +3,7 @@ import re
 from typing import List, Optional, Dict, Literal
 
 # Importamos los tipos y helpers matemáticos que creamos en types.py
-from core.types import Face3D, Vec2, Vec3, Door2D, sub, cross
+from types import Face3D, Vec2, Vec3, Door2D, sub, cross
 
 # ============================================================================
 # Constantes
@@ -13,8 +13,8 @@ DOOR_NAME_PATTERN = re.compile(r"puerta|door|porta", re.IGNORECASE)
 HINGE_RIGHT_PATTERN = re.compile(r"_der|_right|_R\b", re.IGNORECASE)
 
 MAX_DOOR_THICKNESS = 0.30  # metros
-MIN_DOOR_WIDTH = 0.40      # metros
-MAX_DOOR_WIDTH = 3.0       # metros
+MIN_DOOR_WIDTH = 0.40  # metros
+MAX_DOOR_WIDTH = 3.0  # metros
 
 UpAxis = Literal["Y", "Z"]
 
@@ -22,21 +22,25 @@ UpAxis = Literal["Y", "Z"]
 # Helpers
 # ============================================================================
 
+
 def is_door_group(name: str) -> bool:
     """Verifica si el nombre de un grupo OBJ parece ser un componente de puerta."""
     return bool(DOOR_NAME_PATTERN.search(name))
 
+
 def get_up(v: Vec3, up: UpAxis) -> float:
     return v.y if up == "Y" else v.z
 
+
 def project_top_down(v: Vec3, up: UpAxis) -> Vec2:
     return Vec2(v.x, v.z) if up == "Y" else Vec2(v.x, v.y)
+
 
 def face_area(face: Face3D) -> float:
     verts = face.vertices
     if len(verts) < 3:
         return 0.0
-    
+
     sx, sy, sz = 0.0, 0.0, 0.0
     for i in range(1, len(verts) - 1):
         e1 = sub(verts[i], verts[0])
@@ -45,18 +49,17 @@ def face_area(face: Face3D) -> float:
         sx += c.x
         sy += c.y
         sz += c.z
-        
+
     return 0.5 * math.sqrt(sx**2 + sy**2 + sz**2)
+
 
 # ============================================================================
 # Análisis de Puerta Individual
 # ============================================================================
 
+
 def analyze_door_group(
-    group_name: str,
-    faces: List[Face3D],
-    cut_elev: float,
-    up: UpAxis
+    group_name: str, faces: List[Face3D], cut_elev: float, up: UpAxis
 ) -> Optional[Door2D]:
     """
     Analiza un grupo de caras que representan una sola puerta y devuelve su
@@ -68,10 +71,10 @@ def analyze_door_group(
     # --- ¿La puerta cruza la elevación de corte? ---
     all_verts = [v for face in faces for v in face.vertices]
     elevations = [get_up(v, up) for v in all_verts]
-    
+
     min_elev = min(elevations)
     max_elev = max(elevations)
-    
+
     if min_elev > cut_elev or max_elev < cut_elev:
         return None
 
@@ -115,12 +118,12 @@ def analyze_door_group(
         up_comp = abs(get_up(face.normal, up))
         if up_comp > 0.5:
             continue  # Saltar caras horizontales (piso/techo del marco)
-        
+
         area = face_area(face)
         if area > best_area:
             best_area = area
             best_normal = face.normal
-            
+
     if not best_normal:
         return None
 
@@ -129,7 +132,7 @@ def analyze_door_group(
     swing_len = math.sqrt(raw_swing.x**2 + raw_swing.y**2)
     if swing_len < 0.01:
         return None
-        
+
     swing_dir = Vec2(raw_swing.x / swing_len, raw_swing.y / swing_len)
 
     # --- Selección de bisagra ---
@@ -163,20 +166,19 @@ def analyze_door_group(
     # --- Punto final de la hoja (posición completamente abierta) ---
     swing_rad = math.radians(swing_angle_deg)
     leaf_end = Vec2(
-        hinge.x + width * math.cos(swing_rad),
-        hinge.y + width * math.sin(swing_rad)
+        hinge.x + width * math.cos(swing_rad), hinge.y + width * math.sin(swing_rad)
     )
 
     return Door2D(hinge, width, start_angle, end_angle, leaf_end)
+
 
 # ============================================================================
 # Extracción por Lote para un nivel de piso
 # ============================================================================
 
+
 def extract_doors_for_level(
-    door_faces_by_group: Dict[str, List[Face3D]],
-    cut_elev: float,
-    up: UpAxis
+    door_faces_by_group: Dict[str, List[Face3D]], cut_elev: float, up: UpAxis
 ) -> List[Door2D]:
     """
     Extrae entidades `Door2D` para una elevación de corte transversal dada.
@@ -186,5 +188,5 @@ def extract_doors_for_level(
         door = analyze_door_group(name, group_faces, cut_elev, up)
         if door:
             doors.append(door)
-            
+
     return doors
