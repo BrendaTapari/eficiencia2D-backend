@@ -212,5 +212,19 @@ def classify_and_filter(
             continue
 
         result.append(fi.face)
+    print(f"DEBUG: Se procesaron {len(infos)} caras.")
+    # Vamos a ver cuántas caras verticales está detectando realmente
+    verticals = [fi for fi in infos if fi.orientation == "vertical"]
+    print(f"DEBUG: Caras verticales encontradas: {len(verticals)}")
+    if len(verticals) > 0:
+        print(f"DEBUG: Normal de la primera cara vertical: {verticals[0].face.normal}")
+    for face in faces:
+        area = face_area(face)
+        if area < MIN_AREA: continue
 
+        abs_y = abs(face.normal.y)
+        # --- DIAGNÓSTICO AGRESIVO ---
+        if abs_y > 0.01: # Si no es perfectamente horizontal
+             print(f"DEBUG: Cara encontrada con normal.y = {face.normal.y}, área = {area}")
+        # -----------------------------
     return result

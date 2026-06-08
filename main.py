@@ -17,6 +17,7 @@ def run_test():
     print(f"Éxito: Se procesaron {len(result.groups)} grupos estructurales.")
     for g in result.groups:
         print(f"-> {g.label}: {g.total_area:.2f} m²")
+    
 
 if __name__ == "__main__":
     run_test()
