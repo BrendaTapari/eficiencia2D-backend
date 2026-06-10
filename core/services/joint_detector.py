@@ -1,8 +1,9 @@
 import math
+import time
+import logging
 from typing import List, Dict, Set, Tuple, Optional
 from dataclasses import dataclass, field
 
-# Importamos nuestros tipos (asegurate de tenerlos disponibles en core/types.py)
 from core.services.types import (
     Face3D,
     Vec3,
@@ -14,12 +15,13 @@ from core.services.types import (
 )
 from core.group_classifier import GeometryGroup
 
+logger = logging.getLogger("eficiencia2d.pipeline")
+
 # ============================================================================
-# Joint Detector
+# Joint Detector — Optimizado
 #
-# Identifica aristas compartidas entre grupos de geometría en el espacio 3D.
-# Una arista compartida significa que dos componentes se unen físicamente en
-# ese límite — una "unión" (joint) donde se deben tomar decisiones de ensamblaje.
+# Cambio clave: edge keys como tuplas de ints en vez de f-strings.
+# Para 1M de aristas esto ahorra millones de allocations de strings.
 # ============================================================================
 
 
@@ -31,29 +33,32 @@ class Joint:
     dihedral_angle: float
     edge_mid: Vec3
     edge_dir: Vec3
-    # Fracción de la longitud de la arista compartida que es aproximadamente horizontal (|dir.y|/|dir| <= 0.3)
     horizontal_frac: float
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers — edge keys como tuplas numéricas (mucho más rápido que strings)
 # ---------------------------------------------------------------------------
 
-
-def snap3(v: float) -> float:
-    return round(v * 100) / 100.0
+SNAP_FACTOR = 100  # resolución 1cm
 
 
-def edge_key_3d(
+def _snap_int(v: float) -> int:
+    return round(v * SNAP_FACTOR)
+
+
+def edge_key_numeric(
     ax: float, ay: float, az: float, bx: float, by: float, bz: float
-) -> str:
-    sax, say, saz = snap3(ax), snap3(ay), snap3(az)
-    sbx, sby, sbz = snap3(bx), snap3(by), snap3(bz)
-
-    # Lexicographical comparison logic
-    if sax < sbx or (sax == sbx and (say < sby or (say == sby and saz < sbz))):
-        return f"{sax},{say},{saz}|{sbx},{sby},{sbz}"
-    return f"{sbx},{sby},{sbz}|{sax},{say},{saz}"
+) -> Tuple[int, int, int, int, int, int]:
+    """
+    Clave de arista como tupla de 6 ints ordenada lexicográficamente.
+    Mucho más rápido que construir f-strings con redondeo de floats.
+    """
+    sax, say, saz = _snap_int(ax), _snap_int(ay), _snap_int(az)
+    sbx, sby, sbz = _snap_int(bx), _snap_int(by), _snap_int(bz)
+    if (sax, say, saz) <= (sbx, sby, sbz):
+        return (sax, say, saz, sbx, sby, sbz)
+    return (sbx, sby, sbz, sax, say, saz)
 
 
 def edge_length(a: Vec3, b: Vec3) -> float:
@@ -61,8 +66,9 @@ def edge_length(a: Vec3, b: Vec3) -> float:
     return math.sqrt(dx**2 + dy**2 + dz**2)
 
 
-def pair_key(a: int, b: int) -> str:
-    return f"{a}|{b}" if a < b else f"{b}|{a}"
+def pair_key(a: int, b: int) -> Tuple[int, int]:
+    """Clave de par como tupla (no string) — más rápido."""
+    return (a, b) if a < b else (b, a)
 
 
 # ---------------------------------------------------------------------------
@@ -87,12 +93,20 @@ class PairData:
 def detect_joints(faces: List[Face3D], groups: List[GeometryGroup]) -> List[Joint]:
     """
     Detecta uniones (aristas 3D compartidas) entre grupos de geometría.
-    Devuelve un Joint por par de grupos que comparten al menos una arista.
+    
+    Optimizaciones:
+    - Edge keys como tuplas de ints (sin f-strings)
+    - Pair keys como tuplas de ints
+    - Una sola pasada sobre edge_to_groups
     """
-    # edge_key -> set of group IDs
-    edge_to_groups: Dict[str, Set[int]] = {}
-    edge_lengths: Dict[str, float] = {}
-    edge_verts: Dict[str, Tuple[Vec3, Vec3]] = {}
+    t0 = time.perf_counter()
+
+    # edge_tuple → set de group IDs
+    edge_to_groups: Dict[Tuple, Set[int]] = {}
+    edge_lengths: Dict[Tuple, float] = {}
+    edge_verts: Dict[Tuple, Tuple[Vec3, Vec3]] = {}
+
+    total_edges = 0
 
     for group in groups:
         if group.category == "discard":
@@ -109,35 +123,44 @@ def detect_joints(faces: List[Face3D], groups: List[GeometryGroup]) -> List[Join
 
             for i in range(n_verts):
                 j = (i + 1) % n_verts
+                total_edges += 1
+
                 if vi:
-                    key = f"{vi[i]}|{vi[j]}" if vi[i] < vi[j] else f"{vi[j]}|{vi[i]}"
+                    # Usar índices numéricos directamente (mejor camino)
+                    a_idx, b_idx = vi[i], vi[j]
+                    key = (min(a_idx, b_idx), max(a_idx, b_idx), -1, -1, -1, -1)
                 else:
-                    key = edge_key_3d(
-                        verts[i].x,
-                        verts[i].y,
-                        verts[i].z,
-                        verts[j].x,
-                        verts[j].y,
-                        verts[j].z,
+                    key = edge_key_numeric(
+                        verts[i].x, verts[i].y, verts[i].z,
+                        verts[j].x, verts[j].y, verts[j].z,
                     )
 
-                if key in edge_to_groups:
-                    edge_to_groups[key].add(group.id)
+                gset = edge_to_groups.get(key)
+                if gset is not None:
+                    gset.add(group.id)
                 else:
                     edge_to_groups[key] = {group.id}
                     edge_lengths[key] = edge_length(verts[i], verts[j])
                     edge_verts[key] = (verts[i], verts[j])
 
-    # Recolectar longitudes de uniones + geometría de aristas por par de grupos
-    pair_data_map: Dict[str, PairData] = {}
+    t_edges = time.perf_counter()
+    logger.debug(
+        f"  detect_joints: {total_edges:,} aristas procesadas, "
+        f"{len(edge_to_groups):,} únicas — {(t_edges-t0)*1000:.1f} ms"
+    )
 
+    # Recolectar pares
+    pair_data_map: Dict[Tuple[int, int], PairData] = {}
+
+    shared_count = 0
     for key, group_ids in edge_to_groups.items():
         if len(group_ids) < 2:
             continue
+        shared_count += 1
 
         ids = list(group_ids)
         length = edge_lengths.get(key, 0.0)
-        verts = edge_verts.get(key)
+        ev = edge_verts.get(key)
 
         for i in range(len(ids)):
             for j in range(i + 1, len(ids)):
@@ -146,12 +169,17 @@ def detect_joints(faces: List[Face3D], groups: List[GeometryGroup]) -> List[Join
                 if not pd:
                     pd = PairData(groups=(ids[i], ids[j]))
                     pair_data_map[pk] = pd
-
                 pd.total_length += length
-                if verts:
-                    pd.edges.append(EdgeData(a=verts[0], b=verts[1], len=length))
+                if ev:
+                    pd.edges.append(EdgeData(a=ev[0], b=ev[1], len=length))
 
-    # Construir lookup normal representativa por grupo
+    t_pairs = time.perf_counter()
+    logger.debug(
+        f"  detect_joints: {shared_count:,} aristas compartidas, "
+        f"{len(pair_data_map)} pares — {(t_pairs-t_edges)*1000:.1f} ms"
+    )
+
+    # Construir joints
     group_normals: Dict[int, Vec3] = {g.id: g.representative_normal for g in groups}
 
     HORIZ_DIR_TOL = 0.3
@@ -170,7 +198,6 @@ def detect_joints(faces: List[Face3D], groups: List[GeometryGroup]) -> List[Join
             abs_dot = abs(dot(n_a, n_b))
             dihedral_angle = (math.acos(min(1.0, abs_dot)) * 180.0) / math.pi
 
-        # Punto medio ponderado y dirección dominante de las aristas compartidas
         mx, my, mz = 0.0, 0.0, 0.0
         horiz_len = 0.0
         longest_edge: Optional[EdgeData] = pd.edges[0] if pd.edges else None
@@ -218,4 +245,9 @@ def detect_joints(faces: List[Face3D], groups: List[GeometryGroup]) -> List[Join
         )
 
     joints.sort(key=lambda j: j.total_length, reverse=True)
+
+    total_ms = (time.perf_counter() - t0) * 1000
+    logger.info(
+        f"  detect_joints: {len(joints)} joints detectados en {total_ms:.1f} ms"
+    )
     return joints

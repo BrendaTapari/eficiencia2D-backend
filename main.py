@@ -1,4 +1,5 @@
 # main.py
+from api.main import app
 from core.pipeline import parse_pipeline
 from core.services.obj_parser import parse_obj
 
@@ -39,4 +40,5 @@ def run_test():
 
 
 if __name__ == "__main__":
-    run_test()
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

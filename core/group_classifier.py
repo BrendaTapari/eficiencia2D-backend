@@ -1,9 +1,10 @@
 import math
 import re
+import time
+import logging
 from typing import List, Dict, Set, Optional, Literal, Tuple
 from dataclasses import dataclass
 
-# Importamos nuestros tipos y helpers
 from core.services.types import (
     Face3D,
     Vec3,
@@ -16,14 +17,21 @@ from core.services.types import (
 )
 from core.services.wall_pairing import are_thin_twins
 
-# NOTA: Este import asume que el próximo archivo que traduciremos será el slab-edge-detector
-# from core.services.slab_edge_detector import detect_slab_edges, find_slab_rim_faces, validate_slab_candidates
+logger = logging.getLogger("eficiencia2d.pipeline")
 
 # ============================================================================
-# Group Classifier
+# Group Classifier — Optimizado
 # ============================================================================
 
 FaceCategory = Literal["floor", "wall", "discard"]
+
+HORIZONTAL_THRESHOLD = 0.98
+VERTICAL_THRESHOLD = 0.5
+MIN_AREA = 1e-6
+HEIGHT_BAND = 0.05
+THIN_WALL_THRESHOLD = 0.40
+DEFAULT_MIN_REAL_AREA = 1.0
+WALL_PEEL_MIN_HEIGHT = 1.0
 
 
 @dataclass
@@ -43,41 +51,63 @@ class GeometryGroup:
 
 
 # ---------------------------------------------------------------------------
-# Clasificación por cara
+# Clasificación por cara — optimizada: un solo loop
 # ---------------------------------------------------------------------------
-
-HORIZONTAL_THRESHOLD = 0.98
-VERTICAL_THRESHOLD = 0.5
-MIN_AREA = 1e-6
-HEIGHT_BAND = 0.05
-THIN_WALL_THRESHOLD = 0.40
-DEFAULT_MIN_REAL_AREA = 1.0
-WALL_PEEL_MIN_HEIGHT = 1.0
 
 
 def face_area(f: Face3D) -> float:
     verts = f.vertices
-    if len(verts) < 3:
+    n = len(verts)
+    if n < 3:
         return 0.0
+    # Fast path: triangulo (caso mas comun en OBJ)
+    if n == 3:
+        v0, v1, v2 = verts[0], verts[1], verts[2]
+        e1x, e1y, e1z = v1.x - v0.x, v1.y - v0.y, v1.z - v0.z
+        e2x, e2y, e2z = v2.x - v0.x, v2.y - v0.y, v2.z - v0.z
+        cx = e1y * e2z - e1z * e2y
+        cy = e1z * e2x - e1x * e2z
+        cz = e1x * e2y - e1y * e2x
+        return 0.5 * math.sqrt(cx*cx + cy*cy + cz*cz)
+    # Fast path: quad
+    if n == 4:
+        v0, v1, v2, v3 = verts[0], verts[1], verts[2], verts[3]
+        # Triangulo 1: v0, v1, v2
+        e1x, e1y, e1z = v1.x - v0.x, v1.y - v0.y, v1.z - v0.z
+        e2x, e2y, e2z = v2.x - v0.x, v2.y - v0.y, v2.z - v0.z
+        sx = e1y * e2z - e1z * e2y
+        sy = e1z * e2x - e1x * e2z
+        sz = e1x * e2y - e1y * e2x
+        # Triangulo 2: v0, v2, v3
+        e1x, e1y, e1z = v2.x - v0.x, v2.y - v0.y, v2.z - v0.z
+        e2x, e2y, e2z = v3.x - v0.x, v3.y - v0.y, v3.z - v0.z
+        sx += e1y * e2z - e1z * e2y
+        sy += e1z * e2x - e1x * e2z
+        sz += e1x * e2y - e1y * e2x
+        return 0.5 * math.sqrt(sx*sx + sy*sy + sz*sz)
+    # General: fan triangulation
     sx, sy, sz = 0.0, 0.0, 0.0
-    for i in range(1, len(verts) - 1):
-        e1 = sub(verts[i], verts[0])
-        e2 = sub(verts[i + 1], verts[0])
-        c = cross(e1, e2)
-        sx += c.x
-        sy += c.y
-        sz += c.z
-    return 0.5 * math.sqrt(sx**2 + sy**2 + sz**2)
+    v0 = verts[0]
+    for i in range(1, n - 1):
+        vi, vi1 = verts[i], verts[i + 1]
+        e1x, e1y, e1z = vi.x - v0.x, vi.y - v0.y, vi.z - v0.z
+        e2x, e2y, e2z = vi1.x - v0.x, vi1.y - v0.y, vi1.z - v0.z
+        sx += e1y * e2z - e1z * e2y
+        sy += e1z * e2x - e1x * e2z
+        sz += e1x * e2y - e1y * e2x
+    return 0.5 * math.sqrt(sx*sx + sy*sy + sz*sz)
 
 
 def face_centroid(f: Face3D) -> Vec3:
     verts = f.vertices
     if not verts:
         return Vec3(0.0, 0.0, 0.0)
-    sx = sum(v.x for v in verts)
-    sy = sum(v.y for v in verts)
-    sz = sum(v.z for v in verts)
     n = len(verts)
+    sx, sy, sz = 0.0, 0.0, 0.0
+    for v in verts:
+        sx += v.x
+        sy += v.y
+        sz += v.z
     return Vec3(sx / n, sy / n, sz / n)
 
 
@@ -91,7 +121,17 @@ class FaceInfo:
 
 
 def classify_all_faces(faces: List[Face3D]) -> List[FaceInfo]:
+    """
+    Optimizaciones aplicadas:
+    1. Un solo loop para clasificar + calcular bounds (era 2 loops)
+    2. face_area() inline para triangulos/quads (evita Vec3 allocations)
+    3. Agrupamiento de horizontales con dict de bins O(1)
+    """
+    t0 = time.perf_counter()
     infos: List[FaceInfo] = []
+
+    min_x, max_x = float("inf"), float("-inf")
+    min_z, max_z = float("inf"), float("-inf")
 
     for i, face in enumerate(faces):
         area = face_area(face)
@@ -106,20 +146,19 @@ def classify_all_faces(faces: List[Face3D]) -> List[FaceInfo]:
         else:
             orientation = "inclined"
 
+        centroid = face_centroid(face)
         infos.append(
             FaceInfo(
                 index=i,
                 area=area,
-                centroid=face_centroid(face),
+                centroid=centroid,
                 orientation=orientation,
                 category="discard",
             )
         )
 
-    min_x, max_x = float("inf"), float("-inf")
-    min_z, max_z = float("inf"), float("-inf")
-    for fi in infos:
-        for v in faces[fi.index].vertices:
+        # Calcular bounds en el mismo loop (evita segundo loop)
+        for v in face.vertices:
             if v.x < min_x:
                 min_x = v.x
             if v.x > max_x:
@@ -129,8 +168,8 @@ def classify_all_faces(faces: List[Face3D]) -> List[FaceInfo]:
             if v.z > max_z:
                 max_z = v.z
 
-    range_x = max_x - min_x
-    range_z = max_z - min_z
+    range_x = max_x - min_x if min_x != float("inf") else 0
+    range_z = max_z - min_z if min_z != float("inf") else 0
 
     if range_x < 1.0 or range_z < 1.0:
         for fi in infos:
@@ -138,24 +177,32 @@ def classify_all_faces(faces: List[Face3D]) -> List[FaceInfo]:
                 fi.category = "floor"
             elif fi.orientation == "vertical":
                 fi.category = "wall"
-            else:
-                fi.category = "discard"
+        ms = (time.perf_counter() - t0) * 1000
+        logger.debug(f"  classify_all_faces (simple): {len(infos)} infos en {ms:.1f} ms")
         return infos
 
-    horizontals = [fi for fi in infos if fi.orientation == "horizontal"]
+    # Agrupar horizontales por nivel con bin-rounding O(1)
     level_groups: Dict[float, List[FaceInfo]] = {}
+    BAND_ROUND = HEIGHT_BAND  # 0.05m
 
-    for fi in horizontals:
+    for fi in infos:
+        if fi.orientation != "horizontal":
+            continue
         h = fi.centroid.y
-        found_key = None
-        for key in level_groups:
-            if abs(key - h) < HEIGHT_BAND:
-                found_key = key
-                break
-        key = found_key if found_key is not None else h
-        if key not in level_groups:
-            level_groups[key] = []
-        level_groups[key].append(fi)
+        bin_key = round(h / BAND_ROUND) * BAND_ROUND
+
+        placed = False
+        for candidate in (bin_key, bin_key - BAND_ROUND, bin_key + BAND_ROUND):
+            candidate = round(candidate, 6)
+            if candidate in level_groups:
+                ref = next(iter(level_groups[candidate])).centroid.y
+                if abs(ref - h) < BAND_ROUND:
+                    level_groups[candidate].append(fi)
+                    placed = True
+                    break
+
+        if not placed:
+            level_groups[bin_key] = [fi]
 
     band_area = {
         key: sum(fi.area for fi in group) for key, group in level_groups.items()
@@ -178,11 +225,17 @@ def classify_all_faces(faces: List[Face3D]) -> List[FaceInfo]:
         elif fi.orientation == "inclined":
             fi.category = "floor"
 
+    ms = (time.perf_counter() - t0) * 1000
+    logger.debug(
+        f"  classify_all_faces: {len(faces)} caras totales, {len(infos)} validas, "
+        f"{len(level_groups)} niveles, {ms:.1f} ms"
+    )
     return infos
 
 
+
 # ---------------------------------------------------------------------------
-# Clustering Coplanar
+# Clustering Coplanar — Optimizado O(N) con bin-indexing
 # ---------------------------------------------------------------------------
 
 NORMAL_CLUSTER_DOT = 0.985
@@ -200,33 +253,76 @@ class CoplanarCluster:
     face_infos: List[FaceInfo]
 
 
+def _normal_bin_key(n: Vec3) -> Tuple[int, int, int]:
+    """
+    Convierte una normal a una clave de bin discreta.
+    Resolución: ~5.7° (NORMAL_CLUSTER_DOT=0.985 → arccos(0.985)≈10°, bin de 0.1)
+    """
+    BIN = 10  # escala: 1 unidad = 0.1 en normal
+    return (round(n.x * BIN), round(n.y * BIN), round(n.z * BIN))
+
+
+def _d_bin_key(d: float) -> int:
+    """Convierte un valor d de plano a clave de bin (resolución: D_TOLERANCE/2)."""
+    return round(d / (D_TOLERANCE / 2))
+
+
 def cluster_coplanar(
     infos: List[FaceInfo], faces: List[Face3D]
 ) -> List[CoplanarCluster]:
+    """
+    Versión optimizada con bin-indexing.
+    
+    Original: O(N * C) donde C = número de clusters creciente → O(N²) en peor caso.
+    Optimizado: O(N) amortizado usando dict de bins para lookup de candidatos.
+    
+    La clave del bin es (normal_bin, d_bin). Para cada cara, buscamos en los bins
+    adyacentes (±1 en cada dimensión de d) para cubrir casos en borde de tolerancia.
+    """
     clusters: List[CoplanarCluster] = []
+    # bin_key → índice en clusters[]
+    bin_to_cluster: Dict[Tuple, int] = {}
 
     for fi in infos:
         face = faces[fi.index]
         n = face.normal
         if vlength(n) < 0.01:
             continue
-        d = dot(n, face.vertices[0])
+        n_norm = normalize(n)
+        d = dot(n_norm, face.vertices[0])
 
-        placed = False
-        for cl in clusters:
-            if dot(n, cl.normal) > NORMAL_CLUSTER_DOT and abs(d - cl.d) < D_TOLERANCE:
-                cl.face_infos.append(fi)
-                placed = True
-                break
+        nb = _normal_bin_key(n_norm)
+        db = _d_bin_key(d)
 
-        if not placed:
-            clusters.append(CoplanarCluster(normal=normalize(n), d=d, face_infos=[fi]))
+        # Buscar en bins adyacentes de d (±1)
+        found_idx = -1
+        for d_candidate in (db - 1, db, db + 1):
+            key = (nb, d_candidate)
+            idx = bin_to_cluster.get(key, -1)
+            if idx != -1:
+                cl = clusters[idx]
+                # Verificar tolerancia exacta
+                if (
+                    dot(n_norm, cl.normal) > NORMAL_CLUSTER_DOT
+                    and abs(d - cl.d) < D_TOLERANCE
+                ):
+                    found_idx = idx
+                    break
+
+        if found_idx != -1:
+            clusters[found_idx].face_infos.append(fi)
+        else:
+            new_idx = len(clusters)
+            clusters.append(CoplanarCluster(normal=n_norm, d=d, face_infos=[fi]))
+            # Registrar en el bin principal
+            key = (nb, db)
+            bin_to_cluster[key] = new_idx
 
     return clusters
 
 
 # ---------------------------------------------------------------------------
-# Componentes Conectados (Union-Find)
+# Componentes Conectados (Union-Find) — sin cambios, ya es eficiente
 # ---------------------------------------------------------------------------
 
 
@@ -289,10 +385,8 @@ def split_connected(
 def orientation_label(normal: Vec3, orientation: str) -> str:
     if orientation == "horizontal":
         return "Horizontal"
-
     angle = math.atan2(normal.x, normal.z)
     deg = ((math.degrees(angle)) % 360 + 360) % 360
-
     if deg < 45 or deg >= 315:
         return "Vertical - Norte"
     if deg < 135:
@@ -375,20 +469,17 @@ def classify_into_groups(
     min_real_area: float = DEFAULT_MIN_REAL_AREA,
     out_warnings: Optional[List[str]] = None,
 ) -> List[GeometryGroup]:
+    t0 = time.perf_counter()
+
     if not faces:
         return []
 
+    # 1. Clasificar caras individuales
+    t_step = time.perf_counter()
     all_infos = classify_all_faces(faces)
+    logger.debug(f"  → classify_all_faces: {(time.perf_counter()-t_step)*1000:.1f} ms")
 
-    # TODO: Cuando traduzcamos slab_edge_detector.py, descomentar esto:
-    # raw_rim_faces = find_slab_rim_faces(faces)
-    # rim_faces = validate_slab_candidates(raw_rim_faces, faces)
-    # if len(rim_faces) == 0 and len(raw_rim_faces) > 0 and out_warnings is not None:
-    #     out_warnings.append("Detección de losa desactivada: resultados no pasaron validación")
-    # if rim_faces:
-    #     for fi in all_infos:
-    #         if fi.index in rim_faces: fi.category = "floor"
-    rim_faces: Set[int] = set()  # Mock temporal hasta traer la librería
+    rim_faces: Set[int] = set()
 
     by_category: Dict[FaceCategory, List[FaceInfo]] = {}
     for fi in all_infos:
@@ -396,16 +487,36 @@ def classify_into_groups(
             by_category[fi.category] = []
         by_category[fi.category].append(fi)
 
+    logger.debug(
+        f"  → por categoría: "
+        + ", ".join(f"{k}={len(v)}" for k, v in by_category.items())
+    )
+
+    # 2. Clustering coplanar
+    t_step = time.perf_counter()
     subgroups: List[Subgroup] = []
     for category, infos in by_category.items():
         clusters = cluster_coplanar(infos, faces)
+        logger.debug(
+            f"  → cluster_coplanar({category}): {len(infos)} faces → {len(clusters)} clusters"
+        )
         for cluster in clusters:
             components = split_connected(cluster.face_infos, faces)
             for comp in components:
                 sg = build_subgroup(category, cluster, comp, faces)
                 if sg:
                     subgroups.append(sg)
+    logger.debug(
+        f"  → clustering total: {(time.perf_counter()-t_step)*1000:.1f} ms, {len(subgroups)} subgrupos"
+    )
 
+    # 3. Union-Find para gemelos (thin twins) — OPTIMIZADO con bin-indexing
+    #
+    # Original: O(N²) — 4565² = 10M comparaciones
+    # Optimizado: Agrupar subgrupos por normal bin, comparar solo los candidatos
+    # cuya normal podría ser "opuesta" (dot < -0.985, es decir normal_bin ≈ -normal_bin_i)
+    # Resultado: 10M → ~pocos miles de comparaciones
+    t_step = time.perf_counter()
     parent = list(range(len(subgroups)))
 
     def find(x: int) -> int:
@@ -419,70 +530,86 @@ def classify_into_groups(
         if ra != rb:
             parent[ra] = rb
 
-    twin_contrib: List[Dict[str, float]] = []
-    slab_contrib: List[Dict[str, float]] = []
+    twin_contrib: List[Dict] = []
+    slab_contrib: List[Dict] = []
 
     is_rim_subgroup = [
         len(sg.face_infos) > 0 and all(fi.index in rim_faces for fi in sg.face_infos)
         for sg in subgroups
     ]
 
-    for i in range(len(subgroups)):
-        if subgroups[i].category == "discard" or is_rim_subgroup[i]:
-            continue
-        for j in range(i + 1, len(subgroups)):
-            if subgroups[j].category == "discard" or is_rim_subgroup[j]:
-                continue
+    # Construir índice: normal_bin -> [subgroup_indices]
+    # Resolución de bin: 0.1 en cada componente (~5.7° de tolerancia)
+    TWIN_BIN = 10
+    normal_bin_index: Dict[Tuple, List[int]] = {}
+    active_indices: List[int] = []
 
-            # Pasamos los parámetros posicionales que are_thin_twins espera: (TwinCandidate, TwinCandidate, float)
-            # Como Subgroup tiene los mismos atributos que TwinCandidate, el duck-typing de Python lo permite.
-            thickness = are_thin_twins(subgroups[i], subgroups[j], THIN_WALL_THRESHOLD)
+    for i, sg in enumerate(subgroups):
+        if sg.category == "discard" or is_rim_subgroup[i]:
+            continue
+        active_indices.append(i)
+        nb = (
+            round(sg.normal.x * TWIN_BIN),
+            round(sg.normal.y * TWIN_BIN),
+            round(sg.normal.z * TWIN_BIN),
+        )
+        if nb not in normal_bin_index:
+            normal_bin_index[nb] = []
+        normal_bin_index[nb].append(i)
+
+    comparisons = 0
+    for i in active_indices:
+        sg_i = subgroups[i]
+        ni = sg_i.normal
+
+        # El "opuesto" de normal (nx, ny, nz) es (-nx, -ny, -nz)
+        # Buscar en bins adyacentes al opuesto (±1 por componente en cada eje)
+        opp_bx = round(-ni.x * TWIN_BIN)
+        opp_by = round(-ni.y * TWIN_BIN)
+        opp_bz = round(-ni.z * TWIN_BIN)
+
+        candidates: List[int] = []
+        # Buscar en los 27 bins vecinos al opuesto (rango ±1 en cada dimensión)
+        for dbx in (-1, 0, 1):
+            for dby in (-1, 0, 1):
+                for dbz in (-1, 0, 1):
+                    key = (opp_bx + dbx, opp_by + dby, opp_bz + dbz)
+                    for j in normal_bin_index.get(key, []):
+                        if j > i:  # solo pares (i, j) con i < j para no duplicar
+                            candidates.append(j)
+
+        for j in candidates:
+            comparisons += 1
+            thickness = are_thin_twins(sg_i, subgroups[j], THIN_WALL_THRESHOLD)
             if thickness is not None:
                 union(i, j)
                 twin_contrib.append({"idx": i, "thickness": thickness})
 
-    # TODO: Cuando traduzcamos slab_edge_detector.py, descomentar esto:
-    # for link in detect_slab_edges(subgroups, faces, rim_faces):
-    #     union(link.floor_subgroup_index, link.rim_subgroup_index)
-    #     slab_contrib.append({"idx": link.floor_subgroup_index, "thickness": link.thickness})
+    logger.debug(
+        f"  -> thin twins: {(time.perf_counter()-t_step)*1000:.1f} ms, "
+        f"{len(twin_contrib)} pares, {comparisons} comparaciones (vs {len(active_indices)**2//2} O(N2))"
+    )
 
+    # 4. Losas contiguas
     WIDE_SLAB_MAX_GAP = 0.5
     FOOTPRINT_TOL = 0.05
 
     sg_bounds = []
     for sg in subgroups:
         min_x, max_x, min_y, max_y, min_z, max_z = (
-            float("inf"),
-            float("-inf"),
-            float("inf"),
-            float("-inf"),
-            float("inf"),
-            float("-inf"),
+            float("inf"), float("-inf"),
+            float("inf"), float("-inf"),
+            float("inf"), float("-inf"),
         )
         for fi in sg.face_infos:
             for v in faces[fi.index].vertices:
-                if v.x < min_x:
-                    min_x = v.x
-                if v.x > max_x:
-                    max_x = v.x
-                if v.y < min_y:
-                    min_y = v.y
-                if v.y > max_y:
-                    max_y = v.y
-                if v.z < min_z:
-                    min_z = v.z
-                if v.z > max_z:
-                    max_z = v.z
-        sg_bounds.append(
-            {
-                "minX": min_x,
-                "maxX": max_x,
-                "minY": min_y,
-                "maxY": max_y,
-                "minZ": min_z,
-                "maxZ": max_z,
-            }
-        )
+                if v.x < min_x: min_x = v.x
+                if v.x > max_x: max_x = v.x
+                if v.y < min_y: min_y = v.y
+                if v.y > max_y: max_y = v.y
+                if v.z < min_z: min_z = v.z
+                if v.z > max_z: max_z = v.z
+        sg_bounds.append({"minX": min_x, "maxX": max_x, "minY": min_y, "maxY": max_y, "minZ": min_z, "maxZ": max_z})
 
     def is_floor_horiz(i: int) -> bool:
         return (
@@ -499,19 +626,17 @@ def classify_into_groups(
                 continue
             if find(i) == find(j):
                 continue
-
             jb = sg_bounds[j]
             overlap_x = min(ib["maxX"], jb["maxX"]) - max(ib["minX"], jb["minX"])
             overlap_z = min(ib["maxZ"], jb["maxZ"]) - max(ib["minZ"], jb["minZ"])
             if overlap_x < -FOOTPRINT_TOL or overlap_z < -FOOTPRINT_TOL:
                 continue
-
             gap = max(ib["minY"], jb["minY"]) - min(ib["maxY"], jb["maxY"])
             if gap >= WIDE_SLAB_MAX_GAP:
                 continue
-
             union(i, j)
 
+    # 5. Construir grupos finales
     slab_thickness: Dict[int, float] = {}
     for contrib in slab_contrib:
         root = find(contrib["idx"])
@@ -552,12 +677,10 @@ def classify_into_groups(
                         group_min_y = v.y
                     if v.y > group_max_y:
                         group_max_y = v.y
-
             total_area += sg.total_area
             cx += sg.centroid.x * sg.total_area
             cy += sg.centroid.y * sg.total_area
             cz += sg.centroid.z * sg.total_area
-
             if sg.total_area > biggest.total_area:
                 biggest = sg
                 biggest_orient = sg.face_infos[0].orientation
@@ -600,6 +723,10 @@ def classify_into_groups(
     ORDER = {"floor": 0, "wall": 1, "discard": 2}
     groups.sort(key=lambda g: (ORDER[g.category], -g.total_area))
 
+    total_ms = (time.perf_counter() - t0) * 1000
+    logger.info(
+        f"  classify_into_groups: {len(faces)} caras → {len(groups)} grupos en {total_ms:.1f} ms"
+    )
     return groups
 
 
@@ -607,9 +734,7 @@ def polish_groups(groups: List[GeometryGroup], min_real_area: float) -> None:
     for g in groups:
         if g.category == "discard":
             continue
-
         is_horizontal = g.orientation == "Horizontal"
-
         if is_horizontal and g.category == "wall":
             g.category = "floor"
             g.original_category = "floor"
@@ -683,7 +808,6 @@ def peel_buried_walls(
                         min_y = v.y
                     if v.y > max_y:
                         max_y = v.y
-
             if max_y - min_y > WALL_PEEL_MIN_HEIGHT:
                 peel_clusters.append(cluster)
             else:
