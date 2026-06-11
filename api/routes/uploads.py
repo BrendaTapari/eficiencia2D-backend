@@ -157,20 +157,13 @@ async def upload_model(file: UploadFile = File(...)):
         file_size_mb = total_bytes / 1024 / 1024
         logger.info(f"[upload] Archivo recibido: {file.filename} ({file_size_mb:.2f} MB)")
 
-        # --- Paso 2: Leer para parseo (desde disco, sin duplicar en RAM como antes) ---
-        with timer.step("read_file_for_parsing", size_mb=round(file_size_mb, 2)):
-            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                text_content = f.read()
-
-        # --- Paso 3: Parseo OBJ ---
+        # --- Paso 2+3: Parseo OBJ en streaming (sin cargar el archivo entero en RAM) ---
         with timer.step("parse_obj", size_mb=round(file_size_mb, 2)):
-            parsed = parse_obj(text_content)
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                parsed = parse_obj(f)
 
         face_count = len(parsed["faces"])
         logger.info(f"[upload] Caras parseadas: {face_count:,}")
-
-        # Liberar el string grande de memoria lo antes posible
-        del text_content
 
         # --- Paso 4: Pipeline completo ---
         with timer.step("parse_pipeline", face_count=face_count):
@@ -214,8 +207,6 @@ async def upload_model(file: UploadFile = File(...)):
                 "applied_axis": result.applied_axis,
                 "pre_split_face_count": result.pre_split_face_count,
                 "suggested_merges": result.suggested_merges,
-                "faces": [dataclasses.asdict(f) for f in result.faces],
-                "raw_faces": [dataclasses.asdict(f) for f in result.raw_faces],
             },
             "preview_obj": preview_obj,
             "timing": timing_report,  # Debug: reporte de timing
@@ -257,13 +248,9 @@ async def generate_pdf_endpoint(request: GenerateRequest):
             raise HTTPException(status_code=404, detail="Archivo no encontrado. Por favor sube el archivo nuevamente.")
 
         try:
-            with timer.step("read_file_fallback"):
-                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                    text_content = f.read()
-
             with timer.step("parse_obj_fallback"):
-                parsed = parse_obj(text_content)
-            del text_content
+                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                    parsed = parse_obj(f)
 
             with timer.step("parse_pipeline_fallback"):
                 phase1 = parse_pipeline(request.original_filename, parsed["faces"], parsed["warnings"])
