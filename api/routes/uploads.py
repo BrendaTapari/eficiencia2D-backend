@@ -2,11 +2,13 @@ import os
 import uuid
 import gzip
 import time
+import array
+import base64
 import pickle
 import shutil
 import logging
 import dataclasses
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from pydantic import BaseModel
 from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -27,6 +29,63 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 # Límite configurable (500 MB)
 MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024
 CHUNK_SIZE = 1024 * 1024  # 1 MB por chunk
+
+
+# ---------------------------------------------------------------------------
+# Codificación compacta de geometría (buffers binarios + base64)
+#
+# Serializar las caras como dicts (dataclasses.asdict) genera millones de
+# objetos y revienta la RAM (MemoryError) en modelos grandes. En su lugar
+# empaquetamos la geometría en buffers planos little-endian:
+#   - coords:        Float32  (x,y,z por cada vértice de cada cara, en orden)
+#   - normals:       Float32  (nx,ny,nz por cara)
+#   - vertex_counts: UInt32   (cantidad de vértices por cara)
+#   - idx_counts:    UInt32   (cantidad de vertex_indices por cara, 0 si no hay)
+#   - indices:       UInt32   (vertex_indices concatenados)
+# El front los decodifica a Face3D[] con un adaptador chico (Float32Array/…).
+# inner_loops y panel_id se omiten: en este pipeline siempre son [] / None,
+# y el front los reconstruye como vacíos.
+# ---------------------------------------------------------------------------
+
+def encode_faces_compact(faces: List) -> Dict:
+    coords = array.array("f")
+    normals = array.array("f")
+    vertex_counts = array.array("I")
+    idx_counts = array.array("I")
+    indices = array.array("I")
+
+    coords_append = coords.append
+    for f in faces:
+        verts = f.vertices
+        vertex_counts.append(len(verts))
+        for v in verts:
+            coords_append(v.x)
+            coords_append(v.y)
+            coords_append(v.z)
+        n = f.normal
+        normals.append(n.x)
+        normals.append(n.y)
+        normals.append(n.z)
+        vi = getattr(f, "vertex_indices", None)
+        if vi and len(vi) == len(verts):
+            idx_counts.append(len(vi))
+            for k in vi:
+                indices.append(k)
+        else:
+            idx_counts.append(0)
+
+    def b64(a: array.array) -> str:
+        return base64.b64encode(a.tobytes()).decode("ascii")
+
+    return {
+        "count": len(faces),
+        "format": "packed-le-v1",
+        "vertex_counts_b64": b64(vertex_counts),
+        "coords_b64": b64(coords),
+        "normals_b64": b64(normals),
+        "idx_counts_b64": b64(idx_counts),
+        "indices_b64": b64(indices),
+    }
 
 
 class GenerateRequest(BaseModel):
@@ -213,10 +272,10 @@ async def upload_model(
                 "applied_axis": result.applied_axis,
                 "pre_split_face_count": result.pre_split_face_count,
                 "suggested_merges": result.suggested_merges,
-                # El front necesita la geometría completa: ModelViewer 3D y el
-                # pipeline TS reactivo (decomposePanels, reclassifyWithAxis) la consumen.
-                "faces": [dataclasses.asdict(f) for f in result.faces],
-                "raw_faces": [dataclasses.asdict(f) for f in result.raw_faces],
+                # Geometría empaquetada en buffers binarios (ver encode_faces_compact).
+                # El front la decodifica a Face3D[] (faces) y rawFaces.
+                "faces_packed": encode_faces_compact(result.faces),
+                "raw_faces_packed": encode_faces_compact(result.raw_faces),
             },
             "preview_obj": preview_obj,
             "timing": timing_report,  # Debug: reporte de timing
