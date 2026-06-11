@@ -8,7 +8,7 @@ import logging
 import dataclasses
 from typing import Dict, Optional
 from pydantic import BaseModel
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 
 from core.profiler import PipelineTimer
@@ -124,7 +124,10 @@ def export_colored_obj(groups, faces) -> str:
 # ---------------------------------------------------------------------------
 
 @router.post("/upload")
-async def upload_model(file: UploadFile = File(...)):
+async def upload_model(
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None,
+):
     timer = PipelineTimer("upload_endpoint")
 
     extensiones_permitidas = ('.stl', '.obj')
@@ -169,9 +172,12 @@ async def upload_model(file: UploadFile = File(...)):
         with timer.step("parse_pipeline", face_count=face_count):
             result = parse_pipeline(file.filename, parsed["faces"], parsed["warnings"])
 
-        # --- Paso 5: Guardar caché de Phase1 en disco ---
-        with timer.step("save_phase1_cache"):
-            save_phase1_cache(file_id, result)
+        # --- Paso 5: Guardar caché de Phase1 en disco (en segundo plano) ---
+        # El pickle de las caras es costoso (~10-18s) y la respuesta no lo necesita.
+        # Starlette ejecuta las background tasks síncronas en un threadpool, así que
+        # /upload responde de inmediato y el caché se escribe después. Si /generate
+        # llega antes de que termine, su fallback re-procesa el OBJ.
+        background_tasks.add_task(save_phase1_cache, file_id, result)
 
         # --- Paso 6: Generar preview OBJ (limitado) ---
         with timer.step("export_colored_obj_preview"):
