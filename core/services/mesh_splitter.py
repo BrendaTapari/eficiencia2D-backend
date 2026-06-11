@@ -2,8 +2,10 @@ import math
 from typing import List, Dict, Tuple, Literal, Any, Optional
 from dataclasses import dataclass
 
+from shapely.geometry import Polygon, MultiPolygon, box
+
 # Importamos nuestros tipos (asegurate de tenerlos disponibles en core/types.py)
-from core.services.types import Face3D, Vec3
+from core.services.types import Face3D, Vec3, cross, dot, normalize, vlength
 
 # Importamos el GeometryGroup de group_classifier (usamos TYPE_CHECKING para evitar circular imports si es necesario)
 from core.group_classifier import GeometryGroup, DEFAULT_MIN_REAL_AREA
@@ -69,6 +71,123 @@ def clip_polygon(
     return result
 
 
+def _inplane_basis(face: Face3D, up: UpAxis) -> Optional[Tuple[Vec3, Vec3]]:
+    """
+    Construye una base 2D (U, V) en el plano de la cara, con V alineado con la
+    dirección vertical proyectada al plano. Así la coordenada vertical (up) es
+    función SOLO de v, y "arriba/abajo de la elevación" es un semiplano horizontal
+    en (u, v). Retorna None si la cara es ~horizontal (no debería llegar al caso de
+    cruce).
+    """
+    wu = Vec3(0.0, 1.0, 0.0) if up == "Y" else Vec3(0.0, 0.0, 1.0)
+    n = normalize(face.normal)
+    d = dot(wu, n)
+    v_ip = Vec3(wu.x - d * n.x, wu.y - d * n.y, wu.z - d * n.z)
+    if vlength(v_ip) < 1e-9:
+        return None
+    V = normalize(v_ip)
+    U = cross(n, V)
+    if vlength(U) < 1e-9:
+        return None
+    return normalize(U), V
+
+
+def clip_face_pieces(
+    face: Face3D, elevation: float, up: UpAxis, keep_above: bool, tolerance: float
+) -> List[List[Vec3]]:
+    """
+    Recorta una cara plana contra el plano horizontal `elevation`, conservando el
+    lado pedido, y devuelve UNA O MÁS piezas (anillos de Vec3).
+
+    A diferencia de Sutherland-Hodgman (`clip_polygon`), este recorte respeta las
+    caras CÓNCAVAS: si el lado conservado queda partido en varias piezas (p. ej. un
+    muro con una abertura), las devuelve separadas en vez de puentear la concavidad
+    a la altura del corte (que generaba caras espurias rellenando los huecos).
+    """
+    basis = _inplane_basis(face, up)
+    if basis is None:
+        ring = clip_polygon(face.vertices, elevation, up, keep_above, tolerance)
+        return [ring] if len(ring) >= 3 else []
+
+    U, V = basis
+    origin = face.vertices[0]
+
+    pts2d: List[Tuple[float, float]] = []
+    for p in face.vertices:
+        dx, dy, dz = p.x - origin.x, p.y - origin.y, p.z - origin.z
+        u = dx * U.x + dy * U.y + dz * U.z
+        v = dx * V.x + dy * V.y + dz * V.z
+        pts2d.append((u, v))
+
+    try:
+        poly = Polygon(pts2d)
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+    except Exception:
+        return []
+    if poly.is_empty:
+        return []
+
+    # up_val(P) = origin.up + v * V.up  ->  recta de corte v = v_cut
+    v_up = get_up_val(V, up)
+    if abs(v_up) < 1e-12:
+        return []
+    v_cut = (elevation - get_up_val(origin, up)) / v_up
+
+    us = [p[0] for p in pts2d]
+    vs = [p[1] for p in pts2d]
+    pad = max(max(us) - min(us), max(vs) - min(vs), 1.0) + 1.0
+    u_lo, u_hi = min(us) - pad, max(us) + pad
+
+    # Si v_up > 0, mayor v = más arriba. keep_above => v >= v_cut (y viceversa).
+    keep_high_v = keep_above if v_up > 0 else (not keep_above)
+    if keep_high_v:
+        clip_box = box(u_lo, v_cut, u_hi, max(vs) + pad)
+    else:
+        clip_box = box(u_lo, min(vs) - pad, u_hi, v_cut)
+
+    try:
+        clipped = poly.intersection(clip_box)
+    except Exception:
+        return []
+
+    rings: List[List[Vec3]] = []
+
+    def emit(pg: Polygon) -> None:
+        if pg.is_empty or pg.area < 1e-9:
+            return
+        coords = list(pg.exterior.coords)
+        if len(coords) > 1 and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if len(coords) < 3:
+            return
+        ring = [
+            Vec3(
+                origin.x + u * U.x + v * V.x,
+                origin.y + u * U.y + v * V.y,
+                origin.z + u * U.z + v * V.z,
+            )
+            for (u, v) in coords
+        ]
+        rings.append(ring)
+
+    gt = clipped.geom_type
+    if gt == "Polygon":
+        emit(clipped)
+    elif gt == "MultiPolygon":
+        for g in clipped.geoms:
+            emit(g)
+    elif gt == "GeometryCollection":
+        for g in clipped.geoms:
+            if g.geom_type == "Polygon":
+                emit(g)
+            elif g.geom_type == "MultiPolygon":
+                for gg in g.geoms:
+                    emit(gg)
+
+    return rings
+
+
 def split_faces_at_plane(
     faces: List[Face3D], elevation: float, up: UpAxis = "Y", tolerance: float = 0.01
 ) -> SplitResult:
@@ -92,29 +211,28 @@ def split_faces_at_plane(
             above.append(face)
             below.append(face)
         else:
-            # La cara cruza el plano — recortarla.
-            above_verts = clip_polygon(face.vertices, elevation, up, True, tolerance)
-            below_verts = clip_polygon(face.vertices, elevation, up, False, tolerance)
-
-            # Usamos un truco simple para crear una nueva cara preservando propiedades viejas
-            # (En el caso del TypeScript destructurabas properties, aquí las clonamos)
-            if len(above_verts) >= 3:
-                new_above = Face3D(
-                    vertices=above_verts,
-                    normal=face.normal,
-                    inner_loops=[],  # Los innerLoops no se preservan en el recorte simple
-                    panel_id=face.panel_id,
-                )
-                above.append(new_above)
-
-            if len(below_verts) >= 3:
-                new_below = Face3D(
-                    vertices=below_verts,
-                    normal=face.normal,
-                    inner_loops=[],
-                    panel_id=face.panel_id,
-                )
-                below.append(new_below)
+            # La cara cruza el plano — recortarla con el recorte robusto, que
+            # respeta concavidades y puede devolver varias piezas por lado.
+            for ring in clip_face_pieces(face, elevation, up, True, tolerance):
+                if len(ring) >= 3:
+                    above.append(
+                        Face3D(
+                            vertices=ring,
+                            normal=face.normal,
+                            inner_loops=[],
+                            panel_id=face.panel_id,
+                        )
+                    )
+            for ring in clip_face_pieces(face, elevation, up, False, tolerance):
+                if len(ring) >= 3:
+                    below.append(
+                        Face3D(
+                            vertices=ring,
+                            normal=face.normal,
+                            inner_loops=[],
+                            panel_id=face.panel_id,
+                        )
+                    )
 
     return SplitResult(above=above, below=below)
 
