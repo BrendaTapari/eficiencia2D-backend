@@ -29,7 +29,7 @@ app = FastAPI(
 # Si no hay orígenes configurados, se usa "*" SIN credenciales (allow_credentials
 # y allow_origins=["*"] son incompatibles según la especificación CORS).
 def _resolve_cors_origins() -> list[str]:
-    raw = os.environ.get("ALLOWED_ORIGINS") or os.environ.get("FRONTEND_URL", "")
+    raw = os.environ.get("ALLOWED_ORIGINS") or os.environ.get("FRONTEND_URL", "", "FRONTEND_URL_VERCEL")
     origins = [o.strip() for o in raw.split(",") if o.strip()]
     return origins
 
@@ -65,4 +65,4 @@ def read_root():
 # Para correr localmente para pruebas sin la línea de comandos
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("api.main:app", host="0.0.0.0", port=8081, reload=True)
