@@ -1,44 +1,61 @@
-# main.py
-from api.main import app
-from core.pipeline import parse_pipeline
-from core.services.obj_parser import parse_obj
+import os
+import logging
 
+from dotenv import load_dotenv
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-def run_test():
-    file_name = "demo.obj"
-    print(f"[1/3] Leyendo archivo: {file_name}")
-    with open(file_name, "r") as f:
-        text = f.read()
+# Cargar variables de entorno (.env) y configurar logging una sola vez,
+# antes de importar/usar los módulos del pipeline.
+load_dotenv()
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s.%(msecs)03d [%(name)s] %(levelname)s — %(message)s",
+    datefmt="%H:%M:%S",
+)
 
-    print("[2/3] Parseando OBJ...")
-    # 1. Parsear el OBJ
-    parsed = parse_obj(text)
-    print(f"    -> Caras: {len(parsed['faces'])} | Avisos: {len(parsed['warnings'])}")
+from api.routes.uploads import router as uploads_router
 
-    print("[3/3] Ejecutando pipeline...")
-    # 2. Correr el pipeline con las caras obtenidas
-    # (Asegúrate de importar parse_pipeline de tu nuevo pipeline.py)
-    result = parse_pipeline(file_name, parsed["faces"], parsed["warnings"])
+app = FastAPI(
+    title="Eficiencia2D Backend API",
+    description="API para procesamiento de modelos arquitectónicos 3D a planos 2D",
+    version="1.0.0"
+)
 
-    print(f"Éxito: Se procesaron {len(result.groups)} grupos estructurales.")
+# Configuración CORS por variables de entorno.
+#   ALLOWED_ORIGINS: lista separada por comas (tiene prioridad)
+#   FRONTEND_URL: un único origen
+# Si no hay orígenes configurados, se usa "*" SIN credenciales (allow_credentials
+# y allow_origins=["*"] son incompatibles según la especificación CORS).
+def _resolve_cors_origins() -> list[str]:
+    raw = os.environ.get("ALLOWED_ORIGINS") or os.environ.get("FRONTEND_URL", "")
+    origins = [o.strip() for o in raw.split(",") if o.strip()]
+    return origins
 
-    wall_count = sum(1 for g in result.groups if g.category == "wall")
-    floor_count = sum(1 for g in result.groups if g.category == "floor")
-    discard_count = sum(1 for g in result.groups if g.category == "discard")
+_cors_origins = _resolve_cors_origins()
+if _cors_origins:
+    allow_origins = _cors_origins
+    allow_credentials = True
+else:
+    allow_origins = ["*"]
+    allow_credentials = False
 
-    print(
-        "Resumen por categoría: "
-        f"paredes={wall_count}, pisos={floor_count}, descartes={discard_count}"
-    )
-    print(f"Pisos procesados antes del split: {result.pre_split_face_count}")
-    print(f"Uniones detectadas: {len(result.joints)}")
-    print(f"Ajustes calculados: {len(result.adjustments)}")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=allow_credentials,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    print("Detalle de grupos:")
-    for g in result.groups:
-        print(f"-> {g.label}: {g.total_area:.2f} m² [{g.category}]")
+# Incluir las rutas
+app.include_router(uploads_router, prefix="/api", tags=["Procesamiento"])
 
+@app.get("/")
+def read_root():
+    return {"message": "Bienvenido a la API de Eficiencia2D Backend"}
 
+# Para correr localmente para pruebas sin la línea de comandos
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=True)
