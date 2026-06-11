@@ -213,6 +213,10 @@ async def upload_model(
                 "applied_axis": result.applied_axis,
                 "pre_split_face_count": result.pre_split_face_count,
                 "suggested_merges": result.suggested_merges,
+                # El front necesita la geometría completa: ModelViewer 3D y el
+                # pipeline TS reactivo (decomposePanels, reclassifyWithAxis) la consumen.
+                "faces": [dataclasses.asdict(f) for f in result.faces],
+                "raw_faces": [dataclasses.asdict(f) for f in result.raw_faces],
             },
             "preview_obj": preview_obj,
             "timing": timing_report,  # Debug: reporte de timing
