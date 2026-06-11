@@ -332,23 +332,27 @@ def split_connected(
     if len(face_infos) <= 1:
         return [face_infos]
 
-    vert_to_idx: Dict[str, List[int]] = {}
+    vert_to_idx: Dict[Tuple, List[int]] = {}
 
     for i, fi in enumerate(face_infos):
         face = faces[fi.index]
         indices = get_vertex_indices(face)
         if indices:
             for vi in indices:
-                key = str(vi)
-                if key not in vert_to_idx:
-                    vert_to_idx[key] = []
-                vert_to_idx[key].append(i)
+                key = (vi,)
+                bucket = vert_to_idx.get(key)
+                if bucket is None:
+                    vert_to_idx[key] = [i]
+                else:
+                    bucket.append(i)
         else:
             for v in face.vertices:
-                key = f"{snap3(v.x)},{snap3(v.y)},{snap3(v.z)}"
-                if key not in vert_to_idx:
-                    vert_to_idx[key] = []
-                vert_to_idx[key].append(i)
+                key = (snap3(v.x), snap3(v.y), snap3(v.z))
+                bucket = vert_to_idx.get(key)
+                if bucket is None:
+                    vert_to_idx[key] = [i]
+                else:
+                    bucket.append(i)
 
     parent = list(range(len(face_infos)))
 
@@ -617,13 +621,41 @@ def classify_into_groups(
             and abs(subgroups[i].normal.y) >= HORIZONTAL_THRESHOLD
         )
 
-    for i in range(len(subgroups)):
-        if not is_floor_horiz(i):
-            continue
+    # Spatial hashing sobre el footprint X/Z para evitar el O(N²) de comparar
+    # todas las losas contra todas. Cada losa se indexa en TODAS las celdas que
+    # toca su AABB de footprint expandido por FOOTPRINT_TOL; dos losas que se
+    # solapan (overlap >= -FOOTPRINT_TOL en X y Z) comparten al menos una celda,
+    # así que ningún par candidato del O(N²) se pierde. Las pruebas de overlap/gap
+    # y la unión se aplican exactamente igual que antes.
+    SLAB_CELL = 2.0  # tamaño de celda de la grilla (m)
+
+    floor_horiz = [i for i in range(len(subgroups)) if is_floor_horiz(i)]
+
+    def _cell_range(i: int) -> Tuple[int, int, int, int]:
+        b = sg_bounds[i]
+        cx0 = math.floor((b["minX"] - FOOTPRINT_TOL) / SLAB_CELL)
+        cx1 = math.floor((b["maxX"] + FOOTPRINT_TOL) / SLAB_CELL)
+        cz0 = math.floor((b["minZ"] - FOOTPRINT_TOL) / SLAB_CELL)
+        cz1 = math.floor((b["maxZ"] + FOOTPRINT_TOL) / SLAB_CELL)
+        return cx0, cx1, cz0, cz1
+
+    slab_grid: Dict[Tuple[int, int], List[int]] = {}
+    for i in floor_horiz:
+        cx0, cx1, cz0, cz1 = _cell_range(i)
+        for cx in range(cx0, cx1 + 1):
+            for cz in range(cz0, cz1 + 1):
+                slab_grid.setdefault((cx, cz), []).append(i)
+
+    for i in floor_horiz:
         ib = sg_bounds[i]
-        for j in range(i + 1, len(subgroups)):
-            if not is_floor_horiz(j):
-                continue
+        cx0, cx1, cz0, cz1 = _cell_range(i)
+        candidates: Set[int] = set()
+        for cx in range(cx0, cx1 + 1):
+            for cz in range(cz0, cz1 + 1):
+                for j in slab_grid.get((cx, cz), ()):
+                    if j > i:
+                        candidates.add(j)
+        for j in candidates:
             if find(i) == find(j):
                 continue
             jb = sg_bounds[j]
