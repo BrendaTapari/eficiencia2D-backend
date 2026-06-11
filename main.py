@@ -4,6 +4,7 @@ import logging
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 
 # Cargar variables de entorno (.env) y configurar logging una sola vez,
 # antes de importar/usar los módulos del pipeline.
@@ -47,6 +48,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Comprime la respuesta (los buffers base64 de geometría comprimen bien) cuando
+# el cliente envía Accept-Encoding: gzip — el navegador la descomprime solo.
+# compresslevel=1: ~21MB en ~1s para un modelo de 50MB (nivel 9 tardaría ~5-8s
+# para apenas ~4MB menos; no compensa en una respuesta de 100+MB).
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=1)
 
 # Incluir las rutas
 app.include_router(uploads_router, prefix="/api", tags=["Procesamiento"])
