@@ -76,6 +76,15 @@ def pair_key(a: int, b: int) -> Tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(slots=True)
+class EdgeRecord:
+    """Datos de una arista única, consolidados en un solo objeto (antes 3 dicts)."""
+    groups: Set[int]
+    length: float
+    va: Vec3
+    vb: Vec3
+
+
 @dataclass
 class EdgeData:
     a: Vec3
@@ -101,10 +110,8 @@ def detect_joints(faces: List[Face3D], groups: List[GeometryGroup]) -> List[Join
     """
     t0 = time.perf_counter()
 
-    # edge_tuple → set de group IDs
-    edge_to_groups: Dict[Tuple, Set[int]] = {}
-    edge_lengths: Dict[Tuple, float] = {}
-    edge_verts: Dict[Tuple, Tuple[Vec3, Vec3]] = {}
+    # edge_tuple → EdgeRecord (grupos + longitud + vértices, en un solo dict)
+    edges: Dict[Tuple, EdgeRecord] = {}
 
     total_edges = 0
 
@@ -135,32 +142,34 @@ def detect_joints(faces: List[Face3D], groups: List[GeometryGroup]) -> List[Join
                         verts[j].x, verts[j].y, verts[j].z,
                     )
 
-                gset = edge_to_groups.get(key)
-                if gset is not None:
-                    gset.add(group.id)
+                rec = edges.get(key)
+                if rec is not None:
+                    rec.groups.add(group.id)
                 else:
-                    edge_to_groups[key] = {group.id}
-                    edge_lengths[key] = edge_length(verts[i], verts[j])
-                    edge_verts[key] = (verts[i], verts[j])
+                    edges[key] = EdgeRecord(
+                        groups={group.id},
+                        length=edge_length(verts[i], verts[j]),
+                        va=verts[i],
+                        vb=verts[j],
+                    )
 
     t_edges = time.perf_counter()
     logger.debug(
         f"  detect_joints: {total_edges:,} aristas procesadas, "
-        f"{len(edge_to_groups):,} únicas — {(t_edges-t0)*1000:.1f} ms"
+        f"{len(edges):,} únicas — {(t_edges-t0)*1000:.1f} ms"
     )
 
     # Recolectar pares
     pair_data_map: Dict[Tuple[int, int], PairData] = {}
 
     shared_count = 0
-    for key, group_ids in edge_to_groups.items():
-        if len(group_ids) < 2:
+    for rec in edges.values():
+        if len(rec.groups) < 2:
             continue
         shared_count += 1
 
-        ids = list(group_ids)
-        length = edge_lengths.get(key, 0.0)
-        ev = edge_verts.get(key)
+        ids = list(rec.groups)
+        length = rec.length
 
         for i in range(len(ids)):
             for j in range(i + 1, len(ids)):
@@ -170,8 +179,7 @@ def detect_joints(faces: List[Face3D], groups: List[GeometryGroup]) -> List[Join
                     pd = PairData(groups=(ids[i], ids[j]))
                     pair_data_map[pk] = pd
                 pd.total_length += length
-                if ev:
-                    pd.edges.append(EdgeData(a=ev[0], b=ev[1], len=length))
+                pd.edges.append(EdgeData(a=rec.va, b=rec.vb, len=length))
 
     t_pairs = time.perf_counter()
     logger.debug(
