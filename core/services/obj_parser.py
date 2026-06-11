@@ -1,25 +1,23 @@
 import io
 import time
 import logging
-from typing import Any, List, Dict
+from typing import Any, List, Dict, Iterable, Union
 
 from core.services.types import IndexedFace3D, Vec3, sub, cross, normalize
 
 logger = logging.getLogger("eficiencia2d.pipeline")
 
 
-def parse_obj(text: str) -> Dict[str, Any]:
+def parse_obj(source: Union[str, Iterable[str]]) -> Dict[str, Any]:
     """
     Parser OBJ optimizado v2:
-    - Iteracion directa con finditer de prefijos (sin split por linea innecesario)
+    - Acepta un string completo o un iterable de líneas (file handle / generador),
+      permitiendo parsear en streaming sin materializar todo el archivo en RAM.
     - Fast-path para 'v' y 'f' (los tokens mas comunes)
-    - Pre-reserva de listas con capacidad estimada por tamaño del texto
     - Produce IndexedFace3D con indices originales del OBJ
     """
     t_start = time.perf_counter()
 
-    # Estimar cantidad de vertices/caras por tamaño del texto (heuristica)
-    estimated = max(1000, len(text) // 100)
     vertices: List[Vec3] = []
     normals: List[Vec3] = []
     faces: List[IndexedFace3D] = []
@@ -28,12 +26,20 @@ def parse_obj(text: str) -> Dict[str, Any]:
     line_count = 0
     skip_count = 0
 
-    # Usar splitlines(keepends=False) que es mas rapido que io.StringIO en CPython
-    # porque devuelve una lista de referencias al string original sin copias
-    lines = text.splitlines()
-    line_count = len(lines)
+    # Si es un string: splitlines() (rápido, sin copias en CPython, ya sin saltos).
+    # Si es un iterable (file handle): iterar línea a línea y limpiar el salto de
+    # línea por iteración — la RAM solo mantiene la línea actual.
+    if isinstance(source, str):
+        line_iter: Iterable[str] = source.splitlines()
+        strip_newlines = False
+    else:
+        line_iter = source
+        strip_newlines = True
 
-    for line in lines:
+    for line in line_iter:
+        line_count += 1
+        if strip_newlines:
+            line = line.rstrip("\r\n")
         # Saltar lineas vacias y comentarios rapido
         if not line:
             continue
