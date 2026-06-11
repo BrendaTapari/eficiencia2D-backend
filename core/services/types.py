@@ -6,13 +6,13 @@ from typing import List, Optional, Literal
 # Tipos de geometría compartidos para el pipeline de procesamiento Eficiencia2D
 # ============================================================================
 
-@dataclass
+@dataclass(slots=True)
 class Vec3:
     x: float
     y: float
     z: float
 
-@dataclass
+@dataclass(slots=True)
 class Vec2:
     x: float
     y: float
@@ -23,7 +23,7 @@ class Loop2D:
     vertices: List[Vec2]
     panel_id: Optional[str] = None
 
-@dataclass
+@dataclass(slots=True)
 class Face3D:
     """Una cara 3D extraída del modelo fuente."""
     vertices: List[Vec3]
@@ -31,7 +31,7 @@ class Face3D:
     inner_loops: List[List[Vec3]]
     panel_id: Optional[str] = None
 
-@dataclass
+@dataclass(slots=True)
 class IndexedFace3D(Face3D):
     """Face3D con los índices de vértices originales del OBJ para topología exacta."""
     vertex_indices: List[int] = field(default_factory=list)
