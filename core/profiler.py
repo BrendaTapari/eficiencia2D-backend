@@ -16,13 +16,9 @@ import functools
 from contextlib import contextmanager
 from typing import List, Dict, Optional
 
-# Configurar logger con formato detallado
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s.%(msecs)03d [%(name)s] %(levelname)s — %(message)s",
-    datefmt="%H:%M:%S",
-)
-
+# NOTA: la configuración del logging (basicConfig) se hace en el punto de
+# entrada de la aplicación (api/main.py / main.py / benchmark.py), no aquí.
+# Importar este módulo no debe tener efectos colaterales sobre el root logger.
 logger = logging.getLogger("eficiencia2d.pipeline")
 
 
