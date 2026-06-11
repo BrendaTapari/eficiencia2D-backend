@@ -36,7 +36,6 @@ logger = logging.getLogger("eficiencia2d.pipeline")
 @dataclass
 class Phase1Result:
     faces: List[Face3D]
-    raw_faces: List[Face3D]
     applied_axis: Literal["Y", "Z"]
     groups: List[GeometryGroup]
     joints: List[Joint]
@@ -104,7 +103,6 @@ def parse_pipeline(
 
     return Phase1Result(
         faces=split_faces,
-        raw_faces=faces,
         applied_axis="Y",
         groups=split_groups,
         joints=joints,
