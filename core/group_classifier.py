@@ -30,6 +30,9 @@ VERTICAL_THRESHOLD = 0.5
 MIN_AREA = 1e-6
 HEIGHT_BAND = 0.05
 THIN_WALL_THRESHOLD = 0.40
+# Las dos pieles de un muro gemelo deben tener áreas comparables: la menor >= 20%
+# de la mayor. Evita encadenar una fachada con las barras finas de una baranda.
+TWIN_AREA_RATIO = 0.20
 DEFAULT_MIN_REAL_AREA = 1.0
 WALL_PEEL_MIN_HEIGHT = 1.0
 
@@ -583,8 +586,17 @@ def classify_into_groups(
                             candidates.append(j)
 
         for j in candidates:
+            sg_j = subgroups[j]
+            # Guarda de similitud de área: las dos pieles del MISMO muro tienen
+            # áreas comparables. Si son muy dispares (p. ej. fachada de 75 m² vs una
+            # barra de baranda de 0.28 m²) NO son gemelas; sin esto, el union-find
+            # encadena fachada→barra→barra→pared-de-balcón y fusiona todo el balcón.
+            lo = min(sg_i.total_area, sg_j.total_area)
+            hi = max(sg_i.total_area, sg_j.total_area)
+            if hi <= 0 or lo / hi < TWIN_AREA_RATIO:
+                continue
             comparisons += 1
-            thickness = are_thin_twins(sg_i, subgroups[j], THIN_WALL_THRESHOLD)
+            thickness = are_thin_twins(sg_i, sg_j, THIN_WALL_THRESHOLD)
             if thickness is not None:
                 union(i, j)
                 twin_contrib.append({"idx": i, "thickness": thickness})
