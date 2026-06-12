@@ -89,11 +89,24 @@ FRONTEND_URL=http://localhost:3000
 
 ### 6. Iniciar el servidor
 
+El backend corre en el puerto **8081** (coincide con el frontend en `NEXT_PUBLIC_API_URL`).
+
+**Opción recomendada** — usa el puerto definido en `main.py`:
+
 ```bash
-uvicorn main:app --reload
+python main.py
 ```
+
+**Alternativa** con uvicorn (hay que indicar el puerto explícitamente; por defecto usa 8000):
+
 ```bash
-venv\Scripts\python.exe -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn main:app --reload --host 0.0.0.0 --port 8081
+```
+
+En Windows también podés usar:
+
+```powershell
+.\run.ps1
 ```
 
 ---
@@ -104,9 +117,9 @@ Una vez iniciado el servidor, los siguientes recursos estarán disponibles:
 
 | Recurso | URL |
 |----------|----------|
-| API | `http://127.0.0.1:8000` |
-| Documentación Swagger | `http://127.0.0.1:8000/docs` |
-| Documentación ReDoc | `http://127.0.0.1:8000/redoc` |
+| API | `http://127.0.0.1:8081` |
+| Documentación Swagger | `http://127.0.0.1:8081/docs` |
+| Documentación ReDoc | `http://127.0.0.1:8081/redoc` |
 
 ---
 
@@ -115,7 +128,7 @@ Una vez iniciado el servidor, los siguientes recursos estarán disponibles:
 El parámetro `--reload` habilita la recarga automática del servidor cada vez que se detectan cambios en el código fuente.
 
 ```bash
-uvicorn main:app --reload
+python main.py
 ```
 
 Esto facilita el desarrollo al evitar reiniciar manualmente la aplicación después de cada modificación.

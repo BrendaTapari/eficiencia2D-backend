@@ -154,7 +154,15 @@ def generate_pipeline(
     phase1: Phase1Result,
     opts: PipelineOptions,
     overrides: Optional[Dict[int, str]] = None,
+    wall_wall_decisions: Optional[Dict[int, int]] = None,
+    merges: Optional[List[List[int]]] = None,
 ) -> List[OutputFile]:
+    from core.review_generate import generate_from_review
 
-    files: List[OutputFile] = []
-    return files
+    return generate_from_review(
+        phase1,
+        opts,
+        overrides=overrides,
+        wall_wall_decisions=wall_wall_decisions,
+        merges=merges,
+    )

@@ -4,6 +4,8 @@ import gzip
 import time
 import array
 import base64
+import io
+import zipfile
 import pickle
 import shutil
 import logging
@@ -17,7 +19,7 @@ from core.profiler import PipelineTimer
 from core.services.obj_parser import parse_obj
 from core.services.stl_parser import parse_stl
 from core.pipeline import parse_pipeline, generate_pipeline, Phase1Result
-from core.services.types import PipelineOptions
+from core.services.types import PipelineOptions, SheetConfig
 
 router = APIRouter()
 logger = logging.getLogger("eficiencia2d.pipeline")
@@ -89,13 +91,22 @@ def encode_faces_compact(faces: List) -> Dict:
     }
 
 
+class SheetConfigModel(BaseModel):
+    width_m: float = 1.0
+    height_m: float = 0.6
+    gap_m: float = 0.003
+
+
 class GenerateRequest(BaseModel):
     file_id: str
     original_filename: str = "model.obj"
     scale_denom: float = 50.0
     paper: str = "A4"
+    min_area_m2: float = 1.0
+    sheet_config: Optional[SheetConfigModel] = None
     overrides: Optional[Dict[int, str]] = None
     wall_wall_decisions: Optional[Dict[int, int]] = None
+    merges: Optional[List[List[int]]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -343,19 +354,53 @@ async def generate_pdf_endpoint(request: GenerateRequest):
         logger.info("[generate] Usando caché de Phase1 ✓")
 
     try:
+        sheet = request.sheet_config
+        sheet_cfg = (
+            SheetConfig(
+                width_m=sheet.width_m,
+                height_m=sheet.height_m,
+                gap_m=sheet.gap_m,
+            )
+            if sheet
+            else SheetConfig(width_m=1.0, height_m=0.6, gap_m=0.003)
+        )
         opts = PipelineOptions(
             scale_denom=request.scale_denom,
-            paper=request.paper
+            paper=request.paper,
+            include_cutting_sheet=True,
+            sheet_config=sheet_cfg,
+            min_area_m2=request.min_area_m2,
         )
 
         with timer.step("generate_pipeline"):
-            files = generate_pipeline(phase1, opts, overrides=request.overrides)
+            files = generate_pipeline(
+                phase1,
+                opts,
+                overrides=request.overrides,
+                wall_wall_decisions=request.wall_wall_decisions,
+                merges=request.merges,
+            )
+
+        if not files:
+            raise HTTPException(
+                status_code=422,
+                detail="No se generaron archivos. Verificá clasificación y planchas.",
+            )
+
+        with timer.step("build_zip"):
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in files:
+                    zf.writestr(f.name, f.blob)
+            zip_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
 
         timing_report = timer.report()
 
         return JSONResponse(content={
             "message": "Proyecto generado correctamente.",
             "generated_files": [f.name for f in files],
+            "zip_base64": zip_b64,
+            "zip_filename": f"{phase1.stem}_planos.zip",
             "timing": timing_report,
         })
 
