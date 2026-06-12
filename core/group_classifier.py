@@ -30,10 +30,11 @@ VERTICAL_THRESHOLD = 0.5
 MIN_AREA = 1e-6
 HEIGHT_BAND = 0.05
 THIN_WALL_THRESHOLD = 0.40
-# Las dos pieles de un muro gemelo deben tener áreas comparables: la menor >= 20%
-# de la mayor. Evita encadenar una fachada con las barras finas de una baranda.
-TWIN_AREA_RATIO = 0.20
 DEFAULT_MIN_REAL_AREA = 1.0
+# Solo emparejar dos superficies como las dos pieles de un muro si la MÁS CHICA es de
+# tamaño de muro real. Una barra fina de baranda (<1 m²) no es un muro: queda fuera del
+# union-find → no encadena la fachada con el balcón → se filtra luego por min_real_area.
+MIN_TWIN_AREA = DEFAULT_MIN_REAL_AREA
 WALL_PEEL_MIN_HEIGHT = 1.0
 
 
@@ -587,13 +588,13 @@ def classify_into_groups(
 
         for j in candidates:
             sg_j = subgroups[j]
-            # Guarda de similitud de área: las dos pieles del MISMO muro tienen
-            # áreas comparables. Si son muy dispares (p. ej. fachada de 75 m² vs una
-            # barra de baranda de 0.28 m²) NO son gemelas; sin esto, el union-find
-            # encadena fachada→barra→barra→pared-de-balcón y fusiona todo el balcón.
-            lo = min(sg_i.total_area, sg_j.total_area)
-            hi = max(sg_i.total_area, sg_j.total_area)
-            if hi <= 0 or lo / hi < TWIN_AREA_RATIO:
+            # Solo las dos pieles de un muro REAL son gemelas. Si la pieza más chica
+            # está por debajo de MIN_TWIN_AREA (una barra fina de baranda, p. ej.
+            # 0.28 m²) no se empareja → no encadena fachada→barra→barra→balcón (las
+            # barras se filtran después por min_real_area). Dos pieles de un muro,
+            # aunque tengan áreas muy distintas (interior recortada por un tabique),
+            # ambas son ≥ 1 m² → se unen igual, sin depender del ratio.
+            if min(sg_i.total_area, sg_j.total_area) < MIN_TWIN_AREA:
                 continue
             comparisons += 1
             thickness = are_thin_twins(sg_i, sg_j, THIN_WALL_THRESHOLD)
