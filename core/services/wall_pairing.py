@@ -18,6 +18,9 @@ COPLANAR_D_TOLERANCE = 0.05  # 5cm de tolerancia en el plano
 OPPOSITE_NORMAL_DOT = -0.985  # dot product < esto => normales opuestas
 MAX_WALL_THICKNESS = 1.0  # rango de búsqueda para el "gemelo" (1m)
 LATERAL_OVERLAP_FACTOR = 0.5  # cuánto desplazamiento lateral se tolera
+# Dos piezas con tamaños muy distintos (p. ej. muro completo + cristal) no son
+# gemelas del mismo sólido aunque estén a <40 cm y alineadas en planta.
+MIN_EXTENT_RATIO = 0.25
 
 
 @dataclass
@@ -67,7 +70,14 @@ def are_thin_twins(
 
     lateral_dist = math.sqrt(lx * lx + ly * ly + lz * lz)
 
-    budget = (a.extent + b.extent) * 0.5 * LATERAL_OVERLAP_FACTOR
+    min_extent = min(a.extent, b.extent)
+    max_extent = max(a.extent, b.extent)
+    if max_extent > 1e-6 and min_extent / max_extent < MIN_EXTENT_RATIO:
+        return None
+
+    # Presupuesto lateral según la pieza más chica: un muro alto no debe
+    # emparejarse con un cristal pequeño solo por estar en el mismo plano.
+    budget = min_extent * LATERAL_OVERLAP_FACTOR
 
     if lateral_dist <= budget:
         return distance
@@ -177,7 +187,12 @@ def find_twin_thickness(
 
         lateral_dist = math.sqrt(lx * lx + ly * ly + lz * lz)
 
-        budget = (cluster.extent + other.extent) * 0.5 * LATERAL_OVERLAP_FACTOR
+        min_extent = min(cluster.extent, other.extent)
+        max_extent = max(cluster.extent, other.extent)
+        if max_extent > 1e-6 and min_extent / max_extent < MIN_EXTENT_RATIO:
+            continue
+
+        budget = min_extent * LATERAL_OVERLAP_FACTOR
         if lateral_dist > budget:
             continue
 

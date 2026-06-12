@@ -4,7 +4,8 @@ from typing import List, Dict, Optional, Literal, Tuple
 from dataclasses import dataclass
 
 from core.profiler import PipelineTimer
-from core.services.types import Face3D, Facade, FloorPlan, PipelineOptions, OutputFile
+from core.services.types import Face3D, Facade, FloorPlan, PipelineOptions, OutputFile, Vec3, IndexedFace3D
+from core.services.facade_extractor import detect_up_axis
 from core.group_classifier import (
     GeometryGroup,
     classify_into_groups,
@@ -49,17 +50,48 @@ class Phase1Result:
     timing: Optional[Dict] = None  # Reporte de timing para debug
 
 
+def _rotate_z_to_y(face: Face3D) -> Face3D:
+    def rot(v: Vec3) -> Vec3:
+        return Vec3(v.x, v.z, -v.y)
+
+    new_verts = [rot(v) for v in face.vertices]
+    new_normal = rot(face.normal)
+    new_inner = [[rot(v) for v in loop] for loop in face.inner_loops]
+    if isinstance(face, IndexedFace3D):
+        return IndexedFace3D(
+            vertices=new_verts,
+            normal=new_normal,
+            inner_loops=new_inner,
+            panel_id=face.panel_id,
+            vertex_indices=list(face.vertex_indices),
+        )
+    return Face3D(
+        vertices=new_verts,
+        normal=new_normal,
+        inner_loops=new_inner,
+        panel_id=face.panel_id,
+    )
+
+
 def parse_pipeline(
     file_name: str, faces: List[Face3D], warnings: List[str]
 ) -> Phase1Result:
     timer = PipelineTimer(f"parse_pipeline({file_name})")
     stem = file_name.rsplit(".", 1)[0]
 
-    logger.info(f"parse_pipeline: {len(faces):,} caras de entrada")
+    raw_faces = list(faces)
+    detected_up = detect_up_axis(raw_faces)
+    working_faces = raw_faces
+    if detected_up == "Z":
+        working_faces = [_rotate_z_to_y(f) for f in raw_faces]
+
+    logger.info(
+        f"parse_pipeline: {len(working_faces):,} caras de entrada (eje {detected_up})"
+    )
 
     # 1. Clasificación inicial
-    with timer.step("classify_into_groups", face_count=len(faces)):
-        groups = classify_into_groups(faces, out_warnings=warnings)
+    with timer.step("classify_into_groups", face_count=len(working_faces)):
+        groups = classify_into_groups(working_faces, out_warnings=warnings)
 
     logger.info(f"  → {len(groups)} grupos: " + 
                 ", ".join(f"{sum(1 for g in groups if g.category==c)} {c}" 
@@ -67,14 +99,14 @@ def parse_pipeline(
 
     # 2. Peel buried walls
     with timer.step("peel_buried_walls", group_count=len(groups)):
-        groups = peel_buried_walls(faces, groups)
+        groups = peel_buried_walls(working_faces, groups)
 
     logger.info(f"  → tras peel: {len(groups)} grupos")
 
     # 3. Split por pisos
-    pre_split_face_count = len(faces)
+    pre_split_face_count = len(working_faces)
     with timer.step("split_wall_groups_at_floors", face_count=pre_split_face_count):
-        split_faces, split_groups = split_wall_groups_at_floors(faces, groups, {})
+        split_faces, split_groups = split_wall_groups_at_floors(working_faces, groups, {})
 
     logger.info(
         f"  → split: {pre_split_face_count:,} → {len(split_faces):,} caras, "
@@ -104,8 +136,8 @@ def parse_pipeline(
 
     return Phase1Result(
         faces=split_faces,
-        raw_faces=faces,
-        applied_axis="Y",
+        raw_faces=raw_faces,
+        applied_axis=detected_up,
         groups=split_groups,
         joints=joints,
         adjustments=adj_result.adjustments,
