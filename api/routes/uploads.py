@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 
 from core.profiler import PipelineTimer
 from core.services.obj_parser import parse_obj
+from core.services.stl_parser import parse_stl
 from core.pipeline import parse_pipeline, generate_pipeline, Phase1Result
 from core.services.types import PipelineOptions
 
@@ -219,10 +220,15 @@ async def upload_model(
         file_size_mb = total_bytes / 1024 / 1024
         logger.info(f"[upload] Archivo recibido: {file.filename} ({file_size_mb:.2f} MB)")
 
-        # --- Paso 2+3: Parseo OBJ en streaming (sin cargar el archivo entero en RAM) ---
-        with timer.step("parse_obj", size_mb=round(file_size_mb, 2)):
-            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                parsed = parse_obj(f)
+        # --- Paso 2+3: Parseo según formato ---
+        # OBJ: streaming de texto (sin cargar todo en RAM).
+        # STL: vía trimesh (lee binario/ASCII; NO se abre en modo texto).
+        with timer.step("parse_model", size_mb=round(file_size_mb, 2), fmt=file_extension):
+            if file_extension == "stl":
+                parsed = parse_stl(file_path)
+            else:
+                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                    parsed = parse_obj(f)
 
         face_count = len(parsed["faces"])
         logger.info(f"[upload] Caras parseadas: {face_count:,}")
@@ -317,9 +323,12 @@ async def generate_pdf_endpoint(request: GenerateRequest):
             raise HTTPException(status_code=404, detail="Archivo no encontrado. Por favor sube el archivo nuevamente.")
 
         try:
-            with timer.step("parse_obj_fallback"):
-                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                    parsed = parse_obj(f)
+            with timer.step("parse_model_fallback"):
+                if file_path.lower().endswith(".stl"):
+                    parsed = parse_stl(file_path)
+                else:
+                    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                        parsed = parse_obj(f)
 
             with timer.step("parse_pipeline_fallback"):
                 phase1 = parse_pipeline(request.original_filename, parsed["faces"], parsed["warnings"])
