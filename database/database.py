@@ -4,7 +4,7 @@ import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
-from sqlalchemy import Boolean, Column, Integer, String, Numeric, BigInteger, ForeignKey, DateTime, create_engine
+from sqlalchemy import Boolean, Column, Integer, String, Numeric, BigInteger, ForeignKey, DateTime, create_engine, text
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from sqlalchemy.sql import func
@@ -43,6 +43,21 @@ def init_db() -> None:
     logger.info("Conectando a PostgreSQL para crear tablas: %s", tables)
     Base.metadata.create_all(bind=engine)
     logger.info("Tablas verificadas/creadas correctamente")
+    _backfill_configuraciones_usuario()
+
+
+def _backfill_configuraciones_usuario() -> None:
+    """Corrige filas legacy con NULLs en configuraciones_usuario."""
+    statements = (
+        "UPDATE configuraciones_usuario SET tema_color = 'oscuro' WHERE tema_color IS NULL",
+        "UPDATE configuraciones_usuario SET idioma = 'es' WHERE idioma IS NULL",
+        "UPDATE configuraciones_usuario SET notificaciones_email = TRUE WHERE notificaciones_email IS NULL",
+    )
+    with engine.begin() as conn:
+        for sql in statements:
+            result = conn.execute(text(sql))
+            if result.rowcount:
+                logger.info("Backfill configuraciones_usuario: %s (%s filas)", sql, result.rowcount)
 
 class Usuario(Base):
     __tablename__ = 'usuarios'

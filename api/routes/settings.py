@@ -92,6 +92,7 @@ def update_my_settings(
     for field, value in updates.items():
         setattr(config, field, value)
 
+    _normalize_config(config)
     db.commit()
     db.refresh(config)
     return _config_to_response(config)
