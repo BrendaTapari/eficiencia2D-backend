@@ -1,5 +1,7 @@
+import logging
 import os
 import uuid
+from pathlib import Path
 
 from dotenv import load_dotenv
 from sqlalchemy import Column, Integer, String, Numeric, BigInteger, ForeignKey, DateTime, create_engine
@@ -7,7 +9,11 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from sqlalchemy.sql import func
 
-load_dotenv()
+logger = logging.getLogger(__name__)
+
+# Ruta fija al .env del proyecto (systemd no siempre arranca desde ahí).
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(PROJECT_DIR / ".env")
 
 Base = declarative_base()
 
@@ -29,6 +35,14 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def init_db() -> None:
+    """Crea las tablas en PostgreSQL si aún no existen."""
+    tables = list(Base.metadata.tables.keys())
+    logger.info("Conectando a PostgreSQL para crear tablas: %s", tables)
+    Base.metadata.create_all(bind=engine)
+    logger.info("Tablas verificadas/creadas correctamente")
 
 class Usuario(Base):
     __tablename__ = 'usuarios'

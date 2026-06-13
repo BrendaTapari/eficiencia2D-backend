@@ -9,6 +9,7 @@ from database.database import (
     Usuario,
     engine,
     get_db,
+    init_db,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "Usuario",
     "engine",
     "get_db",
+    "init_db",
 ]

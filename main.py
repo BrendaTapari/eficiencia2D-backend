@@ -1,11 +1,11 @@
 import os
 import logging
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from database import engine, Base
 
 # Cargar variables de entorno (.env) y configurar logging una sola vez,
 # antes de importar/usar los módulos del pipeline.
@@ -16,13 +16,28 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from database import init_db
+
+    try:
+        init_db()
+    except Exception:
+        logger.exception("No se pudieron crear las tablas en PostgreSQL")
+        raise
+    yield
+
 
 from api.routes.uploads import router as uploads_router
 
 app = FastAPI(
     title="Eficiencia2D Backend API",
     description="API para procesamiento de modelos arquitectónicos 3D a planos 2D",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 # Configuración CORS por variables de entorno.
@@ -64,7 +79,6 @@ app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=1)
 
 # Incluir las rutas
 app.include_router(uploads_router, prefix="/api", tags=["Procesamiento"])
-Base.metadata.create_all(bind=engine)
 
 @app.get("/")
 def read_root():
