@@ -16,7 +16,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-Base.metadata.create_all(bind=engine)
 
 from api.routes.uploads import router as uploads_router
 
@@ -65,6 +64,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=1)
 
 # Incluir las rutas
 app.include_router(uploads_router, prefix="/api", tags=["Procesamiento"])
+Base.metadata.create_all(bind=engine)
 
 @app.get("/")
 def read_root():
