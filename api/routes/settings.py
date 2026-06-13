@@ -26,11 +26,28 @@ class SettingsUpdateRequest(BaseModel):
     preferencias_interfaz: dict[str, Any] | None = None
 
 
+def _normalize_config(config: ConfiguracionUsuario) -> bool:
+    """Rellena NULLs de filas legacy y devuelve si hubo cambios."""
+    changed = False
+    if config.tema_color is None:
+        config.tema_color = "oscuro"
+        changed = True
+    if config.idioma is None:
+        config.idioma = "es"
+        changed = True
+    if config.notificaciones_email is None:
+        config.notificaciones_email = True
+        changed = True
+    return changed
+
+
 def _config_to_response(config: ConfiguracionUsuario) -> SettingsResponse:
     return SettingsResponse(
-        tema_color=config.tema_color,
-        idioma=config.idioma,
-        notificaciones_email=config.notificaciones_email,
+        tema_color=config.tema_color or "oscuro",
+        idioma=config.idioma or "es",
+        notificaciones_email=(
+            True if config.notificaciones_email is None else config.notificaciones_email
+        ),
         preferencias_interfaz=config.preferencias_interfaz,
     )
 
@@ -47,6 +64,10 @@ def _get_or_create_config(db: Session, user: Usuario) -> ConfiguracionUsuario:
         db.commit()
         db.refresh(config)
         logger.info("Configuración creada para usuario %s", user.id)
+    elif _normalize_config(config):
+        db.commit()
+        db.refresh(config)
+        logger.info("Configuración legacy normalizada para usuario %s", user.id)
     return config
 
 
