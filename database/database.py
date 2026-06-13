@@ -43,7 +43,68 @@ def init_db() -> None:
     logger.info("Conectando a PostgreSQL para crear tablas: %s", tables)
     Base.metadata.create_all(bind=engine)
     logger.info("Tablas verificadas/creadas correctamente")
+    _migrate_configuraciones_usuario_schema()
     _backfill_configuraciones_usuario()
+
+
+def _migrate_configuraciones_usuario_schema() -> None:
+    """Alinea columnas legacy (p. ej. notificaciones_email como timestamp) al esquema actual."""
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(
+                """
+                SELECT data_type
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'configuraciones_usuario'
+                  AND column_name = 'notificaciones_email'
+                """
+            )
+        ).fetchone()
+        if row is None:
+            return
+
+        if row[0] == "boolean":
+            return
+
+        logger.info(
+            "Migrando configuraciones_usuario.notificaciones_email: %s -> boolean",
+            row[0],
+        )
+        conn.execute(
+            text(
+                """
+                ALTER TABLE configuraciones_usuario
+                ALTER COLUMN notificaciones_email DROP DEFAULT
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                ALTER TABLE configuraciones_usuario
+                ALTER COLUMN notificaciones_email TYPE BOOLEAN
+                USING TRUE
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                ALTER TABLE configuraciones_usuario
+                ALTER COLUMN notificaciones_email SET DEFAULT TRUE
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                ALTER TABLE configuraciones_usuario
+                ALTER COLUMN notificaciones_email SET NOT NULL
+                """
+            )
+        )
+        logger.info("Columna notificaciones_email migrada a boolean")
 
 
 def _backfill_configuraciones_usuario() -> None:
