@@ -1,10 +1,34 @@
+import os
 import uuid
-from sqlalchemy import Column, Integer, String, Numeric, BigInteger, ForeignKey, DateTime
+
+from dotenv import load_dotenv
+from sqlalchemy import Column, Integer, String, Numeric, BigInteger, ForeignKey, DateTime, create_engine
 from sqlalchemy.dialects.postgresql import UUID, JSONB
-from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from sqlalchemy.sql import func
 
+load_dotenv()
+
 Base = declarative_base()
+
+# En el servidor con Docker: host=localhost y puerto=5433 (mapeo en docker-compose).
+# Si la API corre dentro de la misma red Docker: host=postgres_db y puerto=5432.
+# La contraseña con "ñ" debe ir URL-encoded (%C3%B1) dentro de DATABASE_URL.
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql+psycopg2://eficiencia_db:%C3%B1StefaBren_bd@localhost:5433/eficiencia_db",
+)
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 class Usuario(Base):
     __tablename__ = 'usuarios'
@@ -20,6 +44,9 @@ class Usuario(Base):
     suscripcion = relationship("Suscripcion", back_populates="usuario", uselist=False) # Relación 1 a 1
     proyectos = relationship("Proyecto", back_populates="usuario")
     pagos = relationship("Pago", back_populates="usuario")
+    configuracion_usuario = relationship(
+        "ConfiguracionUsuario", back_populates="usuario", uselist=False
+    )
 
 
 class Plan(Base):
