@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from database import engine, Base
 
 # Cargar variables de entorno (.env) y configurar logging una sola vez,
 # antes de importar/usar los módulos del pipeline.
@@ -14,6 +15,8 @@ logging.basicConfig(
     format="%(asctime)s.%(msecs)03d [%(name)s] %(levelname)s — %(message)s",
     datefmt="%H:%M:%S",
 )
+
+Base.metadata.create_all(bind=engine)
 
 from api.routes.uploads import router as uploads_router
 
