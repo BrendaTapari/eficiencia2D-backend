@@ -42,28 +42,47 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Configuración CORS por variables de entorno.
-#   ALLOWED_ORIGINS: lista separada por comas (tiene prioridad)
-#   FRONTEND_URL: un único origen
-# Si no hay orígenes configurados, se usa "*" SIN credenciales (allow_credentials
-# y allow_origins=["*"] son incompatibles según la especificación CORS).
+# Configuración CORS por variables de entorno (se combinan, no se elige solo una):
+#   ALLOWED_ORIGINS — lista separada por comas
+#   FRONTEND_URL / FRONTEND_URL_VERCEL — un origen cada una
+#   CORS_EXTRA_ORIGINS — orígenes adicionales (ej. http://localhost:3000)
+# Por defecto se permiten localhost:3000 y 127.0.0.1:3000 para desarrollo local.
+# Desactivar con DISABLE_LOCALHOST_CORS=true en producción estricta.
+_LOCALHOST_ORIGINS = ("http://localhost:3000", "http://127.0.0.1:3000")
+
+
 def _resolve_cors_origins() -> list[str]:
-    raw = (
-        os.environ.get("ALLOWED_ORIGINS")
-        or os.environ.get("FRONTEND_URL")
-        or os.environ.get("FRONTEND_URL_VERCEL")
-        or ""
-    )
-    origins = [o.strip() for o in raw.split(",") if o.strip()]
+    parts: list[str] = []
+    for key in (
+        "ALLOWED_ORIGINS",
+        "FRONTEND_URL",
+        "FRONTEND_URL_VERCEL",
+        "CORS_EXTRA_ORIGINS",
+    ):
+        raw = os.environ.get(key, "")
+        parts.extend(o.strip() for o in raw.split(",") if o.strip())
+
+    if os.environ.get("DISABLE_LOCALHOST_CORS", "").lower() not in ("1", "true", "yes"):
+        parts.extend(_LOCALHOST_ORIGINS)
+
+    seen: set[str] = set()
+    origins: list[str] = []
+    for origin in parts:
+        if origin not in seen:
+            seen.add(origin)
+            origins.append(origin)
     return origins
+
 
 _cors_origins = _resolve_cors_origins()
 if _cors_origins:
     allow_origins = _cors_origins
     allow_credentials = True
+    logger.info("CORS orígenes permitidos: %s", ", ".join(allow_origins))
 else:
     allow_origins = ["*"]
     allow_credentials = False
+    logger.info("CORS: allow_origins=* (sin credenciales)")
 
 app.add_middleware(
     CORSMiddleware,
