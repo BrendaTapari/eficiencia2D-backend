@@ -32,6 +32,7 @@ async def lifespan(app: FastAPI):
 
 
 from api.routes.auth import router as auth_router
+from api.routes.settings import router as settings_router
 from api.routes.uploads import router as uploads_router
 
 app = FastAPI(
@@ -80,6 +81,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=1)
 
 # Incluir las rutas
 app.include_router(auth_router, prefix="/api", tags=["Auth"])
+app.include_router(settings_router, prefix="/api", tags=["Configuración"])
 app.include_router(uploads_router, prefix="/api", tags=["Procesamiento"])
 
 @app.get("/")

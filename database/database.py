@@ -4,7 +4,7 @@ import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
-from sqlalchemy import Column, Integer, String, Numeric, BigInteger, ForeignKey, DateTime, create_engine
+from sqlalchemy import Boolean, Column, Integer, String, Numeric, BigInteger, ForeignKey, DateTime, create_engine
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from sqlalchemy.sql import func
@@ -135,9 +135,9 @@ class ConfiguracionUsuario(Base):
     usuario_id = Column(UUID(as_uuid=True), ForeignKey('usuarios.id', ondelete='CASCADE'), unique=True, nullable=False)
     
     # Preferencias específicas de la interfaz
-    tema_color = Column(String, nullable=False, default='oscuro') # 'claro', 'oscuro', 'sistema'
+    tema_color = Column(String, nullable=False, default='oscuro')
     idioma = Column(String(5), nullable=False, default='es') # 'es', 'en', etc.
-    notificaciones_email = Column(DateTime, nullable=True) # Para registrar preferencias de avisos
+    notificaciones_email = Column(Boolean, nullable=False, default=True)
     
     # Flexibilidad para el futuro (ej: atajos de teclado personalizados, filtros por defecto)
     preferencias_interfaz = Column(JSONB, nullable=True)
