@@ -46,6 +46,12 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    if user.estado == "pendiente_verificacion":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Debes verificar tu correo electrónico",
+        )
+
     if user.estado != "activo":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
