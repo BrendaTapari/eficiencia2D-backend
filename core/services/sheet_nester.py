@@ -27,6 +27,7 @@ DEFAULT_SHEET = SheetConfig(width_m=1.0, height_m=0.6, gap_m=0.003)
 class Edge:
     a: Vec2
     b: Vec2
+    hole: bool = False  # True si la arista pertenece a un anillo interior (abertura)
 
 
 @dataclass
@@ -36,6 +37,7 @@ class NestingPanel:
     width_m: float
     height_m: float
     edges: List[Edge]
+    is_mark: bool = False  # True si las aberturas se graban (no se cortan)
 
 
 @dataclass
@@ -281,7 +283,9 @@ def rotate_edges(edges: List[Edge], original_w: float) -> List[Edge]:
     """
     return [
         Edge(
-            a=Vec2(x=e.a.y, y=original_w - e.a.x), b=Vec2(x=e.b.y, y=original_w - e.b.x)
+            a=Vec2(x=e.a.y, y=original_w - e.a.x),
+            b=Vec2(x=e.b.y, y=original_w - e.b.x),
+            hole=e.hole,
         )
         for e in edges
     ]
