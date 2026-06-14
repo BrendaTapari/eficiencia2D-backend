@@ -17,6 +17,11 @@ def _env(key: str, default: str = "") -> str:
     return os.environ.get(key, default).strip().strip('"').strip("'")
 
 
+def _mail_password() -> str:
+    """App Password de Gmail: quitar espacios (Google las muestra como 'abcd efgh ...')."""
+    return _env("MAIL_PASSWORD").replace(" ", "")
+
+
 def get_frontend_base_url() -> str:
     """
     URL base del frontend para links en correos.
@@ -44,7 +49,7 @@ def _connection_config() -> ConnectionConfig:
 
     return ConnectionConfig(
         MAIL_USERNAME=_env("MAIL_USERNAME"),
-        MAIL_PASSWORD=_env("MAIL_PASSWORD"),
+        MAIL_PASSWORD=_mail_password(),
         MAIL_FROM=_env("MAIL_FROM"),
         MAIL_FROM_NAME=_env("MAIL_FROM_NAME", "Eficiencia 2D"),
         MAIL_PORT=port,
@@ -73,7 +78,7 @@ def validate_mail_config() -> list[str]:
     issues: list[str] = []
     if not _env("MAIL_USERNAME"):
         issues.append("MAIL_USERNAME no está definido")
-    if not _env("MAIL_PASSWORD"):
+    if not _mail_password():
         issues.append("MAIL_PASSWORD no está definido")
     if not _env("MAIL_FROM"):
         issues.append("MAIL_FROM no está definido")
