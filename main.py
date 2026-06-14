@@ -22,12 +22,20 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from database import init_db
+    from utils.mailer import validate_mail_config
 
     try:
         init_db()
     except Exception:
         logger.exception("No se pudieron crear las tablas en PostgreSQL")
         raise
+
+    mail_issues = validate_mail_config()
+    if mail_issues:
+        logger.warning("Correo no configurado correctamente: %s", "; ".join(mail_issues))
+    else:
+        logger.info("Configuración de correo OK")
+
     yield
 
 

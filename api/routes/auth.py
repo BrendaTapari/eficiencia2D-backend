@@ -10,7 +10,12 @@ from sqlalchemy.orm import Session
 from api.deps import get_current_user
 from core.security import create_access_token, hash_password, verify_password
 from database import ConfiguracionUsuario, Usuario, get_db
-from utils.mailer import send_verification_email
+from utils.mailer import (
+    build_verification_url,
+    is_mail_configured,
+    send_verification_email,
+    validate_mail_config,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -50,8 +55,19 @@ class AuthResponse(BaseModel):
 class RegisterResponse(BaseModel):
     message: str
     email: str
-    verification_email_sent: bool
+    verification_email_scheduled: bool
     user: UserResponse
+
+
+class TestEmailRequest(BaseModel):
+    email: EmailStr
+    nombre: str | None = Field(default="Usuario de prueba", max_length=120)
+
+
+class TestEmailResponse(BaseModel):
+    ok: bool
+    message: str
+    verification_url: str
 
 
 def _user_to_response(user: Usuario) -> UserResponse:
@@ -77,6 +93,7 @@ async def _send_verification_email_task(
     token: str,
     nombre: str | None,
 ) -> None:
+    logger.info("Iniciando envío de correo de verificación a %s", email)
     try:
         await send_verification_email(recipient=email, token=token, nombre=nombre)
     except Exception:
@@ -87,7 +104,7 @@ async def _send_verification_email_task(
 
 
 @router.post("/auth/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
-def register(
+async def register(
     body: RegisterRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
@@ -125,18 +142,67 @@ def register(
 
     db.refresh(user)
 
-    background_tasks.add_task(
-        _send_verification_email_task,
-        user.email,
-        verification_token,
-        user.nombre,
-    )
+    mail_ok = is_mail_configured()
+    if mail_ok:
+        background_tasks.add_task(
+            _send_verification_email_task,
+            user.email,
+            verification_token,
+            user.nombre,
+        )
+        logger.info("Correo de verificación programado para %s", user.email)
+    else:
+        logger.error(
+            "Correo NO programado para %s — configuración incompleta: %s",
+            user.email,
+            "; ".join(validate_mail_config()),
+        )
 
     return RegisterResponse(
-        message="Cuenta creada. Revisá tu correo para verificar tu cuenta.",
+        message=(
+            "Cuenta creada. Revisá tu correo para verificar tu cuenta."
+            if mail_ok
+            else "Cuenta creada, pero el servidor no pudo programar el correo de verificación. "
+            "Contactá al administrador o probá POST /api/auth/test-email."
+        ),
         email=user.email,
-        verification_email_sent=True,
+        verification_email_scheduled=mail_ok,
         user=_user_to_response(user),
+    )
+
+
+@router.post("/auth/test-email", response_model=TestEmailResponse)
+async def test_email(body: TestEmailRequest):
+    """
+    Envía un correo de verificación de prueba de forma síncrona.
+    Usá este endpoint en Swagger para ver el error exacto si el SMTP falla.
+    """
+    issues = validate_mail_config()
+    if issues:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"message": "Configuración de correo incompleta", "issues": issues},
+        )
+
+    token = _create_verification_token()
+
+    try:
+        await send_verification_email(
+            recipient=body.email.lower(),
+            token=token,
+            nombre=body.nombre,
+        )
+    except Exception as exc:
+        logger.exception("Fallo test-email a %s", body.email)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"No se pudo enviar el correo: {exc}",
+        ) from exc
+
+    return TestEmailResponse(
+        ok=True,
+        message=f"Correo de prueba enviado a {body.email}",
+        verification_url=build_verification_url(token),
     )
 
 

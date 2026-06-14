@@ -54,11 +54,42 @@ def _connection_config() -> ConnectionConfig:
         USE_CREDENTIALS=True,
         VALIDATE_CERTS=True,
         TEMPLATE_FOLDER=TEMPLATE_DIR,
+        SUPPRESS_SEND=0,
     )
 
 
-def _fastmail() -> FastMail:
-    return FastMail(_connection_config())
+_fastmail_instance: FastMail | None = None
+
+
+def get_fastmail() -> FastMail:
+    global _fastmail_instance
+    if _fastmail_instance is None:
+        _fastmail_instance = FastMail(_connection_config())
+    return _fastmail_instance
+
+
+def validate_mail_config() -> list[str]:
+    """Devuelve una lista de problemas de configuración (vacía = OK)."""
+    issues: list[str] = []
+    if not _env("MAIL_USERNAME"):
+        issues.append("MAIL_USERNAME no está definido")
+    if not _env("MAIL_PASSWORD"):
+        issues.append("MAIL_PASSWORD no está definido")
+    if not _env("MAIL_FROM"):
+        issues.append("MAIL_FROM no está definido")
+    if not _env("MAIL_SERVER"):
+        issues.append("MAIL_SERVER no está definido")
+    if not TEMPLATE_DIR.is_dir():
+        issues.append(f"No existe la carpeta de plantillas: {TEMPLATE_DIR}")
+    elif not (TEMPLATE_DIR / "verify_account.html").is_file():
+        issues.append("Falta templates/email/verify_account.html")
+    if not get_frontend_base_url():
+        issues.append("FRONTEND_URL_VERCEL o FRONTEND_URL no está definido")
+    return issues
+
+
+def is_mail_configured() -> bool:
+    return len(validate_mail_config()) == 0
 
 
 def _app_name() -> str:
@@ -87,7 +118,7 @@ async def send_verification_email(
     )
 
     try:
-        await _fastmail().send_message(message, template_name="verify_account.html")
+        await get_fastmail().send_message(message, template_name="verify_account.html")
         logger.info("Correo de verificación enviado a %s", recipient)
     except Exception:
         logger.exception("Error al enviar correo de verificación a %s", recipient)
@@ -116,7 +147,7 @@ async def send_password_reset_email(
     )
 
     try:
-        await _fastmail().send_message(message, template_name="password_reset.html")
+        await get_fastmail().send_message(message, template_name="password_reset.html")
         logger.info("Correo de recuperación enviado a %s", recipient)
     except Exception:
         logger.exception("Error al enviar correo de recuperación a %s", recipient)
