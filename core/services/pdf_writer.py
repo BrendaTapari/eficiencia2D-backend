@@ -410,9 +410,17 @@ def generate_nesting_pdf(
                 else panel.edges
             )
 
-            # Dibujar bordes del panel
-            cs.append("0 0 0 RG\n0.3 w")
+            # Dibujar bordes del panel. Si el panel está marcado, sus aberturas
+            # (anillos interiores, hole=True) se graban en ROJO (1 0 0 RG) en vez de
+            # cortarse; el resto del contorno en negro.
+            is_mark = getattr(panel, "is_mark", False)
+            cs.append("0.3 w")
+            cur_color = None
             for edge in edges:
+                color = "1 0 0 RG" if (is_mark and getattr(edge, "hole", False)) else "0 0 0 RG"
+                if color != cur_color:
+                    cs.append(color)
+                    cur_color = color
                 eax, eay = sx + px + edge.a.x, sy_top + py + edge.a.y
                 ebx, eby = sx + px + edge.b.x, sy_top + py + edge.b.y
                 cs.append(
