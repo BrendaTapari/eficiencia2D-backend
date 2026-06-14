@@ -18,8 +18,8 @@ def _env(key: str, default: str = "") -> str:
 
 
 def _mail_password() -> str:
-    """App Password de Gmail: quitar espacios (Google las muestra como 'abcd efgh ...')."""
-    return _env("MAIL_PASSWORD").replace(" ", "")
+    """App Password de Gmail: quitar espacios/saltos de línea invisibles."""
+    return "".join(_env("MAIL_PASSWORD").split())
 
 
 def get_frontend_base_url() -> str:
@@ -63,14 +63,43 @@ def _connection_config() -> ConnectionConfig:
     )
 
 
-_fastmail_instance: FastMail | None = None
-
-
 def get_fastmail() -> FastMail:
-    global _fastmail_instance
-    if _fastmail_instance is None:
-        _fastmail_instance = FastMail(_connection_config())
-    return _fastmail_instance
+    """Instancia nueva en cada envío para no cachear credenciales viejas."""
+    return FastMail(_connection_config())
+
+
+def get_mail_config_status() -> dict[str, object]:
+    """Diagnóstico seguro: no expone la contraseña, solo metadatos."""
+    pwd = _mail_password()
+    username = _env("MAIL_USERNAME")
+    mail_from = _env("MAIL_FROM")
+    port = _mail_port()
+    env_path = PROJECT_DIR / ".env"
+    issues = validate_mail_config()
+
+    if username and mail_from and username.lower() != mail_from.lower():
+        issues.append("Para Gmail, MAIL_FROM debe ser igual a MAIL_USERNAME")
+    if pwd and len(pwd) != 16:
+        issues.append(
+            f"MAIL_PASSWORD tiene {len(pwd)} caracteres; una App Password de Google tiene 16"
+        )
+
+    return {
+        "env_file": str(env_path),
+        "env_file_exists": env_path.is_file(),
+        "mail_username": username,
+        "mail_from": mail_from,
+        "mail_server": _env("MAIL_SERVER", "smtp.gmail.com"),
+        "mail_port": port,
+        "mail_ssl_tls": port == 465,
+        "mail_starttls": port != 465,
+        "password_length": len(pwd),
+        "password_is_16_chars": len(pwd) == 16,
+        "template_dir": str(TEMPLATE_DIR),
+        "frontend_base_url": get_frontend_base_url(),
+        "issues": issues,
+        "ok": len(issues) == 0,
+    }
 
 
 def validate_mail_config() -> list[str]:

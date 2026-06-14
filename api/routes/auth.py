@@ -12,6 +12,7 @@ from core.security import create_access_token, hash_password, verify_password
 from database import ConfiguracionUsuario, Usuario, get_db
 from utils.mailer import (
     build_verification_url,
+    get_mail_config_status,
     is_mail_configured,
     send_verification_email,
     validate_mail_config,
@@ -171,6 +172,15 @@ async def register(
     )
 
 
+@router.get("/auth/mail-status")
+def mail_status():
+    """
+    Muestra qué configuración SMTP lee el proceso (sin exponer la contraseña).
+    Compará password_length con 16 y env_file con la ruta del servidor.
+    """
+    return get_mail_config_status()
+
+
 @router.post("/auth/test-email", response_model=TestEmailResponse)
 async def test_email(body: TestEmailRequest):
     """
@@ -194,9 +204,18 @@ async def test_email(body: TestEmailRequest):
         )
     except Exception as exc:
         logger.exception("Fallo test-email a %s", body.email)
+        detail = str(exc)
+        if "535" in detail or "BadCredentials" in detail or "not accepted" in detail.lower():
+            detail = (
+                "Gmail rechazó usuario/contraseña (535). "
+                "Generá una nueva App Password en Google (16 caracteres), "
+                "actualizá MAIL_PASSWORD en el .env DEL SERVIDOR y reiniciá el servicio. "
+                "Verificá GET /api/auth/mail-status (password_length debe ser 16). "
+                f"Detalle SMTP: {exc}"
+            )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"No se pudo enviar el correo: {exc}",
+            detail=detail,
         ) from exc
 
     return TestEmailResponse(
