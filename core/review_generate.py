@@ -53,7 +53,7 @@ def apply_merges(phase1: Phase1Result, merges: List[List[int]]) -> Phase1Result:
         if len(members) < 2:
             continue
 
-        survivor = max(members, key=lambda g: g.totalArea)
+        survivor = max(members, key=lambda g: g.total_area)
         combined_faces: List[int] = []
         total_area = 0.0
         cx = cy = cz = 0.0
@@ -61,10 +61,10 @@ def apply_merges(phase1: Phase1Result, merges: List[List[int]]) -> Phase1Result:
 
         for m in members:
             combined_faces.extend(m.face_indices)
-            total_area += m.totalArea
-            cx += m.centroid.x * m.totalArea
-            cy += m.centroid.y * m.totalArea
-            cz += m.centroid.z * m.totalArea
+            total_area += m.total_area
+            cx += m.centroid.x * m.total_area
+            cy += m.centroid.y * m.total_area
+            cz += m.centroid.z * m.total_area
             if m.min_y is not None:
                 min_y = m.min_y if min_y is None else min(min_y, m.min_y)
             if m.max_y is not None:
@@ -113,8 +113,10 @@ def decompose_panels_from_groups(
     opts: PipelineOptions,
     overrides: Optional[Dict[int, str]] = None,
     wall_wall_decisions: Optional[Dict[int, int]] = None,
+    marks: Optional[List[int]] = None,
 ) -> Tuple[List[Panel], List[Panel]]:
     overrides = overrides or {}
+    marks_set = set(marks or [])  # ids de grupos cuyas aberturas se graban (no se cortan)
     min_area = opts.min_area_m2 if opts.min_area_m2 is not None else 0.01
 
     effective_decisions: Dict[int, int] = {}
@@ -213,6 +215,7 @@ def decompose_panels_from_groups(
                     height_m=height_m,
                     edges=edges,
                     source_group_id=group.id,
+                    is_mark=group.id in marks_set,
                 )
             )
         else:
@@ -227,6 +230,7 @@ def decompose_panels_from_groups(
                     height_m=height_m,
                     edges=edges,
                     source_group_id=group.id,
+                    is_mark=group.id in marks_set,
                 )
             )
 
@@ -247,9 +251,11 @@ def _panels_to_nesting(panels: List[Panel], scale_denom: float) -> List[NestingP
                     Edge(
                         a=Vec2(e.a.x * s, e.a.y * s),
                         b=Vec2(e.b.x * s, e.b.y * s),
+                        hole=e.hole,
                     )
                     for e in p.edges
                 ],
+                is_mark=p.is_mark,
             )
         )
     return out
@@ -261,10 +267,11 @@ def generate_from_review(
     overrides: Optional[Dict[int, str]] = None,
     wall_wall_decisions: Optional[Dict[int, int]] = None,
     merges: Optional[List[List[int]]] = None,
+    marks: Optional[List[int]] = None,
 ) -> List[OutputFile]:
     work = apply_merges(phase1, merges or [])
     wall_panels, floor_panels = decompose_panels_from_groups(
-        work, opts, overrides, wall_wall_decisions
+        work, opts, overrides, wall_wall_decisions, marks
     )
 
     sc = opts.sheet_config
