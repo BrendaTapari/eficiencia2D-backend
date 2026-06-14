@@ -156,6 +156,7 @@ def generate_pipeline(
     overrides: Optional[Dict[int, str]] = None,
     wall_wall_decisions: Optional[Dict[int, int]] = None,
     merges: Optional[List[List[int]]] = None,
+    marks: Optional[List[int]] = None,
 ) -> List[OutputFile]:
     from core.review_generate import generate_from_review
 
@@ -165,4 +166,5 @@ def generate_pipeline(
         overrides=overrides,
         wall_wall_decisions=wall_wall_decisions,
         merges=merges,
+        marks=marks,
     )
