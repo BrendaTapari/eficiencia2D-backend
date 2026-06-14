@@ -107,6 +107,7 @@ class GenerateRequest(BaseModel):
     overrides: Optional[Dict[int, str]] = None
     wall_wall_decisions: Optional[Dict[int, int]] = None
     merges: Optional[List[List[int]]] = None
+    marks: Optional[List[int]] = None  # ids de componentes cuyas aberturas se graban
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +380,7 @@ async def generate_pdf_endpoint(request: GenerateRequest):
                 overrides=request.overrides,
                 wall_wall_decisions=request.wall_wall_decisions,
                 merges=request.merges,
+                marks=request.marks,
             )
 
         if not files:
