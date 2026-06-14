@@ -110,6 +110,7 @@ def sign(x: float) -> int:
 class Edge2D:
     a: Vec2
     b: Vec2
+    hole: bool = False  # True si la arista pertenece a un anillo interior (abertura)
 
 
 @dataclass
@@ -122,6 +123,7 @@ class Panel:
     height_m: float
     edges: List[Edge2D]
     source_group_id: int
+    is_mark: bool = False  # True si las aberturas de este panel se graban (no se cortan)
 
 
 @dataclass
@@ -148,6 +150,7 @@ class RawEdge:
     by: float
     via: Optional[int] = None
     vib: Optional[int] = None
+    hole: bool = False  # True si proviene de un anillo interior (abertura)
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +414,7 @@ def union_outline(
                 RawEdge(ax=ext[i][0], ay=ext[i][1], bx=ext[i + 1][0], by=ext[i + 1][1])
             )
 
-        # Huecos Internos (Windows/Doors)
+        # Huecos Internos (Windows/Doors) -> hole=True (aberturas)
         for interior in poly.interiors:
             int_coords = list(interior.coords)
             if abs(ring_2d_area(int_coords)) < MIN_HOLE_AREA:
@@ -423,6 +426,7 @@ def union_outline(
                         ay=int_coords[i][1],
                         bx=int_coords[i + 1][0],
                         by=int_coords[i + 1][1],
+                        hole=True,
                     )
                 )
 
@@ -525,7 +529,11 @@ def project_faces_to_2d(
         return None
 
     edges = [
-        Edge2D(a=Vec2(e.ax - min_u, e.ay - min_v), b=Vec2(e.bx - min_u, e.by - min_v))
+        Edge2D(
+            a=Vec2(e.ax - min_u, e.ay - min_v),
+            b=Vec2(e.bx - min_u, e.by - min_v),
+            hole=e.hole,
+        )
         for e in contoured
     ]
 
@@ -566,7 +574,11 @@ def clip_panel_at_v(
             ix = e.a.x + t * (e.b.x - e.a.x)
             cut_pt = Vec2(ix, cut)
             keep = e.a if a_in else e.b
-            out.append(Edge2D(a=keep, b=cut_pt) if a_in else Edge2D(a=cut_pt, b=keep))
+            out.append(
+                Edge2D(a=keep, b=cut_pt, hole=e.hole)
+                if a_in
+                else Edge2D(a=cut_pt, b=keep, hole=e.hole)
+            )
             crossings.append(ix)
 
     crossings.sort()
@@ -590,7 +602,9 @@ def clip_panel_at_v(
 
     normalized = [
         Edge2D(
-            a=Vec2(e.a.x - min_u, e.a.y - min_v), b=Vec2(e.b.x - min_u, e.b.y - min_v)
+            a=Vec2(e.a.x - min_u, e.a.y - min_v),
+            b=Vec2(e.b.x - min_u, e.b.y - min_v),
+            hole=e.hole,
         )
         for e in out
     ]
@@ -617,7 +631,11 @@ def clip_panel_at_u(
             iy = e.a.y + t * (e.b.y - e.a.y)
             cut_pt = Vec2(cut, iy)
             keep = e.a if a_in else e.b
-            out.append(Edge2D(a=keep, b=cut_pt) if a_in else Edge2D(a=cut_pt, b=keep))
+            out.append(
+                Edge2D(a=keep, b=cut_pt, hole=e.hole)
+                if a_in
+                else Edge2D(a=cut_pt, b=keep, hole=e.hole)
+            )
             crossings.append(iy)
 
     crossings.sort()
@@ -641,7 +659,9 @@ def clip_panel_at_u(
 
     normalized = [
         Edge2D(
-            a=Vec2(e.a.x - min_u, e.a.y - min_v), b=Vec2(e.b.x - min_u, e.b.y - min_v)
+            a=Vec2(e.a.x - min_u, e.a.y - min_v),
+            b=Vec2(e.b.x - min_u, e.b.y - min_v),
+            hole=e.hole,
         )
         for e in out
     ]
@@ -650,7 +670,11 @@ def clip_panel_at_u(
 
 def mirror_edges_horizontal(edges: List[Edge2D], width_m: float) -> List[Edge2D]:
     return [
-        Edge2D(a=Vec2(width_m - e.a.x, e.a.y), b=Vec2(width_m - e.b.x, e.b.y))
+        Edge2D(
+            a=Vec2(width_m - e.a.x, e.a.y),
+            b=Vec2(width_m - e.b.x, e.b.y),
+            hole=e.hole,
+        )
         for e in edges
     ]
 
@@ -872,6 +896,7 @@ CS_LAYERS = [
     {"name": "ENGRAVE_VECTOR", "aci": "5"},
     {"name": "ENGRAVE_RASTER", "aci": "8"},
     {"name": "CUT_INTERIOR", "aci": "3"},
+    {"name": "MARK_VECTOR", "aci": "1"},  # rojo: aberturas a grabar (no cortar)
 ]
 
 
@@ -950,16 +975,23 @@ def emit_panel_entities(
     oy: float,
     scale_denom: float = 1.0,
     include_text: bool = True,
+    is_mark: bool = False,
 ):
     for edge in edges:
+        # Si el panel está marcado, sus aberturas (anillos interiores, hole=True) se
+        # GRABAN en rojo (MARK_VECTOR/ACI 1) en vez de cortarse; el resto se corta.
+        if is_mark and getattr(edge, "hole", False):
+            layer, aci = "MARK_VECTOR", "1"
+        else:
+            layer, aci = "CUT_EXTERIOR", "7"
         lines.extend(
             [
                 "0",
                 "LINE",
                 "8",
-                "CUT_EXTERIOR",
+                layer,
                 "62",
-                "7",
+                aci,
                 "10",
                 r_str(ox + edge.a.x),
                 "20",
@@ -1047,6 +1079,7 @@ def panels_to_dxf(placed: List[PlacedPanel]) -> str:
             p.panel.id,
             p.x,
             p.y,
+            is_mark=getattr(p.panel, "is_mark", False),
         )
     lines.extend(["0", "ENDSEC", "0", "EOF"])
     return "\n".join(lines) + "\n"
@@ -1164,6 +1197,7 @@ def nested_sheets_to_dxf(nesting: NestingResult, include_text: bool = True) -> s
                 sy + placed.y,
                 nesting.scale_denom,
                 include_text,
+                is_mark=getattr(placed.panel, "is_mark", False),
             )
 
     lines.extend(["0", "ENDSEC", "0", "EOF"])
