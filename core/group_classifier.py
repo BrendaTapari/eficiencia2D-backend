@@ -244,6 +244,9 @@ def classify_all_faces(faces: List[Face3D]) -> List[FaceInfo]:
 
 NORMAL_CLUSTER_DOT = 0.985
 D_TOLERANCE = 0.15
+# Reunir piezas coplanares de pared cuyas cajas en el plano estén a <= este gap (m).
+# Puentea ventanas y costuras del mesh sin unir muros de pisos distintos (< entrepiso).
+COPLANAR_MERGE_GAP = 1.0
 
 
 def snap3(v: float) -> float:
@@ -385,6 +388,70 @@ def split_connected(
     return list(comp_map.values())
 
 
+def merge_adjacent_components(
+    components: List[List[FaceInfo]],
+    normal: Vec3,
+    faces: List[Face3D],
+    gap: float,
+) -> List[List[FaceInfo]]:
+    """
+    Une componentes coplanares (de un mismo plano) cuyas cajas, proyectadas al plano de
+    la cara, se solapan o están a <= `gap` en LOS DOS ejes en-plano. Reconstituye una
+    pared partida por ventanas/aberturas o por costuras del mesh en un solo componente,
+    sin unir muros coplanares que no se solapan (distintas zonas del edificio).
+    """
+    n = len(components)
+    if n <= 1:
+        return components
+
+    # Ejes en-plano = los 2 ejes del mundo que NO son el dominante de la normal.
+    ax, ay, az = abs(normal.x), abs(normal.y), abs(normal.z)
+    if ax >= ay and ax >= az:
+        a1, a2 = "y", "z"
+    elif az >= ax and az >= ay:
+        a1, a2 = "x", "y"
+    else:
+        a1, a2 = "x", "z"
+
+    boxes: List[Tuple[float, float, float, float]] = []
+    for comp in components:
+        lo1 = lo2 = float("inf")
+        hi1 = hi2 = float("-inf")
+        for fi in comp:
+            for v in faces[fi.index].vertices:
+                c1 = getattr(v, a1)
+                c2 = getattr(v, a2)
+                if c1 < lo1: lo1 = c1
+                if c1 > hi1: hi1 = c1
+                if c2 < lo2: lo2 = c2
+                if c2 > hi2: hi2 = c2
+        boxes.append((lo1, hi1, lo2, hi2))
+
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(n):
+        bi = boxes[i]
+        for j in range(i + 1, n):
+            bj = boxes[j]
+            o1 = min(bi[1], bj[1]) - max(bi[0], bj[0])
+            o2 = min(bi[3], bj[3]) - max(bi[2], bj[2])
+            if o1 >= -gap and o2 >= -gap:
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[ri] = rj
+
+    merged: Dict[int, List[FaceInfo]] = {}
+    for i in range(n):
+        merged.setdefault(find(i), []).extend(components[i])
+    return list(merged.values())
+
+
 # ---------------------------------------------------------------------------
 # Etiquetas y Subgrupos
 # ---------------------------------------------------------------------------
@@ -510,6 +577,12 @@ def classify_into_groups(
         )
         for cluster in clusters:
             components = split_connected(cluster.face_infos, faces)
+            # Las paredes vienen partidas por ventanas/costuras del mesh: reunir las
+            # piezas coplanares ADYACENTES en el plano para no sobre-cortar la pared.
+            if category == "wall":
+                components = merge_adjacent_components(
+                    components, cluster.normal, faces, COPLANAR_MERGE_GAP
+                )
             for comp in components:
                 sg = build_subgroup(category, cluster, comp, faces)
                 if sg:
