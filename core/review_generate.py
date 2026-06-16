@@ -114,10 +114,15 @@ def decompose_panels_from_groups(
     overrides: Optional[Dict[int, str]] = None,
     wall_wall_decisions: Optional[Dict[int, int]] = None,
     marks: Optional[List[int]] = None,
+    user_cuts: Optional[List] = None,
+    merge_target: Optional[Dict[int, int]] = None,
 ) -> Tuple[List[Panel], List[Panel]]:
+    from core.services.user_cuts import PanelPiece, UserCut, apply_user_cuts_to_panel, build_cuts_by_group
+
     overrides = overrides or {}
-    marks_set = set(marks or [])  # ids de grupos cuyas aberturas se graban (no se cortan)
+    marks_set = set(marks or [])
     min_area = opts.min_area_m2 if opts.min_area_m2 is not None else 0.01
+    cuts_by_group = build_cuts_by_group(user_cuts or [], merge_target)
 
     effective_decisions: Dict[int, int] = {}
     for ww in phase1.wall_wall_joints:
@@ -203,36 +208,46 @@ def decompose_panels_from_groups(
 
         edges = mirror_edges_horizontal(edges, width_m)
 
-        if is_floor:
-            floor_count += 1
-            floor_panels.append(
-                Panel(
-                    id=f"B{floor_count}",
-                    group_name=f"floor_{floor_count}",
-                    category="floor",
-                    floor_index=0,
-                    width_m=width_m,
-                    height_m=height_m,
-                    edges=edges,
-                    source_group_id=group.id,
-                    is_mark=group.id in marks_set,
-                )
-            )
+        group_cuts: List[UserCut] = cuts_by_group.get(group.id, [])
+        if group_cuts:
+            pieces = apply_user_cuts_to_panel(width_m, height_m, edges, group_cuts)
         else:
-            wall_count += 1
-            wall_panels.append(
-                Panel(
-                    id=f"A{wall_count}",
-                    group_name=f"wall_{wall_count}",
-                    category="wall",
-                    floor_index=0,
-                    width_m=width_m,
-                    height_m=height_m,
-                    edges=edges,
-                    source_group_id=group.id,
-                    is_mark=group.id in marks_set,
+            pieces = [PanelPiece(width_m=width_m, height_m=height_m, edges=edges)]
+
+        for piece in pieces:
+            if piece.width_m * piece.height_m < min_area:
+                continue
+
+            if is_floor:
+                floor_count += 1
+                floor_panels.append(
+                    Panel(
+                        id=f"B{floor_count}",
+                        group_name=f"floor_{floor_count}",
+                        category="floor",
+                        floor_index=0,
+                        width_m=piece.width_m,
+                        height_m=piece.height_m,
+                        edges=piece.edges,
+                        source_group_id=group.id,
+                        is_mark=group.id in marks_set,
+                    )
                 )
-            )
+            else:
+                wall_count += 1
+                wall_panels.append(
+                    Panel(
+                        id=f"A{wall_count}",
+                        group_name=f"wall_{wall_count}",
+                        category="wall",
+                        floor_index=0,
+                        width_m=piece.width_m,
+                        height_m=piece.height_m,
+                        edges=piece.edges,
+                        source_group_id=group.id,
+                        is_mark=group.id in marks_set,
+                    )
+                )
 
     return wall_panels, floor_panels
 
@@ -268,10 +283,21 @@ def generate_from_review(
     wall_wall_decisions: Optional[Dict[int, int]] = None,
     merges: Optional[List[List[int]]] = None,
     marks: Optional[List[int]] = None,
+    user_cuts: Optional[List] = None,
 ) -> List[OutputFile]:
+    from core.services.user_cuts import build_merge_target_map, parse_user_cuts
+
+    merge_target = build_merge_target_map(phase1.groups, merges)
+    parsed_cuts = parse_user_cuts(user_cuts)
     work = apply_merges(phase1, merges or [])
     wall_panels, floor_panels = decompose_panels_from_groups(
-        work, opts, overrides, wall_wall_decisions, marks
+        work,
+        opts,
+        overrides,
+        wall_wall_decisions,
+        marks,
+        parsed_cuts,
+        merge_target,
     )
 
     sc = opts.sheet_config

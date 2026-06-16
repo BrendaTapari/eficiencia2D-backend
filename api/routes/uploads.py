@@ -10,7 +10,7 @@ import pickle
 import shutil
 import logging
 import dataclasses
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Literal
 from pydantic import BaseModel
 from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -97,6 +97,17 @@ class SheetConfigModel(BaseModel):
     gap_m: float = 0.003
 
 
+class UserCutModel(BaseModel):
+    id: str
+    group_id: int
+    kind: Literal["rect", "square", "circle", "line"]
+    u0: float
+    v0: float
+    u1: float
+    v1: float
+    keep_positive: Optional[bool] = True
+
+
 class GenerateRequest(BaseModel):
     file_id: str
     original_filename: str = "model.obj"
@@ -108,6 +119,7 @@ class GenerateRequest(BaseModel):
     wall_wall_decisions: Optional[Dict[int, int]] = None
     merges: Optional[List[List[int]]] = None
     marks: Optional[List[int]] = None  # ids de componentes cuyas aberturas se graban
+    user_cuts: Optional[List[UserCutModel]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +386,11 @@ async def generate_pdf_endpoint(request: GenerateRequest):
         )
 
         with timer.step("generate_pipeline"):
+            user_cuts_payload = (
+                [c.model_dump() for c in request.user_cuts]
+                if request.user_cuts
+                else None
+            )
             files = generate_pipeline(
                 phase1,
                 opts,
@@ -381,6 +398,7 @@ async def generate_pdf_endpoint(request: GenerateRequest):
                 wall_wall_decisions=request.wall_wall_decisions,
                 merges=request.merges,
                 marks=request.marks,
+                user_cuts=user_cuts_payload,
             )
 
         if not files:
