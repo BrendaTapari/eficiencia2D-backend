@@ -117,7 +117,7 @@ def decompose_panels_from_groups(
     user_cuts: Optional[List] = None,
     merge_target: Optional[Dict[int, int]] = None,
 ) -> Tuple[List[Panel], List[Panel]]:
-    from core.services.user_cuts import PanelPiece, UserCut, apply_user_cuts_to_panel, build_cuts_by_group
+    from core.services.user_cuts import UserCut, build_cuts_by_group
 
     overrides = overrides or {}
     marks_set = set(marks or [])
@@ -208,54 +208,66 @@ def decompose_panels_from_groups(
 
         edges = mirror_edges_horizontal(edges, width_m)
 
+        # Los user_cuts se adjuntan al panel como overlay — NO modifican la geometría.
         group_cuts: List[UserCut] = cuts_by_group.get(group.id, [])
-        if group_cuts:
-            pieces = apply_user_cuts_to_panel(width_m, height_m, edges, group_cuts)
+
+        if width_m * height_m < min_area:
+            continue
+
+        if is_floor:
+            floor_count += 1
+            floor_panels.append(
+                Panel(
+                    id=f"B{floor_count}",
+                    group_name=f"floor_{floor_count}",
+                    category="floor",
+                    floor_index=0,
+                    width_m=width_m,
+                    height_m=height_m,
+                    edges=edges,
+                    source_group_id=group.id,
+                    is_mark=group.id in marks_set,
+                    user_cuts=list(group_cuts),
+                )
+            )
         else:
-            pieces = [PanelPiece(width_m=width_m, height_m=height_m, edges=edges)]
-
-        for piece in pieces:
-            if piece.width_m * piece.height_m < min_area:
-                continue
-
-            if is_floor:
-                floor_count += 1
-                floor_panels.append(
-                    Panel(
-                        id=f"B{floor_count}",
-                        group_name=f"floor_{floor_count}",
-                        category="floor",
-                        floor_index=0,
-                        width_m=piece.width_m,
-                        height_m=piece.height_m,
-                        edges=piece.edges,
-                        source_group_id=group.id,
-                        is_mark=group.id in marks_set,
-                    )
+            wall_count += 1
+            wall_panels.append(
+                Panel(
+                    id=f"A{wall_count}",
+                    group_name=f"wall_{wall_count}",
+                    category="wall",
+                    floor_index=0,
+                    width_m=width_m,
+                    height_m=height_m,
+                    edges=edges,
+                    source_group_id=group.id,
+                    is_mark=group.id in marks_set,
+                    user_cuts=list(group_cuts),
                 )
-            else:
-                wall_count += 1
-                wall_panels.append(
-                    Panel(
-                        id=f"A{wall_count}",
-                        group_name=f"wall_{wall_count}",
-                        category="wall",
-                        floor_index=0,
-                        width_m=piece.width_m,
-                        height_m=piece.height_m,
-                        edges=piece.edges,
-                        source_group_id=group.id,
-                        is_mark=group.id in marks_set,
-                    )
-                )
+            )
 
     return wall_panels, floor_panels
 
 
 def _panels_to_nesting(panels: List[Panel], scale_denom: float) -> List[NestingPanel]:
+    from core.services.user_cuts import UserCut as _UserCut
     s = 1.0 / scale_denom
     out: List[NestingPanel] = []
     for p in panels:
+        scaled_cuts = [
+            _UserCut(
+                id=c.id,
+                group_id=c.group_id,
+                kind=c.kind,
+                u0=c.u0 * s,
+                v0=c.v0 * s,
+                u1=c.u1 * s,
+                v1=c.v1 * s,
+                keep_positive=c.keep_positive,
+            )
+            for c in (p.user_cuts or [])
+        ]
         out.append(
             NestingPanel(
                 id=p.id,
@@ -271,6 +283,7 @@ def _panels_to_nesting(panels: List[Panel], scale_denom: float) -> List[NestingP
                     for e in p.edges
                 ],
                 is_mark=p.is_mark,
+                user_cuts=scaled_cuts,
             )
         )
     return out

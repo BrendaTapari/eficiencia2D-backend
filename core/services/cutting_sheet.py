@@ -124,6 +124,7 @@ class Panel:
     edges: List[Edge2D]
     source_group_id: int
     is_mark: bool = False  # True si las aberturas de este panel se graban (no se cortan)
+    user_cuts: List = field(default_factory=list)  # UserCut objects — se dibujan como overlay en el PDF
 
 
 @dataclass

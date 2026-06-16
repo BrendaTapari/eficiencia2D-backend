@@ -1,6 +1,6 @@
 import math
 from typing import List, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Importamos nuestro tipo Vec2
 from core.services.types import Vec2
@@ -38,6 +38,7 @@ class NestingPanel:
     height_m: float
     edges: List[Edge]
     is_mark: bool = False  # True si las aberturas se graban (no se cortan)
+    user_cuts: List = field(default_factory=list)  # UserCut objects (coords escaladas) — overlay en PDF
 
 
 @dataclass
