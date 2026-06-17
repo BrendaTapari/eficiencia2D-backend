@@ -15,7 +15,11 @@ DCEL hecho a mano, así que NO se reemplaza esa parte.
 
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from core.services.types import Face3D, IndexedFace3D
+from shapely import STRtree
+from shapely.geometry import Polygon
+from shapely.ops import unary_union
+
+from core.services.types import Face3D, IndexedFace3D, Vec3, cross, dot, normalize, vlength
 
 
 # Tolerancia de soldado: 0.1 mm. Suelda coincidentes/jitter de float sin fundir
@@ -103,3 +107,98 @@ def connected_components(
     for i, it in enumerate(items):
         comp_map.setdefault(find(i), []).append(it)
     return list(comp_map.values())
+
+
+# ---------------------------------------------------------------------------
+# Adyacencia coplanar por CONTACTO real (Misión 2 — de Berg cap. 2/10)
+#
+# Reemplaza la validación de "plano infinito + bbox con gap" por un test
+# topológico: dos componentes coplanares se unen SÓLO si sus polígonos,
+# proyectados al plano del muro, se tocan/solapan (distancia <= eps ≈ 0).
+# Corrige falsos positivos (hueco real -> no tocan -> no unen) y falsos
+# negativos (se tocan sin compartir vértice -> distancia 0 -> unen).
+# Broad-phase con STRtree (R-tree) -> O(n log n + k), no O(n²).
+# ---------------------------------------------------------------------------
+
+
+def _inplane_basis(n: Vec3) -> Tuple[Vec3, Vec3]:
+    """Base ortonormal (u, v) DENTRO del plano de normal n."""
+    wu = Vec3(0.0, 1.0, 0.0)
+    dd = dot(wu, n)
+    vip = Vec3(wu.x - dd * n.x, wu.y - dd * n.y, wu.z - dd * n.z)
+    if vlength(vip) < 1e-9:  # cara ~horizontal (n ~ Y): usar X como "arriba" auxiliar
+        wu = Vec3(1.0, 0.0, 0.0)
+        dd = dot(wu, n)
+        vip = Vec3(wu.x - dd * n.x, wu.y - dd * n.y, wu.z - dd * n.z)
+    v = normalize(vip)
+    u = normalize(cross(n, v))
+    return u, v
+
+
+def merge_coplanar_by_contact(
+    components: List[List],
+    normal: Vec3,
+    faces: List[Face3D],
+    face_of: Callable[[object], Face3D],
+    eps: float = 1e-3,
+) -> List[List]:
+    """
+    Une componentes coplanares cuyos polígonos proyectados al plano se tocan (<= eps).
+    `face_of(item)` da la Face3D de cada item del componente.
+    """
+    n_comp = len(components)
+    if n_comp <= 1:
+        return components
+
+    u, v = _inplane_basis(normalize(normal))
+
+    def project(vert) -> Tuple[float, float]:
+        return (
+            vert.x * u.x + vert.y * u.y + vert.z * u.z,
+            vert.x * v.x + vert.y * v.y + vert.z * v.z,
+        )
+
+    polys: List[Optional[Polygon]] = []
+    for comp in components:
+        rings = []
+        for it in comp:
+            f = face_of(it)
+            if len(f.vertices) < 3:
+                continue
+            p = Polygon([project(vert) for vert in f.vertices])
+            if not p.is_valid:
+                p = p.buffer(0)
+            if (not p.is_empty) and p.area > 1e-9:
+                rings.append(p)
+        if not rings:
+            polys.append(None)
+            continue
+        merged = unary_union(rings)
+        if not merged.is_valid:
+            merged = merged.buffer(0)
+        polys.append(merged if not merged.is_empty else None)
+
+    parent = list(range(n_comp))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    valid = [i for i in range(n_comp) if polys[i] is not None]
+    if len(valid) > 1:
+        geoms = [polys[i] for i in valid]
+        tree = STRtree(geoms)
+        for i in valid:
+            for m in tree.query(polys[i], predicate="dwithin", distance=eps):
+                j = valid[int(m)]
+                if j > i:
+                    ri, rj = find(i), find(j)
+                    if ri != rj:
+                        parent[ri] = rj
+
+    out: Dict[int, List] = {}
+    for i in range(n_comp):
+        out.setdefault(find(i), []).extend(components[i])
+    return list(out.values())
