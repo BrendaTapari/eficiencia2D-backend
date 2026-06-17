@@ -16,6 +16,7 @@ from core.services.types import (
     vlength,
 )
 from core.services.wall_pairing import are_thin_twins
+from core.services.topology import connected_components as topo_connected_components
 
 logger = logging.getLogger("eficiencia2d.pipeline")
 
@@ -329,7 +330,8 @@ def cluster_coplanar(
 
 
 # ---------------------------------------------------------------------------
-# Componentes Conectados (Union-Find) — sin cambios, ya es eficiente
+# Componentes Conectados — delega en la utilidad compartida de topología
+# (core.services.topology). Mantiene la firma (FaceInfo) por compatibilidad.
 # ---------------------------------------------------------------------------
 
 
@@ -338,54 +340,9 @@ def split_connected(
 ) -> List[List[FaceInfo]]:
     if len(face_infos) <= 1:
         return [face_infos]
-
-    vert_to_idx: Dict[Tuple, List[int]] = {}
-
-    for i, fi in enumerate(face_infos):
-        face = faces[fi.index]
-        indices = get_vertex_indices(face)
-        if indices:
-            for vi in indices:
-                key = (vi,)
-                bucket = vert_to_idx.get(key)
-                if bucket is None:
-                    vert_to_idx[key] = [i]
-                else:
-                    bucket.append(i)
-        else:
-            for v in face.vertices:
-                key = (snap3(v.x), snap3(v.y), snap3(v.z))
-                bucket = vert_to_idx.get(key)
-                if bucket is None:
-                    vert_to_idx[key] = [i]
-                else:
-                    bucket.append(i)
-
-    parent = list(range(len(face_infos)))
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a: int, b: int):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[ra] = rb
-
-    for indices in vert_to_idx.values():
-        for i in range(1, len(indices)):
-            union(indices[0], indices[i])
-
-    comp_map: Dict[int, List[FaceInfo]] = {}
-    for i, fi in enumerate(face_infos):
-        root = find(i)
-        if root not in comp_map:
-            comp_map[root] = []
-        comp_map[root].append(fi)
-
-    return list(comp_map.values())
+    return topo_connected_components(
+        face_infos, face_of=lambda fi: faces[fi.index], coord_snap=0.01
+    )
 
 
 def merge_adjacent_components(
@@ -435,9 +392,36 @@ def merge_adjacent_components(
             x = parent[x]
         return x
 
-    for i in range(n):
-        bi = boxes[i]
-        for j in range(i + 1, n):
+    # Spatial hashing en el plano (mismo patrón que "losas contiguas"): cada componente
+    # se indexa en TODAS las celdas que toca su bbox expandido por `gap`; dos componentes
+    # adyacentes (overlap >= -gap en ambos ejes) comparten al menos una celda, así que no
+    # se pierde ningún par. Evita el O(c²) en clusters con cientos de piezas.
+    CELL = 2.0
+
+    def cell_range(b: Tuple[float, float, float, float]) -> Tuple[int, int, int, int]:
+        return (
+            math.floor((b[0] - gap) / CELL),
+            math.floor((b[1] + gap) / CELL),
+            math.floor((b[2] - gap) / CELL),
+            math.floor((b[3] + gap) / CELL),
+        )
+
+    grid: Dict[Tuple[int, int], List[int]] = {}
+    for i, b in enumerate(boxes):
+        c1a, c1b, c2a, c2b = cell_range(b)
+        for ca in range(c1a, c1b + 1):
+            for cb in range(c2a, c2b + 1):
+                grid.setdefault((ca, cb), []).append(i)
+
+    for i, bi in enumerate(boxes):
+        c1a, c1b, c2a, c2b = cell_range(bi)
+        candidates: Set[int] = set()
+        for ca in range(c1a, c1b + 1):
+            for cb in range(c2a, c2b + 1):
+                for j in grid.get((ca, cb), ()):
+                    if j > i:
+                        candidates.add(j)
+        for j in candidates:
             bj = boxes[j]
             o1 = min(bi[1], bj[1]) - max(bi[0], bj[0])
             o2 = min(bi[3], bj[3]) - max(bi[2], bj[2])
