@@ -111,6 +111,7 @@ class Edge2D:
     a: Vec2
     b: Vec2
     hole: bool = False  # True si la arista pertenece a un anillo interior (abertura)
+    joint: bool = False  # True si es una línea de encastre (junta transversal 3D)
 
 
 @dataclass
@@ -124,7 +125,6 @@ class Panel:
     edges: List[Edge2D]
     source_group_id: int
     is_mark: bool = False  # True si las aberturas de este panel se graban (no se cortan)
-    user_cuts: List = field(default_factory=list)  # UserCut objects — se dibujan como overlay en el PDF
 
 
 @dataclass
@@ -979,9 +979,13 @@ def emit_panel_entities(
     is_mark: bool = False,
 ):
     for edge in edges:
-        # Si el panel está marcado, sus aberturas (anillos interiores, hole=True) se
-        # GRABAN en rojo (MARK_VECTOR/ACI 1) en vez de cortarse; el resto se corta.
-        if is_mark and getattr(edge, "hole", False):
+        # Prioridad de capa por arista:
+        #  - joint  -> línea de encastre (junta transversal 3D) en CUT_INTERIOR (ACI 3)
+        #  - hole en panel marcado -> abertura a grabar en MARK_VECTOR (ACI 1, rojo)
+        #  - resto  -> contorno a cortar en CUT_EXTERIOR (ACI 7)
+        if getattr(edge, "joint", False):
+            layer, aci = "CUT_INTERIOR", "3"
+        elif is_mark and getattr(edge, "hole", False):
             layer, aci = "MARK_VECTOR", "1"
         else:
             layer, aci = "CUT_EXTERIOR", "7"
