@@ -15,6 +15,7 @@ from core.group_classifier import GeometryGroup
 from core.pipeline import Phase1Result
 from core.services.assembly_adjuster import compute_adjustments
 from core.services.cutting_sheet import (
+    Edge2D,
     Panel,
     clip_panel_at_u,
     clip_panel_at_v,
@@ -22,6 +23,7 @@ from core.services.cutting_sheet import (
     nested_sheets_to_dxf,
     project_faces_to_2d,
 )
+from core.services.plate_intersect import resolve_plate_joints
 from core.services.facade_extractor import extract_facades
 from core.services.floor_plan_extractor import extract_floor_plans
 from core.services.joint_detector import detect_joints
@@ -108,21 +110,57 @@ def _effective_category(
     return overrides.get(group.id, group.category)
 
 
+def _slot_edges(
+    ax: float, ay: float, bx: float, by: float, width: float
+) -> List[Edge2D]:
+    """
+    Ranura de encastre (Misión 1-C): rectángulo cerrado de ancho `width` centrado en
+    el segmento (ax,ay)-(bx,by), en el marco 2D del panel. `width` = grosor de la placa
+    cortante, de modo que la placa cortada quede con la abertura justa por donde aquella
+    la atraviesa. Si el grosor es ~0 (desconocido) cae a una sola línea de junta.
+    Todas las aristas van marcadas joint=True -> capa CUT_INTERIOR.
+    """
+    import math
+
+    dx, dy = bx - ax, by - ay
+    seg_len = math.hypot(dx, dy)
+    if seg_len < 1e-9:
+        return []
+    if width < 1e-4:
+        return [Edge2D(a=Vec2(ax, ay), b=Vec2(bx, by), joint=True)]
+
+    ux, uy = dx / seg_len, dy / seg_len
+    px, py = -uy, ux  # perpendicular en el plano del panel
+    hw = width / 2.0
+    c1 = Vec2(ax + px * hw, ay + py * hw)
+    c2 = Vec2(bx + px * hw, by + py * hw)
+    c3 = Vec2(bx - px * hw, by - py * hw)
+    c4 = Vec2(ax - px * hw, ay - py * hw)
+    return [
+        Edge2D(a=c1, b=c2, joint=True),
+        Edge2D(a=c2, b=c3, joint=True),
+        Edge2D(a=c3, b=c4, joint=True),
+        Edge2D(a=c4, b=c1, joint=True),
+    ]
+
+
 def decompose_panels_from_groups(
     phase1: Phase1Result,
     opts: PipelineOptions,
     overrides: Optional[Dict[int, str]] = None,
     wall_wall_decisions: Optional[Dict[int, int]] = None,
     marks: Optional[List[int]] = None,
-    user_cuts: Optional[List] = None,
-    merge_target: Optional[Dict[int, int]] = None,
+    plate_joints: Optional[List] = None,
 ) -> Tuple[List[Panel], List[Panel]]:
-    from core.services.user_cuts import UserCut, build_cuts_by_group
-
     overrides = overrides or {}
-    marks_set = set(marks or [])
+    marks_set = set(marks or [])  # ids de grupos cuyas aberturas se graban (no se cortan)
     min_area = opts.min_area_m2 if opts.min_area_m2 is not None else 0.01
-    cuts_by_group = build_cuts_by_group(user_cuts or [], merge_target)
+
+    # Ranuras de encastre por placa CORTADA (Misión 1): cut_id -> [(P_a, P_b, ancho), ...]
+    # en 3D. `ancho` = grosor de la placa cortante (define el ancho de la ranura).
+    joints_by_cut: Dict[int, list] = {}
+    for pj in plate_joints or []:
+        joints_by_cut.setdefault(pj.cut_id, []).append((pj.a, pj.b, pj.width))
 
     effective_decisions: Dict[int, int] = {}
     for ww in phase1.wall_wall_joints:
@@ -180,9 +218,9 @@ def decompose_panels_from_groups(
                 )
                 if clipped:
                     width_m, height_m, edges = (
-                        clipped.width_m,
-                        clipped.height_m,
-                        clipped.edges,
+                        clipped["width_m"],
+                        clipped["height_m"],
+                        clipped["edges"],
                     )
 
         for w_adj in width_adjs.get(group.id, []):
@@ -201,18 +239,26 @@ def decompose_panels_from_groups(
             )
             if clipped:
                 width_m, height_m, edges = (
-                    clipped.width_m,
-                    clipped.height_m,
-                    clipped.edges,
+                    clipped["width_m"],
+                    clipped["height_m"],
+                    clipped["edges"],
                 )
 
         edges = mirror_edges_horizontal(edges, width_m)
 
-        # Los user_cuts se adjuntan al panel como overlay — NO modifican la geometría.
-        group_cuts: List[UserCut] = cuts_by_group.get(group.id, [])
-
-        if width_m * height_m < min_area:
-            continue
+        # Misión 1 (C): si esta placa es la CORTADA en una junta transversal, agregar la
+        # RANURA de encastre como aristas 'joint' (capa CUT_INTERIOR). El segmento 3D se
+        # proyecta al marco del panel con la base de project_faces_to_2d y se espeja igual
+        # que el contorno (x -> width_m - x); luego se engrosa a un rectángulo de ancho =
+        # grosor de la placa cortante (_slot_edges).
+        for (pa, pb, slot_w) in joints_by_cut.get(group.id, []):
+            ua = dot(pa, result.u_axis) - result.origin_u
+            va = dot(pa, result.v_axis) - result.origin_v
+            ub = dot(pb, result.u_axis) - result.origin_u
+            vb = dot(pb, result.v_axis) - result.origin_v
+            edges.extend(
+                _slot_edges(width_m - ua, va, width_m - ub, vb, slot_w)
+            )
 
         if is_floor:
             floor_count += 1
@@ -227,7 +273,6 @@ def decompose_panels_from_groups(
                     edges=edges,
                     source_group_id=group.id,
                     is_mark=group.id in marks_set,
-                    user_cuts=list(group_cuts),
                 )
             )
         else:
@@ -243,7 +288,6 @@ def decompose_panels_from_groups(
                     edges=edges,
                     source_group_id=group.id,
                     is_mark=group.id in marks_set,
-                    user_cuts=list(group_cuts),
                 )
             )
 
@@ -251,23 +295,9 @@ def decompose_panels_from_groups(
 
 
 def _panels_to_nesting(panels: List[Panel], scale_denom: float) -> List[NestingPanel]:
-    from core.services.user_cuts import UserCut as _UserCut
     s = 1.0 / scale_denom
     out: List[NestingPanel] = []
     for p in panels:
-        scaled_cuts = [
-            _UserCut(
-                id=c.id,
-                group_id=c.group_id,
-                kind=c.kind,
-                u0=c.u0 * s,
-                v0=c.v0 * s,
-                u1=c.u1 * s,
-                v1=c.v1 * s,
-                keep_positive=c.keep_positive,
-            )
-            for c in (p.user_cuts or [])
-        ]
         out.append(
             NestingPanel(
                 id=p.id,
@@ -279,11 +309,11 @@ def _panels_to_nesting(panels: List[Panel], scale_denom: float) -> List[NestingP
                         a=Vec2(e.a.x * s, e.a.y * s),
                         b=Vec2(e.b.x * s, e.b.y * s),
                         hole=e.hole,
+                        joint=getattr(e, "joint", False),
                     )
                     for e in p.edges
                 ],
                 is_mark=p.is_mark,
-                user_cuts=scaled_cuts,
             )
         )
     return out
@@ -296,21 +326,13 @@ def generate_from_review(
     wall_wall_decisions: Optional[Dict[int, int]] = None,
     merges: Optional[List[List[int]]] = None,
     marks: Optional[List[int]] = None,
-    user_cuts: Optional[List] = None,
 ) -> List[OutputFile]:
-    from core.services.user_cuts import build_merge_target_map, parse_user_cuts
-
-    merge_target = build_merge_target_map(phase1.groups, merges)
-    parsed_cuts = parse_user_cuts(user_cuts)
     work = apply_merges(phase1, merges or [])
+    # Misión 1: resolver intersecciones placa-placa en 3D (encastres) sobre la topología
+    # final (post-merges), antes de proyectar.
+    plate_joints = resolve_plate_joints(work.groups, work.faces)
     wall_panels, floor_panels = decompose_panels_from_groups(
-        work,
-        opts,
-        overrides,
-        wall_wall_decisions,
-        marks,
-        parsed_cuts,
-        merge_target,
+        work, opts, overrides, wall_wall_decisions, marks, plate_joints
     )
 
     sc = opts.sheet_config
