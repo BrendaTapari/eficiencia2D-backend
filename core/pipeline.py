@@ -4,7 +4,7 @@ from typing import List, Dict, Optional, Literal, Tuple
 from dataclasses import dataclass
 
 from core.profiler import PipelineTimer
-from core.services.types import Face3D, Facade, FloorPlan, PipelineOptions, OutputFile, Vec3, IndexedFace3D
+from core.services.types import Face3D, PipelineOptions, OutputFile, Vec3, IndexedFace3D
 from core.services.facade_extractor import detect_up_axis
 from core.group_classifier import (
     GeometryGroup,
@@ -20,16 +20,8 @@ from core.services.assembly_adjuster import (
     WallWallJoint,
     compute_adjustments,
 )
-from core.services.cutting_sheet import (
-    decompose_into_panels,
-    generate_cutting_sheets,
-    Panel,
-    PanelCategory,
-)
-from core.services.facade_extractor import extract_facades
-from core.services.floor_plan_extractor import extract_floor_plans
-from core.services.pdf_writer import generate_pdf, generate_nesting_pdf
-from core.services.sheet_nester import nest_panels, NestingResult, SheetConfig
+# La generación (Fase 2) vive en core.review_generate y se importa lazy dentro de
+# generate_pipeline; pipeline.py ya no usa cutting_sheet/pdf_writer/sheet_nester/extractors.
 
 logger = logging.getLogger("eficiencia2d.pipeline")
 
@@ -84,6 +76,12 @@ def parse_pipeline(
     working_faces = raw_faces
     if detected_up == "Z":
         working_faces = [_rotate_z_to_y(f) for f in raw_faces]
+
+    # Soldado canónico de vértices (snap-rounding único): unifica los índices para que
+    # la conectividad use igualdad entera exacta y suelda vértices coincidentes que el
+    # export pudo duplicar (costuras que sobre-cortan la pared). Ver core.services.topology.
+    from core.services.topology import weld_vertices
+    weld_vertices(working_faces)
 
     logger.info(
         f"parse_pipeline: {len(working_faces):,} caras de entrada (eje {detected_up})"
@@ -157,7 +155,6 @@ def generate_pipeline(
     wall_wall_decisions: Optional[Dict[int, int]] = None,
     merges: Optional[List[List[int]]] = None,
     marks: Optional[List[int]] = None,
-    user_cuts: Optional[List[dict]] = None,
 ) -> List[OutputFile]:
     from core.review_generate import generate_from_review
 
@@ -168,5 +165,4 @@ def generate_pipeline(
         wall_wall_decisions=wall_wall_decisions,
         merges=merges,
         marks=marks,
-        user_cuts=user_cuts,
     )
