@@ -1,6 +1,6 @@
 import math
 from typing import List, Optional, Tuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # Importamos nuestro tipo Vec2
 from core.services.types import Vec2
@@ -28,6 +28,7 @@ class Edge:
     a: Vec2
     b: Vec2
     hole: bool = False  # True si la arista pertenece a un anillo interior (abertura)
+    joint: bool = False  # True si es una línea de encastre (junta transversal 3D)
 
 
 @dataclass
@@ -38,7 +39,6 @@ class NestingPanel:
     height_m: float
     edges: List[Edge]
     is_mark: bool = False  # True si las aberturas se graban (no se cortan)
-    user_cuts: List = field(default_factory=list)  # UserCut objects (coords escaladas) — overlay en PDF
 
 
 @dataclass
@@ -287,6 +287,7 @@ def rotate_edges(edges: List[Edge], original_w: float) -> List[Edge]:
             a=Vec2(x=e.a.y, y=original_w - e.a.x),
             b=Vec2(x=e.b.y, y=original_w - e.b.x),
             hole=e.hole,
+            joint=getattr(e, "joint", False),
         )
         for e in edges
     ]
