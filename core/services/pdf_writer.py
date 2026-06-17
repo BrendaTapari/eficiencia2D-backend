@@ -417,7 +417,12 @@ def generate_nesting_pdf(
             cs.append("0.3 w")
             cur_color = None
             for edge in edges:
-                color = "1 0 0 RG" if (is_mark and getattr(edge, "hole", False)) else "0 0 0 RG"
+                if getattr(edge, "joint", False):
+                    color = "0 0.6 0 RG"          # verde: línea de encastre (junta)
+                elif is_mark and getattr(edge, "hole", False):
+                    color = "1 0 0 RG"            # rojo: abertura a grabar
+                else:
+                    color = "0 0 0 RG"            # negro: corte
                 if color != cur_color:
                     cs.append(color)
                     cur_color = color
@@ -426,65 +431,6 @@ def generate_nesting_pdf(
                 cs.append(
                     f"{tx(eax):.4f} {ty(eay):.4f} m\n{tx(ebx):.4f} {ty(eby):.4f} l\nS"
                 )
-
-            # Dibujar user_cuts como overlay (líneas punteadas azules)
-            panel_cuts = getattr(panel, "user_cuts", None) or []
-            if panel_cuts:
-                cs.append("0 0 0.75 RG\n0.5 w\n[4 3] 0 d")
-                orig_w = panel.width_m  # ancho original del NestingPanel (ya escalado)
-                for cut in panel_cuts:
-                    # Aplicar la misma rotación que se aplicó a las aristas
-                    if placed.rotated:
-                        u0r, v0r = cut.v0, orig_w - cut.u0
-                        u1r, v1r = cut.v1, orig_w - cut.u1
-                    else:
-                        u0r, v0r = cut.u0, cut.v0
-                        u1r, v1r = cut.u1, cut.v1
-
-                    if cut.kind == "line":
-                        ax = sx + px + u0r
-                        ay = sy_top + py + v0r
-                        bx = sx + px + u1r
-                        by = sy_top + py + v1r
-                        cs.append(f"{tx(ax):.4f} {ty(ay):.4f} m\n{tx(bx):.4f} {ty(by):.4f} l\nS")
-
-                    elif cut.kind in ("rect", "square"):
-                        min_u = min(u0r, u1r)
-                        max_u = max(u0r, u1r)
-                        min_v = min(v0r, v1r)
-                        max_v = max(v0r, v1r)
-                        if cut.kind == "square":
-                            side = max(max_u - min_u, max_v - min_v)
-                            max_u = min_u + side
-                            max_v = min_v + side
-                        corners = [
-                            (min_u, min_v), (max_u, min_v),
-                            (max_u, max_v), (min_u, max_v),
-                        ]
-                        for ci in range(4):
-                            ax = sx + px + corners[ci][0]
-                            ay = sy_top + py + corners[ci][1]
-                            bx = sx + px + corners[(ci + 1) % 4][0]
-                            by = sy_top + py + corners[(ci + 1) % 4][1]
-                            cs.append(f"{tx(ax):.4f} {ty(ay):.4f} m\n{tx(bx):.4f} {ty(by):.4f} l\nS")
-
-                    elif cut.kind == "circle":
-                        r = math.hypot(u1r - u0r, v1r - v0r)
-                        if r > 0:
-                            steps = 24
-                            pts = [
-                                (u0r + math.cos((i / steps) * math.pi * 2) * r,
-                                 v0r + math.sin((i / steps) * math.pi * 2) * r)
-                                for i in range(steps + 1)
-                            ]
-                            for i in range(len(pts) - 1):
-                                ax = sx + px + pts[i][0]
-                                ay = sy_top + py + pts[i][1]
-                                bx = sx + px + pts[i + 1][0]
-                                by = sy_top + py + pts[i + 1][1]
-                                cs.append(f"{tx(ax):.4f} {ty(ay):.4f} m\n{tx(bx):.4f} {ty(by):.4f} l\nS")
-
-                cs.append("[] 0 d\n0 0 0 RG")  # resetear dash y color
 
             if include_text:
                 real_w = pw * nesting.scale_denom
