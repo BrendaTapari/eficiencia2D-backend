@@ -26,6 +26,11 @@ def parse_obj(source: Union[str, Iterable[str]]) -> Dict[str, Any]:
     line_count = 0
     skip_count = 0
 
+    # Etiquetas semánticas del archivo (si existen). Se adjuntan a cada cara para que
+    # la clasificación pueda separar vidrio/marco/puerta de forma genérica.
+    cur_object = None
+    cur_material = None
+
     # Si es un string: splitlines() (rápido, sin copias en CPython, ya sin saltos).
     # Si es un iterable (file handle): iterar línea a línea y limpiar el salto de
     # línea por iteración — la RAM solo mantiene la línea actual.
@@ -45,6 +50,11 @@ def parse_obj(source: Union[str, Iterable[str]]) -> Dict[str, Any]:
             continue
         c0 = line[0]
         if c0 == '#' or c0 == 'm' or c0 == 'u' or c0 == 'g' or c0 == 's' or c0 == 'o':
+            # Capturar objeto (`o`) y material (`usemtl`) antes de descartar el resto.
+            if c0 == 'o' and line[:2] == 'o ':
+                cur_object = line[2:].strip() or None
+            elif c0 == 'u' and line.startswith('usemtl'):
+                cur_material = line[6:].strip() or None
             continue
 
         # Encontrar el primer espacio para separar prefix del resto
@@ -153,6 +163,8 @@ def parse_obj(source: Union[str, Iterable[str]]) -> Dict[str, Any]:
                     normal=normal,
                     inner_loops=[],
                     vertex_indices=face_v_indices,
+                    material=cur_material,
+                    source_object=cur_object,
                 )
             )
 
