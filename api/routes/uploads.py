@@ -10,7 +10,7 @@ import pickle
 import shutil
 import logging
 import dataclasses
-from typing import Dict, List, Optional, Literal
+from typing import Dict, List, Optional
 from pydantic import BaseModel
 from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -91,21 +91,114 @@ def encode_faces_compact(faces: List) -> Dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Serialización compartida (topology / nesting) para /upload, /recompute,
+# /nesting-preview. Mantiene una sola fuente de verdad del formato de respuesta.
+# ---------------------------------------------------------------------------
+
+def serialize_topology(result: Phase1Result, panel_id_by_group: Optional[Dict] = None) -> Dict:
+    topo = {
+        "groups": [dataclasses.asdict(g) for g in result.groups],
+        "joints": [dataclasses.asdict(j) for j in result.joints],
+        "adjustments": [dataclasses.asdict(a) for a in result.adjustments],
+        "wall_wall_joints": [dataclasses.asdict(wj) for wj in result.wall_wall_joints],
+        "applied_axis": result.applied_axis,
+        "stem": result.stem,
+        "warnings": result.warnings,
+        "pre_split_face_count": result.pre_split_face_count,
+        "suggested_merges": result.suggested_merges,
+        # Geometría empaquetada en buffers binarios (ver encode_faces_compact).
+        "faces_packed": encode_faces_compact(result.faces),
+        "raw_faces_packed": encode_faces_compact(result.raw_faces),
+    }
+    if panel_id_by_group is not None:
+        topo["panel_id_by_group"] = {str(k): v for k, v in panel_id_by_group.items()}
+    return topo
+
+
+def _serialize_nesting_panel(p) -> Dict:
+    return {
+        "id": p.id,
+        "category": p.category,
+        "width_m": p.width_m,
+        "height_m": p.height_m,
+        "edges": [
+            {
+                "a": {"x": e.a.x, "y": e.a.y},
+                "b": {"x": e.b.x, "y": e.b.y},
+                "hole": e.hole,
+                "joint": getattr(e, "joint", False),
+            }
+            for e in p.edges
+        ],
+        "is_mark": p.is_mark,
+    }
+
+
+def serialize_nesting(nesting) -> Dict:
+    return {
+        "sheets": [
+            {
+                "index": s.index,
+                "panels": [
+                    {
+                        "panel": _serialize_nesting_panel(pp.panel),
+                        "x": pp.x,
+                        "y": pp.y,
+                        "rotated": pp.rotated,
+                        "effective_w": pp.effective_w,
+                        "effective_h": pp.effective_h,
+                    }
+                    for pp in s.panels
+                ],
+                "utilization": s.utilization,
+            }
+            for s in nesting.sheets
+        ],
+        "config": {
+            "width_m": nesting.config.width_m,
+            "height_m": nesting.config.height_m,
+            "gap_m": nesting.config.gap_m,
+        },
+        "scale_denom": nesting.scale_denom,
+        "unplaced": [_serialize_nesting_panel(p) for p in nesting.unplaced],
+    }
+
+
+def load_or_parse_phase1(file_id: str, original_filename: str) -> Phase1Result:
+    """Carga el Phase1 de caché o, si no está, re-parsea desde el archivo en disco."""
+    phase1 = load_phase1_cache(file_id)
+    if phase1 is not None:
+        return phase1
+
+    logger.info("[load] Caché no encontrado, re-procesando archivo...")
+    file_path_obj = os.path.join(UPLOAD_DIR, f"{file_id}.obj")
+    file_path_stl = os.path.join(UPLOAD_DIR, f"{file_id}.stl")
+    file_path = file_path_obj if os.path.exists(file_path_obj) else file_path_stl
+    if not os.path.exists(file_path):
+        raise HTTPException(
+            status_code=404,
+            detail="Archivo no encontrado. Por favor sube el archivo nuevamente.",
+        )
+    if file_path.lower().endswith(".stl"):
+        parsed = parse_stl(file_path)
+    else:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            parsed = parse_obj(f)
+    phase1 = parse_pipeline(original_filename, parsed["faces"], parsed["warnings"])
+    save_phase1_cache(file_id, phase1)
+    return phase1
+
+
 class SheetConfigModel(BaseModel):
     width_m: float = 1.0
     height_m: float = 0.6
     gap_m: float = 0.003
 
 
-class UserCutModel(BaseModel):
-    id: str
+class SplitModel(BaseModel):
     group_id: int
-    kind: Literal["rect", "square", "circle", "line"]
-    u0: float
-    v0: float
-    u1: float
-    v1: float
-    keep_positive: Optional[bool] = True
+    mode: str = "components"  # "components" | "panels"
 
 
 class GenerateRequest(BaseModel):
@@ -114,12 +207,37 @@ class GenerateRequest(BaseModel):
     scale_denom: float = 50.0
     paper: str = "A4"
     min_area_m2: float = 1.0
+    axis: Optional[str] = None  # "Y" | "Z" | None (usa el eje del upload)
     sheet_config: Optional[SheetConfigModel] = None
     overrides: Optional[Dict[int, str]] = None
     wall_wall_decisions: Optional[Dict[int, int]] = None
     merges: Optional[List[List[int]]] = None
+    splits: Optional[List[SplitModel]] = None
     marks: Optional[List[int]] = None  # ids de componentes cuyas aberturas se graban
-    user_cuts: Optional[List[UserCutModel]] = None
+    user_cuts: Optional[List] = None  # reservado: corte manual futuro
+
+
+class RecomputeRequest(BaseModel):
+    file_id: str
+    original_filename: str = "model.obj"
+    axis: Optional[str] = None  # "Y" | "Z"
+    min_area_m2: float = 1.0
+    merges: Optional[List[List[int]]] = None
+    splits: Optional[List[SplitModel]] = None
+
+
+class NestingPreviewRequest(BaseModel):
+    file_id: str
+    original_filename: str = "model.obj"
+    axis: Optional[str] = None
+    min_area_m2: float = 1.0
+    merges: Optional[List[List[int]]] = None
+    splits: Optional[List[SplitModel]] = None
+    overrides: Optional[Dict[int, str]] = None
+    wall_wall_decisions: Optional[Dict[int, int]] = None
+    marks: Optional[List[int]] = None
+    sheet_config: Optional[SheetConfigModel] = None
+    scale_denom: float = 50.0
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +395,11 @@ async def upload_model(
         floor_count = sum(1 for g in result.groups if g.category == "floor")
         discard_count = sum(1 for g in result.groups if g.category == "discard")
 
+        # Etiquetas de panel (A1, B2, ...) calculadas por el back (best-effort).
+        with timer.step("panel_id_by_group"):
+            from core.review_generate import compute_panel_id_by_group
+            pid_by_group = compute_panel_id_by_group(result)
+
         timing_report = timer.report()
 
         # --- Respuesta: sin serializar faces individuales (ahorra GBs de JSON) ---
@@ -294,19 +417,7 @@ async def upload_model(
                 "total_faces": len(result.faces),
                 "total_joints": len(result.joints),
             },
-            "topology": {
-                "groups": [dataclasses.asdict(g) for g in result.groups],
-                "joints": [dataclasses.asdict(j) for j in result.joints],
-                "adjustments": [dataclasses.asdict(a) for a in result.adjustments],
-                "wall_wall_joints": [dataclasses.asdict(wj) for wj in result.wall_wall_joints],
-                "applied_axis": result.applied_axis,
-                "pre_split_face_count": result.pre_split_face_count,
-                "suggested_merges": result.suggested_merges,
-                # Geometría empaquetada en buffers binarios (ver encode_faces_compact).
-                # El front la decodifica a Face3D[] (faces) y rawFaces.
-                "faces_packed": encode_faces_compact(result.faces),
-                "raw_faces_packed": encode_faces_compact(result.raw_faces),
-            },
+            "topology": serialize_topology(result, pid_by_group),
             "preview_obj": preview_obj,
             "timing": timing_report,  # Debug: reporte de timing
         })
@@ -332,41 +443,20 @@ async def generate_pdf_endpoint(request: GenerateRequest):
     """
     timer = PipelineTimer("generate_endpoint")
 
-    # --- Intentar cargar caché ---
-    with timer.step("load_phase1_cache"):
-        phase1 = load_phase1_cache(request.file_id)
-
-    if phase1 is None:
-        logger.info("[generate] Caché no encontrado, re-procesando OBJ...")
-        # Fallback: re-procesar desde disco
-        file_path_obj = os.path.join(UPLOAD_DIR, f"{request.file_id}.obj")
-        file_path_stl = os.path.join(UPLOAD_DIR, f"{request.file_id}.stl")
-        file_path = file_path_obj if os.path.exists(file_path_obj) else file_path_stl
-
-        if not os.path.exists(file_path):
-            raise HTTPException(status_code=404, detail="Archivo no encontrado. Por favor sube el archivo nuevamente.")
-
-        try:
-            with timer.step("parse_model_fallback"):
-                if file_path.lower().endswith(".stl"):
-                    parsed = parse_stl(file_path)
-                else:
-                    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                        parsed = parse_obj(f)
-
-            with timer.step("parse_pipeline_fallback"):
-                phase1 = parse_pipeline(request.original_filename, parsed["faces"], parsed["warnings"])
-
-            with timer.step("save_phase1_cache_fallback"):
-                save_phase1_cache(request.file_id, phase1)
-
-        except Exception as e:
-            logger.exception(f"[generate] Error en fallback: {e}")
-            raise HTTPException(status_code=500, detail=f"Error en re-procesamiento: {str(e)}")
-    else:
-        logger.info("[generate] Usando caché de Phase1 ✓")
+    with timer.step("load_phase1"):
+        base = load_or_parse_phase1(request.file_id, request.original_filename)
 
     try:
+        # Re-derivar topología determinística: eje → área mínima → splits.
+        from core.pipeline import apply_review_edits
+        with timer.step("apply_review_edits"):
+            phase1 = apply_review_edits(
+                base,
+                axis=request.axis,
+                min_real_area=request.min_area_m2,
+                splits=[s.dict() for s in (request.splits or [])],
+            )
+
         sheet = request.sheet_config
         sheet_cfg = (
             SheetConfig(
@@ -386,11 +476,6 @@ async def generate_pdf_endpoint(request: GenerateRequest):
         )
 
         with timer.step("generate_pipeline"):
-            user_cuts_payload = (
-                [c.model_dump() for c in request.user_cuts]
-                if request.user_cuts
-                else None
-            )
             files = generate_pipeline(
                 phase1,
                 opts,
@@ -398,7 +483,6 @@ async def generate_pdf_endpoint(request: GenerateRequest):
                 wall_wall_decisions=request.wall_wall_decisions,
                 merges=request.merges,
                 marks=request.marks,
-                user_cuts=user_cuts_payload,
             )
 
         if not files:
@@ -424,6 +508,121 @@ async def generate_pdf_endpoint(request: GenerateRequest):
             "timing": timing_report,
         })
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(f"[generate] Error: {e}")
         raise HTTPException(status_code=500, detail=f"Error en generación: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# Endpoint /recompute — re-deriva la topología tras una edición geométrica
+# (eje, área mínima, fusiones, divisiones). Devuelve la misma estructura que
+# /upload. El front reemplaza su phase1Result completo con esta respuesta.
+# ---------------------------------------------------------------------------
+
+@router.post("/recompute")
+async def recompute_endpoint(request: RecomputeRequest):
+    timer = PipelineTimer("recompute_endpoint")
+
+    with timer.step("load_phase1"):
+        base = load_or_parse_phase1(request.file_id, request.original_filename)
+
+    try:
+        from core.pipeline import apply_review_edits
+        from core.review_generate import apply_merges, compute_panel_id_by_group
+
+        with timer.step("apply_review_edits"):
+            rebuilt = apply_review_edits(
+                base,
+                axis=request.axis,
+                min_real_area=request.min_area_m2,
+                splits=[s.dict() for s in (request.splits or [])],
+            )
+
+        with timer.step("apply_merges"):
+            merged = apply_merges(rebuilt, request.merges or [])
+
+        with timer.step("panel_id_by_group"):
+            pid_by_group = compute_panel_id_by_group(merged)
+
+        timer.report()
+        return JSONResponse(content={"topology": serialize_topology(merged, pid_by_group)})
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"[recompute] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error en recálculo: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# Endpoint /nesting-preview — layout de nesting para previsualizar antes de
+# generar los archivos finales. Aplica la misma cadena determinística que
+# /generate (eje → área → splits → merges → overrides/decisiones) pero en vez
+# de exportar DXF/PDF devuelve la distribución de paneles en planchas.
+# ---------------------------------------------------------------------------
+
+@router.post("/nesting-preview")
+async def nesting_preview_endpoint(request: NestingPreviewRequest):
+    timer = PipelineTimer("nesting_preview_endpoint")
+
+    with timer.step("load_phase1"):
+        base = load_or_parse_phase1(request.file_id, request.original_filename)
+
+    try:
+        from core.pipeline import apply_review_edits
+        from core.review_generate import compute_nesting
+
+        with timer.step("apply_review_edits"):
+            rebuilt = apply_review_edits(
+                base,
+                axis=request.axis,
+                min_real_area=request.min_area_m2,
+                splits=[s.dict() for s in (request.splits or [])],
+            )
+
+        sheet = request.sheet_config
+        sheet_cfg = (
+            SheetConfig(
+                width_m=sheet.width_m,
+                height_m=sheet.height_m,
+                gap_m=sheet.gap_m,
+            )
+            if sheet
+            else SheetConfig(width_m=1.0, height_m=0.6, gap_m=0.003)
+        )
+        opts = PipelineOptions(
+            scale_denom=request.scale_denom,
+            paper="A4",
+            include_cutting_sheet=True,
+            sheet_config=sheet_cfg,
+            min_area_m2=request.min_area_m2,
+        )
+
+        with timer.step("compute_nesting"):
+            _, wall_nesting, floor_nesting, cfg, _ = compute_nesting(
+                rebuilt,
+                opts,
+                overrides=request.overrides,
+                wall_wall_decisions=request.wall_wall_decisions,
+                merges=request.merges,
+                marks=request.marks,
+            )
+
+        timer.report()
+        return JSONResponse(content={
+            "wall_nesting": serialize_nesting(wall_nesting),
+            "floor_nesting": serialize_nesting(floor_nesting),
+            "config": {
+                "width_m": cfg.width_m,
+                "height_m": cfg.height_m,
+                "gap_m": cfg.gap_m,
+            },
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"[nesting-preview] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error en nesting-preview: {str(e)}")
