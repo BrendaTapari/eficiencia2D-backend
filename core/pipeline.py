@@ -11,6 +11,7 @@ from core.group_classifier import (
     classify_into_groups,
     peel_buried_walls,
     polish_groups,
+    split_thin_groups_by_pane,
     DEFAULT_MIN_REAL_AREA,
 )
 from core.services.mesh_splitter import split_wall_groups_at_floors
@@ -124,6 +125,11 @@ def parse_pipeline(
     # 4. Polish groups
     with timer.step("polish_groups", group_count=len(split_groups)):
         polish_groups(split_groups, min_real_area)
+
+    # 4.5 Separar vidrios/elementos finos: cada ventana, cada vidrio, su propio grupo
+    # (sólo grupos finos por grosor; los muros gruesos quedan intactos).
+    with timer.step("split_thin_groups_by_pane", group_count=len(split_groups)):
+        split_groups = split_thin_groups_by_pane(split_groups, split_faces)
 
     # 5. Detección de joints
     with timer.step("detect_joints", group_count=len(split_groups), face_count=len(split_faces)):
