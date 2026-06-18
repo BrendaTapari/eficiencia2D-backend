@@ -36,7 +36,23 @@ from core.services.sheet_nester import (
     Edge,
     nest_panels,
 )
-from core.services.types import OutputFile, PipelineOptions, Vec3, dot
+from core.services.types import OutputFile, PipelineOptions, Vec3, dot, normalize
+
+
+# Una fusión sólo tiene sentido entre paredes COPLANARES (mismo plano). Si la
+# selección por área agarró paredes en distinta dirección, fusionarlas crea un grupo
+# de normales mezcladas que al proyectar produce "paredes fantasma". Guardas:
+MERGE_PARALLEL_DOT = 0.95   # |n_m·n_s| > esto => paralelas/antiparalelas (mismo plano)
+MERGE_PLANE_TOL = 0.30      # m: separación máxima de plano (tolera grosor/pieles)
+
+
+def _coplanar_for_merge(member: GeometryGroup, survivor: GeometryGroup) -> bool:
+    ns = normalize(survivor.representative_normal)
+    nm = normalize(member.representative_normal)
+    if abs(dot(ns, nm)) < MERGE_PARALLEL_DOT:
+        return False  # direcciones distintas -> no fusionar
+    # mismo plano: distancia del centroide del miembro al plano del survivor
+    return abs(dot(ns, member.centroid) - dot(ns, survivor.centroid)) <= MERGE_PLANE_TOL
 
 
 def apply_merges(phase1: Phase1Result, merges: List[List[int]]) -> Phase1Result:
@@ -45,6 +61,7 @@ def apply_merges(phase1: Phase1Result, merges: List[List[int]]) -> Phase1Result:
 
     group_by_id: Dict[int, GeometryGroup] = {g.id: g for g in phase1.groups}
     merged_ids: set[int] = set()
+    skipped = 0
 
     for merge_set in merges:
         members = [
@@ -56,6 +73,16 @@ def apply_merges(phase1: Phase1Result, merges: List[List[int]]) -> Phase1Result:
             continue
 
         survivor = max(members, key=lambda g: g.total_area)
+        # Sólo fusionar los miembros coplanares con el survivor; los que están en otra
+        # dirección/plano se dejan como grupos sueltos (no se funden ni se descartan).
+        members = [
+            m for m in members
+            if m.id == survivor.id or _coplanar_for_merge(m, survivor)
+        ]
+        skipped += len(merge_set) - len(members)
+        if len(members) < 2:
+            continue
+
         combined_faces: List[int] = []
         total_area = 0.0
         cx = cy = cz = 0.0
@@ -86,6 +113,12 @@ def apply_merges(phase1: Phase1Result, merges: List[List[int]]) -> Phase1Result:
             centroid=centroid,
             min_y=min_y,
             max_y=max_y,
+        )
+
+    if skipped:
+        import logging
+        logging.getLogger("eficiencia2d.pipeline").info(
+            f"  apply_merges: {skipped} paredes no coplanares omitidas de la fusión"
         )
 
     new_groups = [
