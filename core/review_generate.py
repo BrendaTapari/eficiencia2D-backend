@@ -319,20 +319,65 @@ def _panels_to_nesting(panels: List[Panel], scale_denom: float) -> List[NestingP
     return out
 
 
-def generate_from_review(
+def _decompose(
+    phase1: Phase1Result,
+    opts: PipelineOptions,
+    overrides: Optional[Dict[int, str]],
+    wall_wall_decisions: Optional[Dict[int, int]],
+    merges: Optional[List[List[int]]],
+    marks: Optional[List[int]],
+) -> Tuple[Phase1Result, List[Panel], List[Panel]]:
+    """Aplica merges, resuelve encastres 3D y descompone a paneles 2D."""
+    work = apply_merges(phase1, merges or [])
+    # Misión 1: resolver intersecciones placa-placa en 3D (encastres) sobre la
+    # topología final (post-merges), antes de proyectar.
+    plate_joints = resolve_plate_joints(work.groups, work.faces)
+    wall_panels, floor_panels = decompose_panels_from_groups(
+        work, opts, overrides, wall_wall_decisions, marks, plate_joints
+    )
+    return work, wall_panels, floor_panels
+
+
+def panel_ids_by_group(
+    wall_panels: List[Panel], floor_panels: List[Panel]
+) -> Dict[int, str]:
+    """Mapa group_id -> etiqueta de panel ("A1", "B2", ...) calculado por el back."""
+    out: Dict[int, str] = {}
+    for p in list(wall_panels) + list(floor_panels):
+        gid = getattr(p, "source_group_id", None)
+        if gid is not None:
+            out[gid] = p.id
+    return out
+
+
+def compute_panel_id_by_group(
+    phase1: Phase1Result, opts: Optional[PipelineOptions] = None
+) -> Dict[int, str]:
+    """Etiquetas de panel por grupo (best-effort) para /upload y /recompute."""
+    if opts is None:
+        opts = PipelineOptions(
+            scale_denom=50.0, paper="A4", min_area_m2=None, sheet_config=None
+        )
+    try:
+        _, wall_panels, floor_panels = _decompose(
+            phase1, opts, None, None, None, None
+        )
+        return panel_ids_by_group(wall_panels, floor_panels)
+    except Exception:
+        return {}
+
+
+def compute_nesting(
     phase1: Phase1Result,
     opts: PipelineOptions,
     overrides: Optional[Dict[int, str]] = None,
     wall_wall_decisions: Optional[Dict[int, int]] = None,
     merges: Optional[List[List[int]]] = None,
     marks: Optional[List[int]] = None,
-) -> List[OutputFile]:
-    work = apply_merges(phase1, merges or [])
-    # Misión 1: resolver intersecciones placa-placa en 3D (encastres) sobre la topología
-    # final (post-merges), antes de proyectar.
-    plate_joints = resolve_plate_joints(work.groups, work.faces)
-    wall_panels, floor_panels = decompose_panels_from_groups(
-        work, opts, overrides, wall_wall_decisions, marks, plate_joints
+) -> Tuple[Phase1Result, NestingResult, NestingResult, SheetConfig, Dict[int, str]]:
+    """Descompone y anida paneles. Compartido por /generate y /nesting-preview."""
+    work, wall_panels, floor_panels = _decompose(
+        phase1, opts, overrides, wall_wall_decisions, merges, marks
     )
 
     sc = opts.sheet_config
@@ -342,10 +387,31 @@ def generate_from_review(
         gap_m=sc.gap_m if sc else 0.003,
     )
     scale = opts.scale_denom
-    stem = work.stem
-
     wall_nesting = nest_panels(_panels_to_nesting(wall_panels, scale), sheet_cfg, scale)
     floor_nesting = nest_panels(_panels_to_nesting(floor_panels, scale), sheet_cfg, scale)
+
+    return (
+        work,
+        wall_nesting,
+        floor_nesting,
+        sheet_cfg,
+        panel_ids_by_group(wall_panels, floor_panels),
+    )
+
+
+def generate_from_review(
+    phase1: Phase1Result,
+    opts: PipelineOptions,
+    overrides: Optional[Dict[int, str]] = None,
+    wall_wall_decisions: Optional[Dict[int, int]] = None,
+    merges: Optional[List[List[int]]] = None,
+    marks: Optional[List[int]] = None,
+) -> List[OutputFile]:
+    work, wall_nesting, floor_nesting, sheet_cfg, _ = compute_nesting(
+        phase1, opts, overrides, wall_wall_decisions, merges, marks
+    )
+    scale = opts.scale_denom
+    stem = work.stem
 
     files: List[OutputFile] = []
 
