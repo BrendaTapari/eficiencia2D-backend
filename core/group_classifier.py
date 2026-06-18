@@ -501,40 +501,57 @@ GLASS_MAX_THICKNESS = 0.02  # 2 cm: por debajo se considera vidrio/elemento fino
 
 
 def _overlap_components(
-    face_indices: List[int], faces: List[Face3D], normal: Vec3
+    face_indices: List[int], faces: List[Face3D], normal: Vec3, merge_frac: float = 0.5
 ) -> List[List[int]]:
-    """Reagrupa caras por solape 2D (área de intersección > 0) en el plano `normal`."""
+    """
+    Separa un grupo fino en sus piezas reales (cada vidrio, el marco) así:
+      1. componentes conexas 3D -> cada vidrio es ya un componente aparte (no
+         comparte vértices con sus vecinos), y el marco/montantes es otro;
+      2. se reúnen SÓLO los componentes cuyas proyecciones se solapan en una
+         fracción alta (>= merge_frac del área del más chico). Frente y dorso del
+         mismo vidrio se proyectan al mismo rectángulo (solape ~100%) -> se unen
+         en un elemento; el marco solapa cada vidrio sólo en bordes finos (fracción
+         baja) -> queda separado; vidrios vecinos sólo se tocan en el borde
+         (solape nulo) -> quedan separados.
+    """
     from shapely import STRtree
     from shapely.geometry import Polygon
+    from shapely.ops import unary_union
     from core.services.topology import _inplane_basis
+
+    comps = topo_connected_components(
+        list(face_indices), face_of=lambda i: faces[i], coord_snap=0.01
+    )
+    if len(comps) <= 1:
+        return [list(face_indices)]
 
     n = normalize(normal)
     u, v = _inplane_basis(n)
 
-    polys: Dict[int, "Polygon"] = {}
-    degenerate: List[int] = []
-    for i in face_indices:
-        f = faces[i]
-        if len(f.vertices) < 3:
-            degenerate.append(i)
-            continue
-        pts = [
-            (vt.x * u.x + vt.y * u.y + vt.z * u.z, vt.x * v.x + vt.y * v.y + vt.z * v.z)
-            for vt in f.vertices
-        ]
-        pp = Polygon(pts)
-        if not pp.is_valid:
-            pp = pp.buffer(0)
-        if pp.is_empty or pp.area <= 1e-9:
-            degenerate.append(i)
-            continue
-        polys[i] = pp
+    def project(vt):
+        return (vt.x * u.x + vt.y * u.y + vt.z * u.z, vt.x * v.x + vt.y * v.y + vt.z * v.z)
 
-    valid = list(polys.keys())
-    if len(valid) <= 1:
-        return [face_indices]
+    polys: List[Optional["Polygon"]] = []
+    for comp in comps:
+        rings = []
+        for i in comp:
+            f = faces[i]
+            if len(f.vertices) < 3:
+                continue
+            pp = Polygon([project(vt) for vt in f.vertices])
+            if not pp.is_valid:
+                pp = pp.buffer(0)
+            if (not pp.is_empty) and pp.area > 1e-9:
+                rings.append(pp)
+        if not rings:
+            polys.append(None)
+            continue
+        m = unary_union(rings)
+        if not m.is_valid:
+            m = m.buffer(0)
+        polys.append(m if not m.is_empty else None)
 
-    parent = {i: i for i in valid}
+    parent = list(range(len(comps)))
 
     def find(x: int) -> int:
         while parent[x] != x:
@@ -542,29 +559,28 @@ def _overlap_components(
             x = parent[x]
         return x
 
-    geoms = [polys[i] for i in valid]
-    tree = STRtree(geoms)
-    AREA_EPS = 1e-6
-    for i in valid:
-        for m in tree.query(polys[i]):
-            j = valid[int(m)]
-            if j <= i:
-                continue
-            inter = polys[i].intersection(polys[j])
-            if (not inter.is_empty) and inter.area > AREA_EPS:
-                ri, rj = find(i), find(j)
-                if ri != rj:
-                    parent[ri] = rj
+    valid = [i for i in range(len(comps)) if polys[i] is not None]
+    if len(valid) > 1:
+        geoms = [polys[i] for i in valid]
+        tree = STRtree(geoms)
+        for i in valid:
+            for m in tree.query(polys[i]):
+                j = valid[int(m)]
+                if j <= i:
+                    continue
+                inter = polys[i].intersection(polys[j])
+                if inter.is_empty:
+                    continue
+                amin = min(polys[i].area, polys[j].area)
+                if amin > 1e-9 and inter.area >= merge_frac * amin:
+                    ri, rj = find(i), find(j)
+                    if ri != rj:
+                        parent[ri] = rj
 
     comp_map: Dict[int, List[int]] = {}
-    for i in valid:
-        comp_map.setdefault(find(i), []).append(i)
-    pieces = list(comp_map.values())
-    # Las caras canto (proyección degenerada, p. ej. el grosor del vidrio) se
-    # adjuntan al primer elemento para no perder geometría.
-    if degenerate and pieces:
-        pieces[0].extend(degenerate)
-    return pieces
+    for k, comp in enumerate(comps):
+        comp_map.setdefault(find(k), []).extend(comp)
+    return list(comp_map.values())
 
 
 def split_thin_groups_by_pane(
