@@ -484,6 +484,159 @@ def apply_splits(
 
 
 # ---------------------------------------------------------------------------
+# Separación por etiquetas semánticas del archivo (objeto `o` + material `usemtl`)
+#
+# Genérico: si el modelo trae objetos/materiales explícitos (Blender, Revit, etc.),
+# dos caras con DISTINTO (objeto, material) no deben quedar en el mismo grupo. Así
+# se separa vidrio de marco de muro, y la puerta del muro, sin heurísticas ni
+# nombres hardcodeados. Si el archivo no trae etiquetas (p. ej. STL), no hace nada
+# y el pipeline cae a la separación por grosor.
+# ---------------------------------------------------------------------------
+
+
+def _face_tag(f: Face3D) -> Tuple[Optional[str], Optional[str]]:
+    return (getattr(f, "source_object", None), getattr(f, "material", None))
+
+
+def _merge_overlapping_pieces(
+    pieces: List[List[int]], faces: List[Face3D], normal: Vec3, frac: float = 0.5
+) -> List[List[int]]:
+    """
+    Reúne piezas cuyas proyecciones se solapan >= `frac` del área de la más chica.
+    Protege el emparejamiento de pieles: el frente y el dorso del mismo panel (mismo
+    rectángulo proyectado, materiales distintos) vuelven a ser UN panel; vidrio y
+    marco (coplanares lado a lado, solape nulo) quedan separados.
+    """
+    if len(pieces) <= 1:
+        return pieces
+
+    from shapely import STRtree
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+    from core.services.topology import _inplane_basis
+
+    n = normalize(normal)
+    u, v = _inplane_basis(n)
+
+    polys: List[Optional["Polygon"]] = []
+    for piece in pieces:
+        rings = []
+        for i in piece:
+            f = faces[i]
+            if len(f.vertices) < 3:
+                continue
+            pp = Polygon(
+                [
+                    (vt.x * u.x + vt.y * u.y + vt.z * u.z, vt.x * v.x + vt.y * v.y + vt.z * v.z)
+                    for vt in f.vertices
+                ]
+            )
+            if not pp.is_valid:
+                pp = pp.buffer(0)
+            if (not pp.is_empty) and pp.area > 1e-9:
+                rings.append(pp)
+        if not rings:
+            polys.append(None)
+            continue
+        m = unary_union(rings)
+        if not m.is_valid:
+            m = m.buffer(0)
+        polys.append(m if not m.is_empty else None)
+
+    parent = list(range(len(pieces)))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    valid = [i for i in range(len(pieces)) if polys[i] is not None]
+    if len(valid) > 1:
+        tree = STRtree([polys[i] for i in valid])
+        for i in valid:
+            for m in tree.query(polys[i]):
+                j = valid[int(m)]
+                if j <= i:
+                    continue
+                inter = polys[i].intersection(polys[j])
+                if inter.is_empty:
+                    continue
+                amin = min(polys[i].area, polys[j].area)
+                if amin > 1e-9 and inter.area >= frac * amin:
+                    ri, rj = find(i), find(j)
+                    if ri != rj:
+                        parent[ri] = rj
+
+    merged: Dict[int, List[int]] = {}
+    for k in range(len(pieces)):
+        merged.setdefault(find(k), []).extend(pieces[k])
+    return list(merged.values())
+
+
+def split_groups_by_tags(
+    groups: List["GeometryGroup"], faces: List[Face3D]
+) -> List["GeometryGroup"]:
+    """
+    Subdivide los grupos que mezclan varios (objeto, material) en un subgrupo por
+    etiqueta (y por componente conexo dentro de cada etiqueta), pero RE-UNE las
+    piezas que se solapan en proyección para no partir las dos pieles de un muro
+    (frente/dorso con materiales distintos). Los grupos con una sola etiqueta quedan
+    intactos. No-op si el archivo no trae etiquetas.
+    """
+    has_tags = any(
+        _face_tag(faces[fi]) != (None, None)
+        for g in groups
+        for fi in g.face_indices
+        if 0 <= fi < len(faces)
+    )
+    if not has_tags:
+        return groups
+
+    next_id = max((g.id for g in groups), default=0) + 1
+    out: List["GeometryGroup"] = []
+    split_count = 0
+
+    for g in groups:
+        buckets: Dict[Tuple[Optional[str], Optional[str]], List[int]] = {}
+        for fi in g.face_indices:
+            if 0 <= fi < len(faces):
+                buckets.setdefault(_face_tag(faces[fi]), []).append(fi)
+        if len(buckets) <= 1:
+            out.append(g)
+            continue
+
+        pieces: List[List[int]] = []
+        for _tag, idxs in buckets.items():
+            pieces.extend(
+                topo_connected_components(
+                    idxs, face_of=lambda i: faces[i], coord_snap=0.01
+                )
+            )
+
+        # Re-unir pieles (frente/dorso) que se solapan; mantener separados vidrio,
+        # marco y puerta (coplanares lado a lado).
+        pieces = _merge_overlapping_pieces(pieces, faces, g.representative_normal)
+        if len(pieces) <= 1:
+            out.append(g)
+            continue
+
+        for piece in pieces:
+            ng = _build_group_from_indices(next_id, g, piece, faces)
+            if ng:
+                out.append(ng)
+                next_id += 1
+        split_count += 1
+
+    if split_count:
+        logger.info(
+            f"  split_groups_by_tags: {split_count} grupos multi-etiqueta separados "
+            f"({len(groups)} -> {len(out)} grupos)"
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Separación de vidrios / elementos finos (ventanas) — por grosor + solape 2D
 #
 # Una "hilera de ventanas" o un muro cortina termina en un solo grupo (los
