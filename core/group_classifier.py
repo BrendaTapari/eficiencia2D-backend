@@ -598,6 +598,13 @@ def split_groups_by_tags(
     split_count = 0
 
     for g in groups:
+        # Sólo separar PAREDES por material/objeto (vidrio, marco, puerta). Los pisos
+        # son una losa por nivel: partirlos por material los fragmenta (FrontColor /
+        # Color_*), así que se dejan con la fusión de losas de classify.
+        if g.category != "wall":
+            out.append(g)
+            continue
+
         buckets: Dict[Tuple[Optional[str], Optional[str]], List[int]] = {}
         for fi in g.face_indices:
             if 0 <= fi < len(faces):
