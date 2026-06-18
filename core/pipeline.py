@@ -66,13 +66,19 @@ def _rotate_z_to_y(face: Face3D) -> Face3D:
 
 
 def parse_pipeline(
-    file_name: str, faces: List[Face3D], warnings: List[str]
+    file_name: str,
+    faces: List[Face3D],
+    warnings: List[str],
+    force_axis: Optional[Literal["Y", "Z"]] = None,
+    min_real_area: float = DEFAULT_MIN_REAL_AREA,
 ) -> Phase1Result:
     timer = PipelineTimer(f"parse_pipeline({file_name})")
     stem = file_name.rsplit(".", 1)[0]
 
     raw_faces = list(faces)
-    detected_up = detect_up_axis(raw_faces)
+    # `force_axis` permite al usuario fijar el eje vertical (endpoint /recompute);
+    # si no se fuerza, se autodetecta como siempre.
+    detected_up = force_axis if force_axis in ("Y", "Z") else detect_up_axis(raw_faces)
     working_faces = raw_faces
     if detected_up == "Z":
         working_faces = [_rotate_z_to_y(f) for f in raw_faces]
@@ -89,7 +95,9 @@ def parse_pipeline(
 
     # 1. Clasificación inicial
     with timer.step("classify_into_groups", face_count=len(working_faces)):
-        groups = classify_into_groups(working_faces, out_warnings=warnings)
+        groups = classify_into_groups(
+            working_faces, min_real_area=min_real_area, out_warnings=warnings
+        )
 
     logger.info(f"  → {len(groups)} grupos: " + 
                 ", ".join(f"{sum(1 for g in groups if g.category==c)} {c}" 
@@ -104,7 +112,9 @@ def parse_pipeline(
     # 3. Split por pisos
     pre_split_face_count = len(working_faces)
     with timer.step("split_wall_groups_at_floors", face_count=pre_split_face_count):
-        split_faces, split_groups = split_wall_groups_at_floors(working_faces, groups, {})
+        split_faces, split_groups = split_wall_groups_at_floors(
+            working_faces, groups, {}, min_real_area=min_real_area
+        )
 
     logger.info(
         f"  → split: {pre_split_face_count:,} → {len(split_faces):,} caras, "
@@ -113,7 +123,7 @@ def parse_pipeline(
 
     # 4. Polish groups
     with timer.step("polish_groups", group_count=len(split_groups)):
-        polish_groups(split_groups, DEFAULT_MIN_REAL_AREA)
+        polish_groups(split_groups, min_real_area)
 
     # 5. Detección de joints
     with timer.step("detect_joints", group_count=len(split_groups), face_count=len(split_faces)):
@@ -166,3 +176,56 @@ def generate_pipeline(
         merges=merges,
         marks=marks,
     )
+
+
+def apply_review_edits(
+    base: Phase1Result,
+    axis: Optional[str] = None,
+    min_real_area: Optional[float] = None,
+    splits: Optional[List[dict]] = None,
+) -> Phase1Result:
+    """
+    Re-deriva la topología de forma determinística a partir de las caras originales
+    (`base.raw_faces`) aplicando, en orden: eje vertical → área mínima → splits.
+
+    No aplica merges (eso lo hace review_generate.apply_merges, compartido por
+    /recompute, /nesting-preview y /generate). Reusa parse_pipeline para que la
+    cadena sea idéntica a la del upload, sin re-leer el archivo de disco.
+    """
+    from dataclasses import replace as _replace
+    from core.group_classifier import apply_splits
+
+    ax = axis if axis in ("Y", "Z") else base.applied_axis
+    mra = DEFAULT_MIN_REAL_AREA if min_real_area is None else float(min_real_area)
+    splits = splits or []
+
+    # Fast-path: sin ediciones reales (mismo eje, área por defecto, sin splits) →
+    # devolver la base tal cual y evitar re-clasificar (~2 s en modelos grandes).
+    if (
+        not splits
+        and (axis is None or ax == base.applied_axis)
+        and abs(mra - DEFAULT_MIN_REAL_AREA) < 1e-9
+    ):
+        return base
+
+    p1 = parse_pipeline(
+        f"{base.stem}.obj",
+        base.raw_faces,
+        [],
+        force_axis=ax,
+        min_real_area=mra,
+    )
+
+    if splits:
+        groups = apply_splits(p1.groups, p1.faces, splits)
+        joints = detect_joints(p1.faces, groups)
+        adj = compute_adjustments(joints, groups, faces=p1.faces)
+        p1 = _replace(
+            p1,
+            groups=groups,
+            joints=joints,
+            adjustments=adj.adjustments,
+            wall_wall_joints=adj.wall_wall_joints,
+        )
+
+    return p1
