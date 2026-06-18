@@ -11,6 +11,7 @@ from core.group_classifier import (
     classify_into_groups,
     peel_buried_walls,
     polish_groups,
+    split_groups_by_tags,
     split_thin_groups_by_pane,
     DEFAULT_MIN_REAL_AREA,
 )
@@ -56,6 +57,8 @@ def _rotate_z_to_y(face: Face3D) -> Face3D:
             normal=new_normal,
             inner_loops=new_inner,
             panel_id=face.panel_id,
+            material=getattr(face, "material", None),
+            source_object=getattr(face, "source_object", None),
             vertex_indices=list(face.vertex_indices),
         )
     return Face3D(
@@ -63,6 +66,8 @@ def _rotate_z_to_y(face: Face3D) -> Face3D:
         normal=new_normal,
         inner_loops=new_inner,
         panel_id=face.panel_id,
+        material=getattr(face, "material", None),
+        source_object=getattr(face, "source_object", None),
     )
 
 
@@ -99,6 +104,12 @@ def parse_pipeline(
         groups = classify_into_groups(
             working_faces, min_real_area=min_real_area, out_warnings=warnings
         )
+
+    # 1.5 Separar por etiquetas del archivo (objeto/material) si existen: el vidrio,
+    # el marco y la puerta no deben quedar fundidos con el muro. No-op si el formato
+    # no trae etiquetas (cae a la separación por grosor).
+    with timer.step("split_groups_by_tags", group_count=len(groups)):
+        groups = split_groups_by_tags(groups, working_faces)
 
     logger.info(f"  → {len(groups)} grupos: " + 
                 ", ".join(f"{sum(1 for g in groups if g.category==c)} {c}" 
