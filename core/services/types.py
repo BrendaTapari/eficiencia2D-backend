@@ -30,6 +30,11 @@ class Face3D:
     normal: Vec3
     inner_loops: List[List[Vec3]]
     panel_id: Optional[str] = None
+    # Etiquetas semánticas del archivo fuente (si existen): nombre de objeto (`o`)
+    # y material (`usemtl`). Permiten separar vidrio/marco/puerta sin heurísticas
+    # cuando el modelo las trae. None cuando el formato no las provee (p. ej. STL).
+    material: Optional[str] = None
+    source_object: Optional[str] = None
 
 @dataclass(slots=True)
 class IndexedFace3D(Face3D):
