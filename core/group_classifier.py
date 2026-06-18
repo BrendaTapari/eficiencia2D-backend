@@ -346,6 +346,144 @@ def split_connected(
 
 
 # ---------------------------------------------------------------------------
+# Divisiones dirigidas por el usuario (endpoint /recompute, /generate splits)
+#
+# El usuario puede pedir partir un grupo ya clasificado:
+#   - "components": por componentes conexos (conectividad de vértices). Separa
+#     piezas coplanares que NO se tocan (p. ej. dos tramos de muro sueltos que
+#     quedaron en un mismo grupo).
+#   - "panels": por panel plano distinto (normal + distancia de plano). Separa
+#     las dos pieles de un muro o las dos caras de una esquina en L que el
+#     clustering coplanar / thin-twin había unido en un solo grupo.
+# ---------------------------------------------------------------------------
+
+
+def _split_group_face_indices(
+    face_indices: List[int], faces: List[Face3D], mode: str
+) -> List[List[int]]:
+    valid = [i for i in face_indices if 0 <= i < len(faces)]
+    if len(valid) <= 1:
+        return [valid]
+
+    if mode == "panels":
+        buckets: Dict[Tuple, List[int]] = {}
+        for i in valid:
+            f = faces[i]
+            n = normalize(f.normal)
+            v0 = f.vertices[0]
+            d = n.x * v0.x + n.y * v0.y + n.z * v0.z
+            key = (round(n.x, 1), round(n.y, 1), round(n.z, 1), round(d, 2))
+            buckets.setdefault(key, []).append(i)
+        return list(buckets.values())
+
+    # mode == "components" (default)
+    return topo_connected_components(
+        valid, face_of=lambda idx: faces[idx], coord_snap=0.01
+    )
+
+
+def _build_group_from_indices(
+    new_id: int, base_group: "GeometryGroup", face_indices: List[int], faces: List[Face3D]
+) -> Optional["GeometryGroup"]:
+    total_area = 0.0
+    cx = cy = cz = 0.0
+    min_y, max_y = float("inf"), float("-inf")
+    biggest_area, biggest_n = -1.0, base_group.representative_normal
+
+    for idx in face_indices:
+        f = faces[idx]
+        a = face_area(f)
+        if a <= 0:
+            continue
+        c = face_centroid(f)
+        total_area += a
+        cx += c.x * a
+        cy += c.y * a
+        cz += c.z * a
+        for v in f.vertices:
+            if v.y < min_y:
+                min_y = v.y
+            if v.y > max_y:
+                max_y = v.y
+        if a > biggest_area:
+            biggest_area = a
+            biggest_n = f.normal
+
+    if total_area <= 0:
+        return None
+
+    cx /= total_area
+    cy /= total_area
+    cz /= total_area
+    n = normalize(biggest_n)
+
+    abs_y = abs(n.y)
+    if abs_y >= HORIZONTAL_THRESHOLD:
+        orient_kind = "horizontal"
+    elif abs_y <= VERTICAL_THRESHOLD:
+        orient_kind = "vertical"
+    else:
+        orient_kind = "inclined"
+    orient = orientation_label(n, orient_kind)
+    cat_label = CATEGORY_LABELS[base_group.category]
+
+    return GeometryGroup(
+        id=new_id,
+        label=f"{cat_label} {orient} #{new_id}",
+        category=base_group.category,
+        face_indices=list(face_indices),
+        total_area=total_area,
+        centroid=Vec3(cx, cy, cz),
+        orientation=orient,
+        representative_normal=n,
+        thickness=base_group.thickness,
+        min_y=None if min_y == float("inf") else min_y,
+        max_y=None if max_y == float("-inf") else max_y,
+        original_category=base_group.original_category or base_group.category,
+    )
+
+
+def apply_splits(
+    groups: List["GeometryGroup"], faces: List[Face3D], splits: Optional[List[dict]]
+) -> List["GeometryGroup"]:
+    """
+    Aplica divisiones dirigidas por el usuario. `splits` = [{group_id, mode}, ...].
+    Devuelve una nueva lista de grupos con los grupos objetivo partidos en piezas
+    (ids reasignados). Los grupos no afectados se conservan tal cual.
+    """
+    if not splits:
+        return groups
+
+    mode_by_id: Dict[int, str] = {}
+    for s in splits:
+        gid = s.get("group_id") if isinstance(s, dict) else getattr(s, "group_id", None)
+        mode = s.get("mode") if isinstance(s, dict) else getattr(s, "mode", None)
+        if gid is not None:
+            mode_by_id[int(gid)] = mode or "components"
+    if not mode_by_id:
+        return groups
+
+    next_id = max((g.id for g in groups), default=0) + 1
+    out: List["GeometryGroup"] = []
+    for g in groups:
+        mode = mode_by_id.get(g.id)
+        if not mode:
+            out.append(g)
+            continue
+        pieces = _split_group_face_indices(g.face_indices, faces, mode)
+        pieces = [p for p in pieces if p]
+        if len(pieces) <= 1:
+            out.append(g)
+            continue
+        for piece in pieces:
+            ng = _build_group_from_indices(next_id, g, piece, faces)
+            if ng:
+                out.append(ng)
+                next_id += 1
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Etiquetas y Subgrupos
 # ---------------------------------------------------------------------------
 
