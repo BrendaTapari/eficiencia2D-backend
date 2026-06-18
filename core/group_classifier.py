@@ -484,6 +484,139 @@ def apply_splits(
 
 
 # ---------------------------------------------------------------------------
+# Separación de vidrios / elementos finos (ventanas) — por grosor + solape 2D
+#
+# Una "hilera de ventanas" o un muro cortina termina en un solo grupo (los
+# coplanares que se tocan se fusionan). Para cortar cada vidrio por separado:
+#   - se eligen sólo los grupos FINOS (grosor < GLASS_MAX_THICKNESS = vidrio),
+#     dejando los muros gruesos intactos;
+#   - dentro de cada grupo fino se reagrupan las caras por SOLAPE 2D real
+#     (intersección de área > 0), no por contacto de borde. Así el frente y el
+#     dorso del mismo vidrio (se proyectan al mismo rectángulo -> solapan) quedan
+#     en UN elemento, pero dos vidrios vecinos pegados por un montante (sólo se
+#     tocan en el borde -> solape nulo) quedan separados.
+# ---------------------------------------------------------------------------
+
+GLASS_MAX_THICKNESS = 0.02  # 2 cm: por debajo se considera vidrio/elemento fino
+
+
+def _overlap_components(
+    face_indices: List[int], faces: List[Face3D], normal: Vec3
+) -> List[List[int]]:
+    """Reagrupa caras por solape 2D (área de intersección > 0) en el plano `normal`."""
+    from shapely import STRtree
+    from shapely.geometry import Polygon
+    from core.services.topology import _inplane_basis
+
+    n = normalize(normal)
+    u, v = _inplane_basis(n)
+
+    polys: Dict[int, "Polygon"] = {}
+    degenerate: List[int] = []
+    for i in face_indices:
+        f = faces[i]
+        if len(f.vertices) < 3:
+            degenerate.append(i)
+            continue
+        pts = [
+            (vt.x * u.x + vt.y * u.y + vt.z * u.z, vt.x * v.x + vt.y * v.y + vt.z * v.z)
+            for vt in f.vertices
+        ]
+        pp = Polygon(pts)
+        if not pp.is_valid:
+            pp = pp.buffer(0)
+        if pp.is_empty or pp.area <= 1e-9:
+            degenerate.append(i)
+            continue
+        polys[i] = pp
+
+    valid = list(polys.keys())
+    if len(valid) <= 1:
+        return [face_indices]
+
+    parent = {i: i for i in valid}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    geoms = [polys[i] for i in valid]
+    tree = STRtree(geoms)
+    AREA_EPS = 1e-6
+    for i in valid:
+        for m in tree.query(polys[i]):
+            j = valid[int(m)]
+            if j <= i:
+                continue
+            inter = polys[i].intersection(polys[j])
+            if (not inter.is_empty) and inter.area > AREA_EPS:
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[ri] = rj
+
+    comp_map: Dict[int, List[int]] = {}
+    for i in valid:
+        comp_map.setdefault(find(i), []).append(i)
+    pieces = list(comp_map.values())
+    # Las caras canto (proyección degenerada, p. ej. el grosor del vidrio) se
+    # adjuntan al primer elemento para no perder geometría.
+    if degenerate and pieces:
+        pieces[0].extend(degenerate)
+    return pieces
+
+
+def split_thin_groups_by_pane(
+    groups: List["GeometryGroup"],
+    faces: List[Face3D],
+    max_thickness: float = GLASS_MAX_THICKNESS,
+) -> List["GeometryGroup"]:
+    """
+    Separa cada vidrio/elemento fino en su propio grupo. Sólo toca grupos pared con
+    grosor detectado por debajo de `max_thickness`; los muros gruesos quedan iguales.
+    """
+    out: List["GeometryGroup"] = []
+    next_id = max((g.id for g in groups), default=0) + 1
+    split_count = 0
+
+    for g in groups:
+        t = g.thickness
+        if (
+            g.category != "wall"
+            or t is None
+            or t >= max_thickness
+            or len(g.face_indices) <= 1
+        ):
+            out.append(g)
+            continue
+
+        pieces = _overlap_components(
+            [i for i in g.face_indices if 0 <= i < len(faces)],
+            faces,
+            g.representative_normal,
+        )
+        pieces = [p for p in pieces if p]
+        if len(pieces) <= 1:
+            out.append(g)
+            continue
+
+        for piece in pieces:
+            ng = _build_group_from_indices(next_id, g, piece, faces)
+            if ng:
+                out.append(ng)
+                next_id += 1
+        split_count += 1
+
+    if split_count:
+        logger.info(
+            f"  split_thin_groups_by_pane: {split_count} grupos finos separados "
+            f"({len(groups)} -> {len(out)} grupos)"
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Etiquetas y Subgrupos
 # ---------------------------------------------------------------------------
 
