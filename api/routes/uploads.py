@@ -236,6 +236,7 @@ class NestingPreviewRequest(BaseModel):
     overrides: Optional[Dict[int, str]] = None
     wall_wall_decisions: Optional[Dict[int, int]] = None
     marks: Optional[List[int]] = None
+    user_cuts: Optional[List[dict]] = None
     sheet_config: Optional[SheetConfigModel] = None
     scale_denom: float = 50.0
 
@@ -483,6 +484,7 @@ async def generate_pdf_endpoint(request: GenerateRequest):
                 wall_wall_decisions=request.wall_wall_decisions,
                 merges=request.merges,
                 marks=request.marks,
+                user_cuts=request.user_cuts,
             )
 
         if not files:
@@ -608,6 +610,7 @@ async def nesting_preview_endpoint(request: NestingPreviewRequest):
                 wall_wall_decisions=request.wall_wall_decisions,
                 merges=request.merges,
                 marks=request.marks,
+                user_cuts=request.user_cuts,
             )
 
         timer.report()
