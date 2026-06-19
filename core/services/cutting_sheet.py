@@ -112,6 +112,7 @@ class Edge2D:
     b: Vec2
     hole: bool = False  # True si la arista pertenece a un anillo interior (abertura)
     joint: bool = False  # True si es una línea de encastre (junta transversal 3D)
+    score: bool = False  # True si es una línea de pliegue/score (corte manual tipo "line")
 
 
 @dataclass
@@ -675,9 +676,156 @@ def mirror_edges_horizontal(edges: List[Edge2D], width_m: float) -> List[Edge2D]
             a=Vec2(width_m - e.a.x, e.a.y),
             b=Vec2(width_m - e.b.x, e.b.y),
             hole=e.hole,
+            joint=getattr(e, "joint", False),
+            score=getattr(e, "score", False),
         )
         for e in edges
     ]
+
+
+# ---------------------------------------------------------------------------
+# Cortes manuales del usuario (user_cuts) — ver CONTRATO_user_cuts_backend.
+#
+# Los cortes llegan en el marco local del panel (post project_faces_to_2d,
+# normalizado a (0,0), metros), el mismo del front. rect/square/circle se RESTAN
+# (boolean difference, pueden partir el panel en varias piezas y dejar huecos);
+# line es marca de pliegue/score (no parte el panel, se emite como score).
+# ---------------------------------------------------------------------------
+
+
+def _edges_to_polygon(edges: List[Edge2D]):
+    """Reconstruye el polígono del panel (exterior + huecos) desde sus aristas."""
+    from shapely.geometry import LineString
+    from shapely.ops import polygonize, unary_union
+
+    segs = [
+        LineString([(e.a.x, e.a.y), (e.b.x, e.b.y)])
+        for e in edges
+        if not getattr(e, "score", False)
+    ]
+    if not segs:
+        return None
+    faces = list(polygonize(unary_union(segs)))
+    if not faces:
+        return None
+    faces.sort(key=lambda p: p.area, reverse=True)
+    outer = faces[0]
+    holes = [f for f in faces[1:] if outer.contains(f.representative_point())]
+    poly = outer.difference(unary_union(holes)) if holes else outer
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+    return poly if not poly.is_empty else None
+
+
+def _polygon_to_edges(poly) -> List[Edge2D]:
+    out: List[Edge2D] = []
+
+    def ring(coords, hole: bool):
+        for i in range(len(coords) - 1):
+            out.append(
+                Edge2D(
+                    a=Vec2(coords[i][0], coords[i][1]),
+                    b=Vec2(coords[i + 1][0], coords[i + 1][1]),
+                    hole=hole,
+                )
+            )
+
+    ring(list(poly.exterior.coords), False)
+    for interior in poly.interiors:
+        ring(list(interior.coords), True)
+    return out
+
+
+def _cut_polygon(cut: Dict, width_m: float, height_m: float):
+    """Polígono sustractivo de un corte rect/square/circle (None para line / degenerado)."""
+    from shapely.geometry import Polygon
+
+    kind = cut.get("kind")
+    if kind == "line":
+        return None
+    u0, v0 = float(cut["u0"]), float(cut["v0"])
+    u1, v1 = float(cut["u1"]), float(cut["v1"])
+    min_u, max_u = min(u0, u1), max(u0, u1)
+    min_v, max_v = min(v0, v1), max(v0, v1)
+
+    if kind == "square":
+        side = max(max_u - min_u, max_v - min_v)
+        max_u, max_v = min_u + side, min_v + side
+
+    if kind == "circle":
+        cx, cy = (min_u + max_u) / 2, (min_v + max_v) / 2
+        rx, ry = (max_u - min_u) / 2, (max_v - min_v) / 2
+        if rx < 0.02 or ry < 0.02:
+            return None
+        pts = [
+            (cx + math.cos(2 * math.pi * i / 32) * rx, cy + math.sin(2 * math.pi * i / 32) * ry)
+            for i in range(33)
+        ]
+        return Polygon(pts)
+
+    # rect / square
+    if (max_u - min_u) < 0.02 or (max_v - min_v) < 0.02:
+        return None
+    min_u, min_v = max(0.0, min_u), max(0.0, min_v)
+    max_u, max_v = min(width_m, max_u), min(height_m, max_v)
+    if (max_u - min_u) <= 0 or (max_v - min_v) <= 0:
+        return None
+    return Polygon([(min_u, min_v), (max_u, min_v), (max_u, max_v), (min_u, max_v)])
+
+
+def apply_user_cuts(
+    width_m: float, height_m: float, edges: List[Edge2D], cuts: List[Dict]
+) -> Tuple[List[List[Edge2D]], List[Tuple[Vec2, Vec2]]]:
+    """
+    Aplica los cortes a un panel (marco local, sin espejar). Devuelve:
+      - piezas: lista de listas de aristas (contorno+huecos) en el MISMO marco, una
+        por pieza resultante (un corte que cruza el panel lo parte en varias).
+      - score_lines: segmentos (a,b) de los cortes tipo "line" (marcas de pliegue).
+    Si no hay cortes sustractivos efectivos, devuelve el panel original como única pieza.
+    """
+    from shapely.geometry import MultiPolygon
+
+    score_lines: List[Tuple[Vec2, Vec2]] = [
+        (Vec2(float(c["u0"]), float(c["v0"])), Vec2(float(c["u1"]), float(c["v1"])))
+        for c in cuts
+        if c.get("kind") == "line"
+    ]
+
+    subtractive = [c for c in cuts if c.get("kind") != "line"]
+    if not subtractive:
+        return [edges], score_lines
+
+    panel = _edges_to_polygon(edges)
+    if panel is None:
+        return [edges], score_lines
+
+    geom = panel
+    for cut in subtractive:
+        cp = _cut_polygon(cut, width_m, height_m)
+        if cp is None or not cp.is_valid:
+            continue
+        try:
+            geom = geom.difference(cp)
+        except Exception:
+            continue
+        if geom.is_empty:
+            return [], score_lines
+
+    polys = (
+        list(geom.geoms)
+        if isinstance(geom, MultiPolygon)
+        else ([geom] if geom.geom_type == "Polygon" and not geom.is_empty else [])
+    )
+    pieces: List[List[Edge2D]] = []
+    for p in polys:
+        if p.area < 1e-4:
+            continue
+        pe = _polygon_to_edges(p)
+        if len(pe) >= 3:
+            pieces.append(pe)
+    if not pieces:
+        return [], score_lines
+    return pieces, score_lines
 
 
 # ---------------------------------------------------------------------------
@@ -983,7 +1131,10 @@ def emit_panel_entities(
         #  - joint  -> línea de encastre (junta transversal 3D) en CUT_INTERIOR (ACI 3)
         #  - hole en panel marcado -> abertura a grabar en MARK_VECTOR (ACI 1, rojo)
         #  - resto  -> contorno a cortar en CUT_EXTERIOR (ACI 7)
-        if getattr(edge, "joint", False):
+        if getattr(edge, "score", False):
+            # Corte manual tipo "line" -> marca de pliegue/score (no corta): MARK_VECTOR.
+            layer, aci = "MARK_VECTOR", "1"
+        elif getattr(edge, "joint", False):
             layer, aci = "CUT_INTERIOR", "3"
         elif is_mark and getattr(edge, "hole", False):
             layer, aci = "MARK_VECTOR", "1"
