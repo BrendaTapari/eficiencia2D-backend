@@ -182,6 +182,7 @@ def generate_pipeline(
     wall_wall_decisions: Optional[Dict[int, int]] = None,
     merges: Optional[List[List[int]]] = None,
     marks: Optional[List[int]] = None,
+    user_cuts: Optional[List[dict]] = None,
 ) -> List[OutputFile]:
     from core.review_generate import generate_from_review
 
@@ -192,6 +193,7 @@ def generate_pipeline(
         wall_wall_decisions=wall_wall_decisions,
         merges=merges,
         marks=marks,
+        user_cuts=user_cuts,
     )
 
 
