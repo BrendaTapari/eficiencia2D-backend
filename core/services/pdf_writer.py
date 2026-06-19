@@ -417,7 +417,9 @@ def generate_nesting_pdf(
             cs.append("0.3 w")
             cur_color = None
             for edge in edges:
-                if getattr(edge, "joint", False):
+                if getattr(edge, "score", False):
+                    color = "1 0 0 RG"            # rojo: pliegue/score (corte manual línea)
+                elif getattr(edge, "joint", False):
                     color = "0 0.6 0 RG"          # verde: línea de encastre (junta)
                 elif is_mark and getattr(edge, "hole", False):
                     color = "1 0 0 RG"            # rojo: abertura a grabar
