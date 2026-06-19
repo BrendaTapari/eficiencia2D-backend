@@ -17,6 +17,7 @@ from core.services.assembly_adjuster import compute_adjustments
 from core.services.cutting_sheet import (
     Edge2D,
     Panel,
+    apply_user_cuts,
     clip_panel_at_u,
     clip_panel_at_v,
     mirror_edges_horizontal,
@@ -184,10 +185,18 @@ def decompose_panels_from_groups(
     wall_wall_decisions: Optional[Dict[int, int]] = None,
     marks: Optional[List[int]] = None,
     plate_joints: Optional[List] = None,
+    user_cuts: Optional[List[dict]] = None,
 ) -> Tuple[List[Panel], List[Panel]]:
     overrides = overrides or {}
     marks_set = set(marks or [])  # ids de grupos cuyas aberturas se graban (no se cortan)
     min_area = opts.min_area_m2 if opts.min_area_m2 is not None else 0.01
+
+    # Cortes manuales por grupo (user_cuts): group_id -> [cut, ...] en el marco del panel.
+    cuts_by_group: Dict[int, list] = {}
+    for c in user_cuts or []:
+        gid = c.get("group_id") if isinstance(c, dict) else getattr(c, "group_id", None)
+        if gid is not None:
+            cuts_by_group.setdefault(int(gid), []).append(c)
 
     # Ranuras de encastre por placa CORTADA (Misión 1): cut_id -> [(P_a, P_b, ancho), ...]
     # en 3D. `ancho` = grosor de la placa cortante (define el ancho de la ranura).
@@ -237,6 +246,70 @@ def decompose_panels_from_groups(
 
         width_m, height_m, edges = result.width_m, result.height_m, result.edges
         if width_m * height_m < min_area:
+            continue
+
+        # Cortes manuales (user_cuts): se aplican en el marco de project_faces_to_2d
+        # (el mismo del front), antes de espejar. Pueden partir el panel en varias
+        # piezas y dejar huecos; la línea es marca de pliegue/score. Se omiten los
+        # trims de ensamble y los encastres en paneles con cortes manuales.
+        cuts = cuts_by_group.get(group.id)
+        if cuts:
+            pieces, score_lines = apply_user_cuts(width_m, height_m, edges, cuts)
+            for piece_edges in pieces:
+                mnu = min(min(e.a.x, e.b.x) for e in piece_edges)
+                mnv = min(min(e.a.y, e.b.y) for e in piece_edges)
+                mxu = max(max(e.a.x, e.b.x) for e in piece_edges)
+                mxv = max(max(e.a.y, e.b.y) for e in piece_edges)
+                pw, ph = mxu - mnu, mxv - mnv
+                if pw * ph < min_area:
+                    continue
+                norm = [
+                    Edge2D(a=Vec2(e.a.x - mnu, e.a.y - mnv),
+                           b=Vec2(e.b.x - mnu, e.b.y - mnv),
+                           hole=e.hole)
+                    for e in piece_edges
+                ]
+                p_edges = mirror_edges_horizontal(norm, pw)
+                for (sa, sb) in score_lines:
+                    mx, my = (sa.x + sb.x) / 2.0, (sa.y + sb.y) / 2.0
+                    if mnu - 1e-6 <= mx <= mxu + 1e-6 and mnv - 1e-6 <= my <= mxv + 1e-6:
+                        p_edges.append(
+                            Edge2D(
+                                a=Vec2(pw - (sa.x - mnu), sa.y - mnv),
+                                b=Vec2(pw - (sb.x - mnu), sb.y - mnv),
+                                score=True,
+                            )
+                        )
+                if is_floor:
+                    floor_count += 1
+                    floor_panels.append(
+                        Panel(
+                            id=f"B{floor_count}",
+                            group_name=f"floor_{floor_count}",
+                            category="floor",
+                            floor_index=0,
+                            width_m=pw,
+                            height_m=ph,
+                            edges=p_edges,
+                            source_group_id=group.id,
+                            is_mark=group.id in marks_set,
+                        )
+                    )
+                else:
+                    wall_count += 1
+                    wall_panels.append(
+                        Panel(
+                            id=f"A{wall_count}",
+                            group_name=f"wall_{wall_count}",
+                            category="wall",
+                            floor_index=0,
+                            width_m=pw,
+                            height_m=ph,
+                            edges=p_edges,
+                            source_group_id=group.id,
+                            is_mark=group.id in marks_set,
+                        )
+                    )
             continue
 
         height_delta = height_adj.get(group.id, 0.0)
@@ -343,6 +416,7 @@ def _panels_to_nesting(panels: List[Panel], scale_denom: float) -> List[NestingP
                         b=Vec2(e.b.x * s, e.b.y * s),
                         hole=e.hole,
                         joint=getattr(e, "joint", False),
+                        score=getattr(e, "score", False),
                     )
                     for e in p.edges
                 ],
@@ -359,6 +433,7 @@ def _decompose(
     wall_wall_decisions: Optional[Dict[int, int]],
     merges: Optional[List[List[int]]],
     marks: Optional[List[int]],
+    user_cuts: Optional[List[dict]] = None,
 ) -> Tuple[Phase1Result, List[Panel], List[Panel]]:
     """Aplica merges, resuelve encastres 3D y descompone a paneles 2D."""
     work = apply_merges(phase1, merges or [])
@@ -366,7 +441,7 @@ def _decompose(
     # topología final (post-merges), antes de proyectar.
     plate_joints = resolve_plate_joints(work.groups, work.faces)
     wall_panels, floor_panels = decompose_panels_from_groups(
-        work, opts, overrides, wall_wall_decisions, marks, plate_joints
+        work, opts, overrides, wall_wall_decisions, marks, plate_joints, user_cuts
     )
     return work, wall_panels, floor_panels
 
@@ -407,10 +482,11 @@ def compute_nesting(
     wall_wall_decisions: Optional[Dict[int, int]] = None,
     merges: Optional[List[List[int]]] = None,
     marks: Optional[List[int]] = None,
+    user_cuts: Optional[List[dict]] = None,
 ) -> Tuple[Phase1Result, NestingResult, NestingResult, SheetConfig, Dict[int, str]]:
     """Descompone y anida paneles. Compartido por /generate y /nesting-preview."""
     work, wall_panels, floor_panels = _decompose(
-        phase1, opts, overrides, wall_wall_decisions, merges, marks
+        phase1, opts, overrides, wall_wall_decisions, merges, marks, user_cuts
     )
 
     sc = opts.sheet_config
@@ -439,9 +515,10 @@ def generate_from_review(
     wall_wall_decisions: Optional[Dict[int, int]] = None,
     merges: Optional[List[List[int]]] = None,
     marks: Optional[List[int]] = None,
+    user_cuts: Optional[List[dict]] = None,
 ) -> List[OutputFile]:
     work, wall_nesting, floor_nesting, sheet_cfg, _ = compute_nesting(
-        phase1, opts, overrides, wall_wall_decisions, merges, marks
+        phase1, opts, overrides, wall_wall_decisions, merges, marks, user_cuts
     )
     scale = opts.scale_denom
     stem = work.stem
