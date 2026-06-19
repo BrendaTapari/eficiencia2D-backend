@@ -29,6 +29,7 @@ class Edge:
     b: Vec2
     hole: bool = False  # True si la arista pertenece a un anillo interior (abertura)
     joint: bool = False  # True si es una línea de encastre (junta transversal 3D)
+    score: bool = False  # True si es una línea de pliegue/score (corte manual "line")
 
 
 @dataclass
@@ -288,6 +289,7 @@ def rotate_edges(edges: List[Edge], original_w: float) -> List[Edge]:
             b=Vec2(x=e.b.y, y=original_w - e.b.x),
             hole=e.hole,
             joint=getattr(e, "joint", False),
+            score=getattr(e, "score", False),
         )
         for e in edges
     ]
