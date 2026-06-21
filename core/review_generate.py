@@ -219,10 +219,13 @@ def decompose_panels_from_groups(
     )
 
     height_adj: Dict[int, float] = {}
+    height_top_adj: Dict[int, float] = {}
     width_adjs: Dict[int, list] = {}
     for adj in adj_result.adjustments:
         if adj.axis == "height":
             height_adj[adj.group_id] = height_adj.get(adj.group_id, 0.0) + adj.delta
+        elif adj.axis == "height_top":
+            height_top_adj[adj.group_id] = height_top_adj.get(adj.group_id, 0.0) + adj.delta
         else:
             width_adjs.setdefault(adj.group_id, []).append(adj)
 
@@ -321,6 +324,25 @@ def decompose_panels_from_groups(
                     clip_panel_at_v(edges, strip, True)
                     if base_at_min_v
                     else clip_panel_at_v(edges, height_m - strip, False)
+                )
+                if clipped:
+                    width_m, height_m, edges = (
+                        clipped["width_m"],
+                        clipped["height_m"],
+                        clipped["edges"],
+                    )
+
+        height_top_delta = height_top_adj.get(group.id, 0.0)
+        if height_top_delta < 0 and not is_floor:
+            strip = min(-height_top_delta, height_m - 0.01)
+            if strip > 0.001:
+                base_at_min_v = result.v_up >= 0
+                # Recortar desde la CIMA: cuando la base está en min_v (orientación normal),
+                # conservar sólo la parte por debajo de height_m - strip.
+                clipped = (
+                    clip_panel_at_v(edges, height_m - strip, False)
+                    if base_at_min_v
+                    else clip_panel_at_v(edges, strip, True)
                 )
                 if clipped:
                     width_m, height_m, edges = (

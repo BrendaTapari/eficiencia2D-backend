@@ -26,8 +26,10 @@ from core.services.joint_topology_classifier import (
 class DimensionAdjustment:
     group_id: int
     delta: float
-    # Qué dimensión recortar: "height" recorta la base (muro-piso), "width" recorta un lado (muro-muro).
-    axis: Literal["height", "width"]
+    # "height"     → recorta la BASE del muro (muro encima de losa de piso)
+    # "height_top" → recorta la CIMA del muro (techo/losa encima del muro)
+    # "width"      → recorta un lado lateral (muro-muro)
+    axis: Literal["height", "height_top", "width"]
     reason: str
     joint_index: int
 
@@ -90,31 +92,37 @@ def compute_adjustments(
         b_is_floor = g_b.category == "floor" and abs_y_b > 0.5
 
         if a_is_floor != b_is_floor:
-            # Unión Muro–Piso
+            # Unión Muro–Losa (piso o techo)
             floor = g_a if a_is_floor else g_b
             wall = g_b if a_is_floor else g_a
 
             if not floor.thickness or floor.thickness < 0.001:
                 continue
 
-            # Filtro: el muro debe asentarse SOBRE el piso (wall.min_y ≈ floor.max_y)
-            # Y la arista compartida debe ser predominantemente horizontal.
-            wall_on_top = is_wall_on_top(wall, floor, joint)
-            if not wall_on_top:
-                continue
-
-            delta = -floor.thickness
             label = floor.label if floor.label else f"Grupo {floor.id}"
 
-            adjustments.append(
-                DimensionAdjustment(
-                    group_id=wall.id,
-                    delta=delta,
-                    axis="height",
-                    reason=f"Junta con {label} (grosor {floor.thickness * 100:.1f}cm)",
-                    joint_index=ji,
+            if is_wall_on_top(wall, floor, joint):
+                # Muro encima de la losa → recortar BASE del muro
+                adjustments.append(
+                    DimensionAdjustment(
+                        group_id=wall.id,
+                        delta=-floor.thickness,
+                        axis="height",
+                        reason=f"Junta con {label} (grosor {floor.thickness * 100:.1f}cm)",
+                        joint_index=ji,
+                    )
                 )
-            )
+            elif is_roof_above_wall(floor, wall, joint):
+                # Techo/losa encima del muro → recortar CIMA del muro
+                adjustments.append(
+                    DimensionAdjustment(
+                        group_id=wall.id,
+                        delta=-floor.thickness,
+                        axis="height_top",
+                        reason=f"Techo sobre muro: {label} (grosor {floor.thickness * 100:.1f}cm)",
+                        joint_index=ji,
+                    )
+                )
 
         elif not a_is_floor and not b_is_floor:
             # Unión Muro–Muro
@@ -168,9 +176,10 @@ def compute_adjustments(
                             )
                         )
 
-    # Deduplicar ajustes de altura (muro-piso): mantener el delta más grande (el más negativo) por grupo.
+    # Deduplicar ajustes de altura: mantener el delta más negativo por grupo y eje.
     # Los ajustes de ancho (muro-muro) pasan directos.
     seen_height: Dict[int, DimensionAdjustment] = {}
+    seen_height_top: Dict[int, DimensionAdjustment] = {}
     kept_width: List[DimensionAdjustment] = []
 
     for adj in adjustments:
@@ -178,10 +187,16 @@ def compute_adjustments(
             existing = seen_height.get(adj.group_id)
             if not existing or adj.delta < existing.delta:
                 seen_height[adj.group_id] = adj
+        elif adj.axis == "height_top":
+            existing = seen_height_top.get(adj.group_id)
+            if not existing or adj.delta < existing.delta:
+                seen_height_top[adj.group_id] = adj
         else:
             kept_width.append(adj)
 
-    final_adjustments = list(seen_height.values()) + kept_width
+    final_adjustments = (
+        list(seen_height.values()) + list(seen_height_top.values()) + kept_width
+    )
     return AdjustmentsResult(
         adjustments=final_adjustments, wall_wall_joints=wall_wall_joints
     )
@@ -260,6 +275,23 @@ def is_wall_on_top(wall: GeometryGroup, floor: GeometryGroup, joint: Joint) -> b
     if wall.min_y < floor.max_y - tol:
         return False
 
+    if joint.horizontal_frac < 0.5:
+        return False
+
+    return True
+
+
+def is_roof_above_wall(roof: GeometryGroup, wall: GeometryGroup, joint: Joint) -> bool:
+    """Verifica si una losa/techo se asienta sobre la parte SUPERIOR del muro."""
+    if roof.min_y is None or wall.max_y is None:
+        return False
+
+    tol = max(roof.thickness or 0.0, 0.05)
+    # El borde inferior del techo debe estar cerca de la cima del muro
+    if roof.min_y < wall.max_y - tol:
+        return False
+
+    # La arista compartida debe ser predominantemente horizontal
     if joint.horizontal_frac < 0.5:
         return False
 
