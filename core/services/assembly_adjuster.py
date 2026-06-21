@@ -96,7 +96,12 @@ def compute_adjustments(
             floor = g_a if a_is_floor else g_b
             wall = g_b if a_is_floor else g_a
 
-            if not floor.thickness or floor.thickness < 0.001:
+            # Grosor: usar floor.thickness si está disponible; si no, estimarlo
+            # del rango Y (útil para techos modelados como superficie sin sólido).
+            thickness = floor.thickness or 0.0
+            if thickness < 0.001 and floor.min_y is not None and floor.max_y is not None:
+                thickness = floor.max_y - floor.min_y
+            if thickness < 0.001:
                 continue
 
             label = floor.label if floor.label else f"Grupo {floor.id}"
@@ -106,9 +111,9 @@ def compute_adjustments(
                 adjustments.append(
                     DimensionAdjustment(
                         group_id=wall.id,
-                        delta=-floor.thickness,
+                        delta=-thickness,
                         axis="height",
-                        reason=f"Junta con {label} (grosor {floor.thickness * 100:.1f}cm)",
+                        reason=f"Junta con {label} (grosor {thickness * 100:.1f}cm)",
                         joint_index=ji,
                     )
                 )
@@ -117,9 +122,9 @@ def compute_adjustments(
                 adjustments.append(
                     DimensionAdjustment(
                         group_id=wall.id,
-                        delta=-floor.thickness,
+                        delta=-thickness,
                         axis="height_top",
-                        reason=f"Techo sobre muro: {label} (grosor {floor.thickness * 100:.1f}cm)",
+                        reason=f"Techo sobre muro: {label} (grosor {thickness * 100:.1f}cm)",
                         joint_index=ji,
                     )
                 )
@@ -286,7 +291,14 @@ def is_roof_above_wall(roof: GeometryGroup, wall: GeometryGroup, joint: Joint) -
     if roof.min_y is None or wall.max_y is None:
         return False
 
-    tol = max(roof.thickness or 0.0, 0.05)
+    # Tolerancia: al menos 15 cm para cubrir modelos con pequeñas discrepancias
+    y_extent = (
+        (roof.max_y - roof.min_y)
+        if roof.max_y is not None and roof.min_y is not None
+        else 0.0
+    )
+    tol = max(roof.thickness or 0.0, y_extent, 0.15)
+
     # El borde inferior del techo debe estar cerca de la cima del muro
     if roof.min_y < wall.max_y - tol:
         return False
