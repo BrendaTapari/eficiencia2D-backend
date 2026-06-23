@@ -629,3 +629,155 @@ async def nesting_preview_endpoint(request: NestingPreviewRequest):
     except Exception as e:
         logger.exception(f"[nesting-preview] Error: {e}")
         raise HTTPException(status_code=500, detail=f"Error en nesting-preview: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# Endpoint /assembly-preview — datos de ensamble para la vista de instrucciones.
+#
+# Devuelve JSON con:
+#   - panels: lista de paneles con ID, categoría, dimensiones y posición 3D
+#   - elevations: qué paneles son visibles desde cada dirección (frente/atrás/…)
+#   - totals: conteos rápidos
+#
+# El frontend puede usar este JSON para renderizar una vista interactiva del
+# modelo anotado con los códigos de panel (complementa la guía de ensamble PDF
+# que se incluye en el ZIP de /generate).
+# ---------------------------------------------------------------------------
+
+class AssemblyPreviewRequest(BaseModel):
+    file_id: str
+    original_filename: str = "model.obj"
+    axis: Optional[str] = None
+    min_area_m2: float = 1.0
+    merges: Optional[List[List[int]]] = None
+    splits: Optional[List[SplitModel]] = None
+    overrides: Optional[Dict[int, str]] = None
+    wall_wall_decisions: Optional[Dict[int, int]] = None
+    marks: Optional[List[int]] = None
+    user_cuts: Optional[List[dict]] = None
+    scale_denom: float = 50.0
+    sheet_config: Optional[SheetConfigModel] = None
+
+
+# Direcciones de elevación estándar: (clave, nombre, view_dir como (x,y,z))
+_ASSEMBLY_ELEVATIONS = [
+    ("front",    "Frente",    ( 0,  0,  1)),
+    ("back",     "Atras",     ( 0,  0, -1)),
+    ("right",    "Derecha",   ( 1,  0,  0)),
+    ("left",     "Izquierda", (-1,  0,  0)),
+    ("top",      "Techo",     ( 0,  1,  0)),
+]
+
+
+@router.post("/assembly-preview")
+async def assembly_preview_endpoint(request: AssemblyPreviewRequest):
+    """
+    Devuelve el mapa de paneles y elevaciones para la vista de instrucciones
+    de ensamble. No genera PDF — sólo calcula la distribución de paneles.
+    """
+    timer = PipelineTimer("assembly_preview_endpoint")
+
+    with timer.step("load_phase1"):
+        base = load_or_parse_phase1(request.file_id, request.original_filename)
+
+    try:
+        from core.pipeline import apply_review_edits
+        from core.review_generate import _decompose
+
+        with timer.step("apply_review_edits"):
+            rebuilt = apply_review_edits(
+                base,
+                axis=request.axis,
+                min_real_area=request.min_area_m2,
+                splits=[s.dict() for s in (request.splits or [])],
+            )
+
+        sc = request.sheet_config
+        sheet_cfg = SheetConfig(
+            width_m=sc.width_m if sc else 1.0,
+            height_m=sc.height_m if sc else 0.6,
+            gap_m=sc.gap_m if sc else 0.003,
+        )
+        opts = PipelineOptions(
+            scale_denom=request.scale_denom,
+            paper="A4",
+            include_cutting_sheet=True,
+            sheet_config=sheet_cfg,
+            min_area_m2=request.min_area_m2,
+        )
+
+        with timer.step("decompose_panels"):
+            work, wall_panels, floor_panels = _decompose(
+                rebuilt,
+                opts,
+                overrides=request.overrides,
+                wall_wall_decisions=request.wall_wall_decisions,
+                merges=request.merges,
+                marks=request.marks,
+                user_cuts=request.user_cuts,
+            )
+
+        all_panels = list(wall_panels) + list(floor_panels)
+        group_by_id = {g.id: g for g in work.groups}
+
+        # ── Serializar paneles con posición 3D ──────────────────────────────
+        panels_out = []
+        for p in sorted(all_panels, key=lambda x: (0 if x.category == "wall" else 1, x.id)):
+            g = group_by_id.get(p.source_group_id)
+            entry = {
+                "id": p.id,
+                "category": p.category,
+                "source_group_id": p.source_group_id,
+                "width_m": round(p.width_m, 4),
+                "height_m": round(p.height_m, 4),
+                "area_m2": round(p.width_m * p.height_m, 4),
+            }
+            if g:
+                entry["centroid"] = {
+                    "x": round(g.centroid.x, 4),
+                    "y": round(g.centroid.y, 4),
+                    "z": round(g.centroid.z, 4),
+                }
+                entry["normal"] = {
+                    "x": round(g.representative_normal.x, 4),
+                    "y": round(g.representative_normal.y, 4),
+                    "z": round(g.representative_normal.z, 4),
+                }
+                entry["label"] = g.label or ""
+            panels_out.append(entry)
+
+        # ── Agrupar por elevación ───────────────────────────────────────────
+        # Un panel es visible desde una dirección cuando su normal tiene
+        # componente positiva en esa dirección (dot > 0.25).
+        elevations_out = {}
+        for key, name, (dx, dy, dz) in _ASSEMBLY_ELEVATIONS:
+            visible_ids = []
+            for p in all_panels:
+                g = group_by_id.get(p.source_group_id)
+                if not g:
+                    continue
+                n = g.representative_normal
+                if n.x * dx + n.y * dy + n.z * dz > 0.25:
+                    visible_ids.append(p.id)
+            if visible_ids:
+                elevations_out[key] = {
+                    "label": name,
+                    "panel_ids": sorted(visible_ids),
+                }
+
+        timer.report()
+        return JSONResponse(content={
+            "panels": panels_out,
+            "elevations": elevations_out,
+            "totals": {
+                "wall_count":  len(wall_panels),
+                "floor_count": len(floor_panels),
+                "total_panels": len(all_panels),
+            },
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"[assembly-preview] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error en assembly-preview: {str(e)}")

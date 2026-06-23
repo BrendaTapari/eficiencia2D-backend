@@ -539,11 +539,21 @@ def generate_from_review(
     marks: Optional[List[int]] = None,
     user_cuts: Optional[List[dict]] = None,
 ) -> List[OutputFile]:
-    work, wall_nesting, floor_nesting, sheet_cfg, _ = compute_nesting(
+    # Descomponer paneles primero para tenerlos disponibles para la guía
+    work, wall_panels, floor_panels = _decompose(
         phase1, opts, overrides, wall_wall_decisions, merges, marks, user_cuts
     )
     scale = opts.scale_denom
     stem = work.stem
+
+    sc = opts.sheet_config
+    sheet_cfg = SheetConfig(
+        width_m=sc.width_m if sc else 1.0,
+        height_m=sc.height_m if sc else 0.6,
+        gap_m=sc.gap_m if sc else 0.003,
+    )
+    wall_nesting = nest_panels(_panels_to_nesting(wall_panels, scale), sheet_cfg, scale)
+    floor_nesting = nest_panels(_panels_to_nesting(floor_panels, scale), sheet_cfg, scale)
 
     files: List[OutputFile] = []
 
@@ -579,5 +589,21 @@ def generate_from_review(
     plan_pdf = generate_pdf(facades, floor_plans, scale, opts.paper)
     if plan_pdf:
         files.append(OutputFile(name=f"{stem}_planos.pdf", blob=plan_pdf))
+
+    # Guía de ensamble: modelo 3D anotado con el código de cada panel
+    try:
+        from core.services.assembly_guide import generate_assembly_guide_pdf
+        guide_pdf = generate_assembly_guide_pdf(
+            wall_panels, floor_panels,
+            work.faces, work.groups,
+            scale_denom=scale,
+            paper_name="A3",
+        )
+        if guide_pdf:
+            files.append(
+                OutputFile(name=f"{stem}_guia_ensamble.pdf", blob=guide_pdf)
+            )
+    except Exception:
+        pass  # La guía es opcional; no interrumpir la generación principal
 
     return files
