@@ -186,17 +186,32 @@ def decompose_panels_from_groups(
     marks: Optional[List[int]] = None,
     plate_joints: Optional[List] = None,
     user_cuts: Optional[List[dict]] = None,
+    merge_target: Optional[Dict[int, int]] = None,
 ) -> Tuple[List[Panel], List[Panel]]:
+    from core.services.user_cuts import build_cuts_by_group, parse_user_cuts
+
     overrides = overrides or {}
     marks_set = set(marks or [])  # ids de grupos cuyas aberturas se graban (no se cortan)
     min_area = opts.min_area_m2 if opts.min_area_m2 is not None else 0.01
 
-    # Cortes manuales por grupo (user_cuts): group_id -> [cut, ...] en el marco del panel.
+    # Cortes manuales: el front envía group_id PRE-fusión → remapear al superviviente.
     cuts_by_group: Dict[int, list] = {}
-    for c in user_cuts or []:
-        gid = c.get("group_id") if isinstance(c, dict) else getattr(c, "group_id", None)
-        if gid is not None:
-            cuts_by_group.setdefault(int(gid), []).append(c)
+    for gid, cuts in build_cuts_by_group(
+        parse_user_cuts(user_cuts), merge_target
+    ).items():
+        cuts_by_group[gid] = [
+            {
+                "id": c.id,
+                "group_id": gid,
+                "kind": c.kind,
+                "u0": c.u0,
+                "v0": c.v0,
+                "u1": c.u1,
+                "v1": c.v1,
+                "keep_positive": c.keep_positive,
+            }
+            for c in cuts
+        ]
 
     # Ranuras de encastre por placa CORTADA (Misión 1): cut_id -> [(P_a, P_b, ancho), ...]
     # en 3D. `ancho` = grosor de la placa cortante (define el ancho de la ranura).
@@ -458,12 +473,22 @@ def _decompose(
     user_cuts: Optional[List[dict]] = None,
 ) -> Tuple[Phase1Result, List[Panel], List[Panel]]:
     """Aplica merges, resuelve encastres 3D y descompone a paneles 2D."""
+    from core.services.user_cuts import build_merge_target_map
+
+    merge_target = build_merge_target_map(phase1.groups, merges or [])
     work = apply_merges(phase1, merges or [])
     # Misión 1: resolver intersecciones placa-placa en 3D (encastres) sobre la
     # topología final (post-merges), antes de proyectar.
     plate_joints = resolve_plate_joints(work.groups, work.faces)
     wall_panels, floor_panels = decompose_panels_from_groups(
-        work, opts, overrides, wall_wall_decisions, marks, plate_joints, user_cuts
+        work,
+        opts,
+        overrides,
+        wall_wall_decisions,
+        marks,
+        plate_joints,
+        user_cuts,
+        merge_target=merge_target,
     )
     return work, wall_panels, floor_panels
 
@@ -594,8 +619,11 @@ def generate_from_review(
     try:
         from core.services.assembly_guide import generate_assembly_guide_pdf
         guide_pdf = generate_assembly_guide_pdf(
-            wall_panels, floor_panels,
-            work.faces, work.groups,
+            wall_panels,
+            floor_panels,
+            work.faces,
+            work.groups,
+            overrides=overrides or {},
             scale_denom=scale,
             paper_name="A3",
         )
@@ -603,7 +631,10 @@ def generate_from_review(
             files.append(
                 OutputFile(name=f"{stem}_guia_ensamble.pdf", blob=guide_pdf)
             )
-    except Exception:
-        pass  # La guía es opcional; no interrumpir la generación principal
+    except Exception as exc:
+        import logging
+        logging.getLogger("eficiencia2d.pipeline").warning(
+            "Guia de ensamble omitida: %s", exc, exc_info=True
+        )
 
     return files

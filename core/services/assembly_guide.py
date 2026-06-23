@@ -12,7 +12,7 @@ import math
 from typing import Dict, List, Optional, Set, Tuple
 
 from core.group_classifier import GeometryGroup
-from core.services.cutting_sheet import Panel
+from core.services.cutting_sheet import Panel, project_faces_to_2d
 from core.services.pdf_writer import PAPERS, MM_TO_PT, assemble_pdf, pdf_escape
 from core.services.types import Face3D, Vec3, dot
 
@@ -95,6 +95,65 @@ _LEADER_COLOR = "0 0 0"  # negro para líneas líder
 _WIRE_COLOR   = "0.80 0.80 0.80"  # gris claro wireframe
 
 
+def _effective_category(
+    group: GeometryGroup, overrides: Dict[int, str]
+) -> str:
+    return overrides.get(group.id, group.category)
+
+
+def _panel_bbox_centroid(panel: Panel) -> Tuple[float, float]:
+    xs = [e.a.x for e in panel.edges] + [e.b.x for e in panel.edges]
+    ys = [e.a.y for e in panel.edges] + [e.b.y for e in panel.edges]
+    return (min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0
+
+
+def _panel_centroid_3d(
+    panel: Panel,
+    group: GeometryGroup,
+    faces: List[Face3D],
+) -> Vec3:
+    """
+    Ubica la etiqueta en el centro de la pieza 2D final, mapeado al 3D del grupo.
+    Si un corte manual partió el panel, cada pieza queda en su propia posición.
+    """
+    group_faces = [faces[fi] for fi in group.face_indices if fi < len(faces)]
+    proj = project_faces_to_2d(group_faces, group.representative_normal, "Y")
+    if not proj:
+        return group.centroid
+
+    cx_m, cy_m = _panel_bbox_centroid(panel)
+    u_local = panel.width_m - cx_m  # des-espejar (mirror_edges_horizontal)
+    v_local = cy_m
+    target_u = proj.origin_u + u_local
+    target_v = proj.origin_v + v_local
+
+    best: Optional[Vec3] = None
+    best_d = float("inf")
+    for face in group_faces:
+        for vertex in face.vertices:
+            pu = dot(vertex, proj.u_axis)
+            pv = dot(vertex, proj.v_axis)
+            d = (pu - target_u) ** 2 + (pv - target_v) ** 2
+            if d < best_d:
+                best_d = d
+                best = vertex
+    return best if best is not None else group.centroid
+
+
+def _active_group_ids(
+    panels: List[Panel],
+    groups: List[GeometryGroup],
+    overrides: Dict[int, str],
+) -> Set[int]:
+    """Grupos que produjeron paneles finales (respeta overrides/descartes)."""
+    panel_groups = {p.source_group_id for p in panels}
+    return {
+        g.id
+        for g in groups
+        if g.id in panel_groups and _effective_category(g, overrides) != "discard"
+    }
+
+
 # ---------------------------------------------------------------------------
 # Página 1: Vista isométrica
 # ---------------------------------------------------------------------------
@@ -104,6 +163,7 @@ def _build_iso_page(
     faces: List[Face3D],
     group_by_id: Dict[int, GeometryGroup],
     paper: Dict[str, float],
+    overrides: Dict[int, str],
 ) -> str:
     pw = paper["w"] * MM_TO_PT
     ph = paper["h"] * MM_TO_PT
@@ -112,10 +172,13 @@ def _build_iso_page(
     avail_w = pw - 2 * _MARGIN
     avail_h = ph - 2 * _MARGIN - _TITLE_H
 
-    # Recopilar puntos isométricos de TODOS los grupos para calcular escala
+    active_ids = _active_group_ids(panels, list(group_by_id.values()), overrides)
+
+    # Recopilar puntos isométricos de los grupos activos para calcular escala
     all_face_indices: Set[int] = set()
-    for g in group_by_id.values():
-        if g.category != "discard":
+    for gid in active_ids:
+        g = group_by_id.get(gid)
+        if g:
             for fi in g.face_indices:
                 all_face_indices.add(fi)
 
@@ -159,10 +222,11 @@ def _build_iso_page(
     # ── Marcadores y etiquetas de paneles ───────────────────────────────────
     for panel in sorted(panels, key=lambda p: p.id):
         group = group_by_id.get(panel.source_group_id)
-        if not group:
+        if not group or panel.source_group_id not in active_ids:
             continue
 
-        cx_w, cy_w = _iso(group.centroid)
+        label_pt = _panel_centroid_3d(panel, group, faces)
+        cx_w, cy_w = _iso(label_pt)
         px_pt = tx(cx_w)
         py_pt = ty(cy_w)
 
@@ -225,6 +289,7 @@ def _build_elevation_page(
     faces: List[Face3D],
     group_by_id: Dict[int, GeometryGroup],
     paper: Dict[str, float],
+    overrides: Dict[int, str],
 ) -> Optional[str]:
     """Genera una página de elevación para la dirección dada."""
     pw = paper["w"] * MM_TO_PT
@@ -234,11 +299,12 @@ def _build_elevation_page(
     avail_w = pw - 2 * _MARGIN
     avail_h = ph - 2 * _MARGIN - _TITLE_H
 
+    active_ids = _active_group_ids(panels, list(group_by_id.values()), overrides)
+
     # ── Grupos visibles desde esta dirección ──────────────────────────────
-    # Un grupo es "visible" si su normal tiene componente positiva hacia view_dir
     visible_groups = [
         g for g in group_by_id.values()
-        if g.category != "discard" and dot(g.representative_normal, view_dir) > 0.25
+        if g.id in active_ids and dot(g.representative_normal, view_dir) > 0.25
     ]
     if not visible_groups:
         return None
@@ -297,7 +363,6 @@ def _build_elevation_page(
                 )
 
     # ── Paneles con etiquetas ────────────────────────────────────────────────
-    # Solo los paneles que corresponden a grupos visibles
     vis_group_ids = {g.id for g in visible_groups}
     vis_panels = [p for p in panels if p.source_group_id in vis_group_ids]
 
@@ -306,7 +371,8 @@ def _build_elevation_page(
         if not group:
             continue
 
-        cx2, cy2 = _proj(group.centroid, u_axis, v_axis)
+        label_pt = _panel_centroid_3d(panel, group, faces)
+        cx2, cy2 = _proj(label_pt, u_axis, v_axis)
         px_pt = tx(cx2)
         py_pt = ty(cy2)
 
@@ -492,6 +558,7 @@ def generate_assembly_guide_pdf(
     floor_panels: List[Panel],
     faces: List[Face3D],
     groups: List[GeometryGroup],
+    overrides: Optional[Dict[int, str]] = None,
     scale_denom: float = 100.0,
     paper_name: str = "A3",
 ) -> bytes:
@@ -504,6 +571,7 @@ def generate_assembly_guide_pdf(
     if not all_panels:
         return b""
 
+    overrides = overrides or {}
     paper = PAPERS.get(paper_name, PAPERS["A3"])
 
     group_by_id: Dict[int, GeometryGroup] = {g.id: g for g in groups}
@@ -511,13 +579,13 @@ def generate_assembly_guide_pdf(
     pages: List[str] = []
 
     # Página 1 — isométrica
-    pages.append(_build_iso_page(all_panels, faces, group_by_id, paper))
+    pages.append(_build_iso_page(all_panels, faces, group_by_id, paper, overrides))
 
     # Páginas 2-5 — elevaciones
     for name, view_dir, u_axis, v_axis in _ELEVATIONS:
         page = _build_elevation_page(
             name, view_dir, u_axis, v_axis,
-            all_panels, faces, group_by_id, paper,
+            all_panels, faces, group_by_id, paper, overrides,
         )
         if page:
             pages.append(page)

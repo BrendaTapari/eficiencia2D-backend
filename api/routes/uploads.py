@@ -719,6 +719,9 @@ async def assembly_preview_endpoint(request: AssemblyPreviewRequest):
 
         all_panels = list(wall_panels) + list(floor_panels)
         group_by_id = {g.id: g for g in work.groups}
+        overrides = request.overrides or {}
+
+        from core.services.assembly_guide import _panel_centroid_3d
 
         # ── Serializar paneles con posición 3D ──────────────────────────────
         panels_out = []
@@ -733,10 +736,11 @@ async def assembly_preview_endpoint(request: AssemblyPreviewRequest):
                 "area_m2": round(p.width_m * p.height_m, 4),
             }
             if g:
+                label_pt = _panel_centroid_3d(p, g, work.faces)
                 entry["centroid"] = {
-                    "x": round(g.centroid.x, 4),
-                    "y": round(g.centroid.y, 4),
-                    "z": round(g.centroid.z, 4),
+                    "x": round(label_pt.x, 4),
+                    "y": round(label_pt.y, 4),
+                    "z": round(label_pt.z, 4),
                 }
                 entry["normal"] = {
                     "x": round(g.representative_normal.x, 4),
