@@ -6,7 +6,7 @@ import re
 from core.services.types import Facade, FloorPlan
 
 # Importamos el NestingResult y rotate_edges del sheet_nester
-from core.services.sheet_nester import NestingResult, rotate_edges
+from core.services.sheet_nester import NestingResult, NestingSheet, rotate_edges
 
 # ============================================================================
 # PDF Writer
@@ -22,6 +22,7 @@ from core.services.sheet_nester import NestingResult, rotate_edges
 PAPERS = {
     "A4": {"w": 297.0, "h": 210.0},  # horizontal (landscape) en mm
     "A3": {"w": 420.0, "h": 297.0},
+    "A2": {"w": 594.0, "h": 420.0},
     "A1": {"w": 841.0, "h": 594.0},
 }
 MM_TO_PT = 72.0 / 25.4
@@ -319,15 +320,16 @@ def pdf_escape(s: str) -> str:
     return s.encode("ascii", "ignore").decode("ascii")
 
 
-def generate_nesting_pdf(
-    nesting: NestingResult, label: str, include_text: bool
-) -> bytes:
-    sheets = nesting.sheets
-    config = nesting.config
-
-    if not sheets:
-        return b""
-
+def _render_sheets_page(
+    sheets: List[NestingSheet],
+    config,
+    scale_denom: float,
+    label: str,
+    include_text: bool,
+    page_w: float,
+    page_h: float,
+) -> str:
+    """Dibuja un conjunto de planchas (grid) en UNA página; devuelve su content stream."""
     SHEET_SPACING_M = 0.10
     cols = min(len(sheets), 3)
     rows = math.ceil(len(sheets) / cols)
@@ -337,9 +339,6 @@ def generate_nesting_pdf(
     sheet_label_space_m = 0.04
     total_h_with_labels = total_h + rows * sheet_label_space_m
 
-    paper = PAPERS["A3"]
-    page_w = paper["w"] * MM_TO_PT
-    page_h = paper["h"] * MM_TO_PT
     margin = 40.0
 
     avail_w = page_w - 2 * margin
@@ -390,8 +389,8 @@ def generate_nesting_pdf(
             bx, by = corners[(ci + 1) % 4]
             cs.append(f"{tx(ax):.4f} {ty(ay):.4f} m\n{tx(bx):.4f} {ty(by):.4f} l\nS")
 
-        # Etiqueta de la plancha
-        sheet_label = f"Plancha {si + 1}"
+        # Etiqueta de la plancha (índice global, correcto en single_page y one_per_sheet)
+        sheet_label = f"Plancha {sheet.index + 1}"
         label_cx = tx(sx + config.width_m / 2.0)
         label_cy = ty(sy_top - sheet_label_space_m * 0.4)
         cs.append(
@@ -435,8 +434,8 @@ def generate_nesting_pdf(
                 )
 
             if include_text:
-                real_w = pw * nesting.scale_denom
-                real_h = ph * nesting.scale_denom
+                real_w = pw * scale_denom
+                real_h = ph * scale_denom
                 dim_text = f"{real_w:.2f} x {real_h:.2f} m"
 
                 label_h = fit_text_height_pdf(panel.id, pw, ph * 0.45, LABEL_H_M)
@@ -464,5 +463,44 @@ def generate_nesting_pdf(
         f"BT\n0 0 0 rg\n/F1 14 Tf\n{(page_w / 2.0):.2f} {(page_h - margin / 2.0 - 4.0):.2f} Td\n({pdf_escape(label)}) Tj\nET"
     )
 
-    content_str = "\n".join(cs) + "\n"
-    return assemble_pdf([content_str], page_w, page_h)
+    return "\n".join(cs) + "\n"
+
+
+def generate_nesting_pdf(
+    nesting: NestingResult,
+    label: str,
+    include_text: bool,
+    paper_name: str = "A4",
+    page_mode: str = "one_per_sheet",
+) -> bytes:
+    """
+    PDF de planchas de corte. `paper_name` ∈ {A4,A3,A2,A1} fija el tamaño de hoja.
+    `page_mode`:
+      - "one_per_sheet" (default): una página por NestingSheet.
+      - "single_page": todas las planchas de la categoría en una sola página.
+    No afecta DXF ni nesting; sólo el armado del PDF.
+    """
+    sheets = nesting.sheets
+    config = nesting.config
+    if not sheets:
+        return b""
+
+    paper = PAPERS.get(paper_name, PAPERS["A4"])
+    page_w = paper["w"] * MM_TO_PT
+    page_h = paper["h"] * MM_TO_PT
+
+    if page_mode == "single_page":
+        pages = [
+            _render_sheets_page(
+                sheets, config, nesting.scale_denom, label, include_text, page_w, page_h
+            )
+        ]
+    else:  # one_per_sheet
+        pages = [
+            _render_sheets_page(
+                [sheet], config, nesting.scale_denom, label, include_text, page_w, page_h
+            )
+            for sheet in sheets
+        ]
+
+    return assemble_pdf(pages, page_w, page_h)
