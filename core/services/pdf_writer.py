@@ -486,8 +486,16 @@ def generate_nesting_pdf(
         return b""
 
     paper = PAPERS.get(paper_name, PAPERS["A4"])
-    page_w = paper["w"] * MM_TO_PT
-    page_h = paper["h"] * MM_TO_PT
+    p_long = max(paper["w"], paper["h"])
+    p_short = min(paper["w"], paper["h"])
+    # En modo cartón (one_per_sheet) la página sigue la orientación de la plancha
+    # derivada; en single_page se mantiene la hoja landscape.
+    if page_mode != "single_page" and config.height_m > config.width_m:
+        page_w = p_short * MM_TO_PT  # portrait
+        page_h = p_long * MM_TO_PT
+    else:
+        page_w = p_long * MM_TO_PT  # landscape
+        page_h = p_short * MM_TO_PT
 
     if page_mode == "single_page":
         pages = [
