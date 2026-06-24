@@ -186,32 +186,17 @@ def decompose_panels_from_groups(
     marks: Optional[List[int]] = None,
     plate_joints: Optional[List] = None,
     user_cuts: Optional[List[dict]] = None,
-    merge_target: Optional[Dict[int, int]] = None,
 ) -> Tuple[List[Panel], List[Panel]]:
-    from core.services.user_cuts import build_cuts_by_group, parse_user_cuts
-
     overrides = overrides or {}
     marks_set = set(marks or [])  # ids de grupos cuyas aberturas se graban (no se cortan)
     min_area = opts.min_area_m2 if opts.min_area_m2 is not None else 0.01
 
-    # Cortes manuales: el front envía group_id PRE-fusión → remapear al superviviente.
+    # Cortes manuales por grupo (user_cuts): group_id -> [cut, ...] en el marco del panel.
     cuts_by_group: Dict[int, list] = {}
-    for gid, cuts in build_cuts_by_group(
-        parse_user_cuts(user_cuts), merge_target
-    ).items():
-        cuts_by_group[gid] = [
-            {
-                "id": c.id,
-                "group_id": gid,
-                "kind": c.kind,
-                "u0": c.u0,
-                "v0": c.v0,
-                "u1": c.u1,
-                "v1": c.v1,
-                "keep_positive": c.keep_positive,
-            }
-            for c in cuts
-        ]
+    for c in user_cuts or []:
+        gid = c.get("group_id") if isinstance(c, dict) else getattr(c, "group_id", None)
+        if gid is not None:
+            cuts_by_group.setdefault(int(gid), []).append(c)
 
     # Ranuras de encastre por placa CORTADA (Misión 1): cut_id -> [(P_a, P_b, ancho), ...]
     # en 3D. `ancho` = grosor de la placa cortante (define el ancho de la ranura).
@@ -234,13 +219,10 @@ def decompose_panels_from_groups(
     )
 
     height_adj: Dict[int, float] = {}
-    height_top_adj: Dict[int, float] = {}
     width_adjs: Dict[int, list] = {}
     for adj in adj_result.adjustments:
         if adj.axis == "height":
             height_adj[adj.group_id] = height_adj.get(adj.group_id, 0.0) + adj.delta
-        elif adj.axis == "height_top":
-            height_top_adj[adj.group_id] = height_top_adj.get(adj.group_id, 0.0) + adj.delta
         else:
             width_adjs.setdefault(adj.group_id, []).append(adj)
 
@@ -339,25 +321,6 @@ def decompose_panels_from_groups(
                     clip_panel_at_v(edges, strip, True)
                     if base_at_min_v
                     else clip_panel_at_v(edges, height_m - strip, False)
-                )
-                if clipped:
-                    width_m, height_m, edges = (
-                        clipped["width_m"],
-                        clipped["height_m"],
-                        clipped["edges"],
-                    )
-
-        height_top_delta = height_top_adj.get(group.id, 0.0)
-        if height_top_delta < 0 and not is_floor:
-            strip = min(-height_top_delta, height_m - 0.01)
-            if strip > 0.001:
-                base_at_min_v = result.v_up >= 0
-                # Recortar desde la CIMA: cuando la base está en min_v (orientación normal),
-                # conservar sólo la parte por debajo de height_m - strip.
-                clipped = (
-                    clip_panel_at_v(edges, height_m - strip, False)
-                    if base_at_min_v
-                    else clip_panel_at_v(edges, strip, True)
                 )
                 if clipped:
                     width_m, height_m, edges = (
@@ -473,22 +436,12 @@ def _decompose(
     user_cuts: Optional[List[dict]] = None,
 ) -> Tuple[Phase1Result, List[Panel], List[Panel]]:
     """Aplica merges, resuelve encastres 3D y descompone a paneles 2D."""
-    from core.services.user_cuts import build_merge_target_map
-
-    merge_target = build_merge_target_map(phase1.groups, merges or [])
     work = apply_merges(phase1, merges or [])
     # Misión 1: resolver intersecciones placa-placa en 3D (encastres) sobre la
     # topología final (post-merges), antes de proyectar.
     plate_joints = resolve_plate_joints(work.groups, work.faces)
     wall_panels, floor_panels = decompose_panels_from_groups(
-        work,
-        opts,
-        overrides,
-        wall_wall_decisions,
-        marks,
-        plate_joints,
-        user_cuts,
-        merge_target=merge_target,
+        work, opts, overrides, wall_wall_decisions, marks, plate_joints, user_cuts
     )
     return work, wall_panels, floor_panels
 
@@ -564,23 +517,15 @@ def generate_from_review(
     marks: Optional[List[int]] = None,
     user_cuts: Optional[List[dict]] = None,
 ) -> List[OutputFile]:
-    # Descomponer paneles primero para tenerlos disponibles para la guía
-    work, wall_panels, floor_panels = _decompose(
+    work, wall_nesting, floor_nesting, sheet_cfg, _ = compute_nesting(
         phase1, opts, overrides, wall_wall_decisions, merges, marks, user_cuts
     )
     scale = opts.scale_denom
     stem = work.stem
 
-    sc = opts.sheet_config
-    sheet_cfg = SheetConfig(
-        width_m=sc.width_m if sc else 1.0,
-        height_m=sc.height_m if sc else 0.6,
-        gap_m=sc.gap_m if sc else 0.003,
-    )
-    wall_nesting = nest_panels(_panels_to_nesting(wall_panels, scale), sheet_cfg, scale)
-    floor_nesting = nest_panels(_panels_to_nesting(floor_panels, scale), sheet_cfg, scale)
-
     files: List[OutputFile] = []
+    paper_name = opts.paper or "A4"
+    page_mode = opts.page_mode or "one_per_sheet"
 
     def add_nesting_outputs(nesting: NestingResult, label: str, prefix: str) -> None:
         if not nesting.sheets:
@@ -591,7 +536,7 @@ def generate_from_review(
                 blob=nested_sheets_to_dxf(nesting, True).encode("utf-8"),
             )
         )
-        ref_pdf = generate_nesting_pdf(nesting, label, True)
+        ref_pdf = generate_nesting_pdf(nesting, label, True, paper_name, page_mode)
         if ref_pdf:
             files.append(
                 OutputFile(name=f"{stem}_{prefix}_con_referencias.pdf", blob=ref_pdf)
@@ -602,7 +547,7 @@ def generate_from_review(
                 blob=nested_sheets_to_dxf(nesting, False).encode("utf-8"),
             )
         )
-        cut_pdf = generate_nesting_pdf(nesting, label, False)
+        cut_pdf = generate_nesting_pdf(nesting, label, False, paper_name, page_mode)
         if cut_pdf:
             files.append(OutputFile(name=f"{stem}_{prefix}_corte.pdf", blob=cut_pdf))
 
@@ -614,27 +559,5 @@ def generate_from_review(
     plan_pdf = generate_pdf(facades, floor_plans, scale, opts.paper)
     if plan_pdf:
         files.append(OutputFile(name=f"{stem}_planos.pdf", blob=plan_pdf))
-
-    # Guía de ensamble: modelo 3D anotado con el código de cada panel
-    try:
-        from core.services.assembly_guide import generate_assembly_guide_pdf
-        guide_pdf = generate_assembly_guide_pdf(
-            wall_panels,
-            floor_panels,
-            work.faces,
-            work.groups,
-            overrides=overrides or {},
-            scale_denom=scale,
-            paper_name="A3",
-        )
-        if guide_pdf:
-            files.append(
-                OutputFile(name=f"{stem}_guia_ensamble.pdf", blob=guide_pdf)
-            )
-    except Exception as exc:
-        import logging
-        logging.getLogger("eficiencia2d.pipeline").warning(
-            "Guia de ensamble omitida: %s", exc, exc_info=True
-        )
 
     return files
