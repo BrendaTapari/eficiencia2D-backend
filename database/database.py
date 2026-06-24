@@ -45,6 +45,7 @@ def init_db() -> None:
     logger.info("Tablas verificadas/creadas correctamente")
     _migrate_configuraciones_usuario_schema()
     _migrate_usuario_email_verification_schema()
+    _migrate_cupones_schema()
     _backfill_configuraciones_usuario()
 
 
@@ -131,6 +132,48 @@ def _migrate_usuario_email_verification_schema() -> None:
     logger.info("Esquema de verificación de correo en usuarios verificado")
 
 
+def _migrate_cupones_schema() -> None:
+    """Crea tablas de cupones y registro de usos si aún no existen."""
+    statements = (
+        """
+        CREATE TABLE IF NOT EXISTS cupones (
+            id UUID PRIMARY KEY,
+            codigo VARCHAR NOT NULL UNIQUE,
+            descripcion VARCHAR,
+            limite_usos INTEGER NOT NULL DEFAULT 1,
+            limite_usos_por_usuario INTEGER NOT NULL DEFAULT 1,
+            plan_id INTEGER,
+            descuento_porcentaje NUMERIC(5, 2),
+            descuento_monto NUMERIC(10, 2),
+            fecha_inicio TIMESTAMPTZ,
+            fecha_expiracion TIMESTAMPTZ,
+            activo BOOLEAN NOT NULL DEFAULT TRUE,
+            limitaciones JSONB,
+            fecha_creacion TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT fk_cupones_plan FOREIGN KEY (plan_id) REFERENCES planes (id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS usos_cupon (
+            id UUID PRIMARY KEY,
+            cupon_id UUID NOT NULL,
+            usuario_id UUID NOT NULL,
+            fecha_uso TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT fk_usos_cupon_cupon FOREIGN KEY (cupon_id) REFERENCES cupones (id),
+            CONSTRAINT fk_usos_cupon_usuario FOREIGN KEY (usuario_id) REFERENCES usuarios (id)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS ix_usos_cupon_cupon_usuario
+        ON usos_cupon (cupon_id, usuario_id)
+        """,
+    )
+    with engine.begin() as conn:
+        for sql in statements:
+            conn.execute(text(sql))
+    logger.info("Esquema de cupones verificado")
+
+
 def _backfill_configuraciones_usuario() -> None:
     """Corrige filas legacy con NULLs en configuraciones_usuario."""
     statements = (
@@ -160,6 +203,7 @@ class Usuario(Base):
     suscripcion = relationship("Suscripcion", back_populates="usuario", uselist=False) # Relación 1 a 1
     proyectos = relationship("Proyecto", back_populates="usuario")
     pagos = relationship("Pago", back_populates="usuario")
+    usos_cupon = relationship("UsoCupon", back_populates="usuario")
     configuracion_usuario = relationship(
         "ConfiguracionUsuario", back_populates="usuario", uselist=False
     )
@@ -176,6 +220,7 @@ class Plan(Base):
 
     # Relaciones
     suscripciones = relationship("Suscripcion", back_populates="plan")
+    cupones = relationship("Cupon", back_populates="plan")
 
 
 class Suscripcion(Base):
@@ -246,3 +291,36 @@ class ConfiguracionUsuario(Base):
 
     # Relación inversa hacia Usuario
     usuario = relationship("Usuario", back_populates="configuracion_usuario")
+
+
+class Cupon(Base):
+    __tablename__ = 'cupones'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    codigo = Column(String, unique=True, nullable=False)
+    descripcion = Column(String, nullable=True)
+    limite_usos = Column(Integer, nullable=False, default=1)
+    limite_usos_por_usuario = Column(Integer, nullable=False, default=1)
+    plan_id = Column(Integer, ForeignKey('planes.id', ondelete='RESTRICT'), nullable=True)
+    descuento_porcentaje = Column(Numeric(5, 2), nullable=True)
+    descuento_monto = Column(Numeric(10, 2), nullable=True)
+    fecha_inicio = Column(DateTime(timezone=True), nullable=True)
+    fecha_expiracion = Column(DateTime(timezone=True), nullable=True)
+    activo = Column(Boolean, nullable=False, default=True)
+    limitaciones = Column(JSONB, nullable=True)
+    fecha_creacion = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    plan = relationship("Plan", back_populates="cupones")
+    usos = relationship("UsoCupon", back_populates="cupon")
+
+
+class UsoCupon(Base):
+    __tablename__ = 'usos_cupon'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    cupon_id = Column(UUID(as_uuid=True), ForeignKey('cupones.id', ondelete='RESTRICT'), nullable=False)
+    usuario_id = Column(UUID(as_uuid=True), ForeignKey('usuarios.id', ondelete='RESTRICT'), nullable=False)
+    fecha_uso = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    cupon = relationship("Cupon", back_populates="usos")
+    usuario = relationship("Usuario", back_populates="usos_cupon")
