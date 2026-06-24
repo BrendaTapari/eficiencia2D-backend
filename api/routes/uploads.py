@@ -240,6 +240,8 @@ class NestingPreviewRequest(BaseModel):
     user_cuts: Optional[List[dict]] = None
     sheet_config: Optional[SheetConfigModel] = None
     scale_denom: float = 50.0
+    paper: str = "A4"
+    page_mode: str = "one_per_sheet"  # cartón (deriva plancha del papel) | láser
 
 
 # ---------------------------------------------------------------------------
@@ -598,10 +600,11 @@ async def nesting_preview_endpoint(request: NestingPreviewRequest):
         )
         opts = PipelineOptions(
             scale_denom=request.scale_denom,
-            paper="A4",
+            paper=request.paper,
             include_cutting_sheet=True,
             sheet_config=sheet_cfg,
             min_area_m2=request.min_area_m2,
+            page_mode=request.page_mode,
         )
 
         with timer.step("compute_nesting"):
