@@ -244,6 +244,17 @@ class NestingPreviewRequest(BaseModel):
     page_mode: str = "one_per_sheet"  # cartón (deriva plancha del papel) | láser
 
 
+class AssemblyGuideRequest(BaseModel):
+    file_id: str
+    original_filename: str = "model.obj"
+    axis: Optional[str] = None
+    min_area_m2: float = 1.0
+    merges: Optional[List[List[int]]] = None
+    splits: Optional[List[SplitModel]] = None
+    overrides: Optional[Dict[int, str]] = None
+    epsilon: float = 0.01  # tolerancia AABB para adyacencia (metros)
+
+
 # ---------------------------------------------------------------------------
 # Caché de Phase1 en disco (pickle + gzip)
 # ---------------------------------------------------------------------------
@@ -634,3 +645,65 @@ async def nesting_preview_endpoint(request: NestingPreviewRequest):
     except Exception as e:
         logger.exception(f"[nesting-preview] Error: {e}")
         raise HTTPException(status_code=500, detail=f"Error en nesting-preview: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# Endpoint /assembly-guide — secuencia de ensamble 3D para el visor React
+# ---------------------------------------------------------------------------
+
+@router.post("/assembly-guide")
+async def assembly_guide_endpoint(request: AssemblyGuideRequest):
+    """
+    Calcula la secuencia de ensamble paso a paso y la geometría simplificada
+    de cada pieza para el visor interactivo (React Three Fiber).
+    """
+    timer = PipelineTimer("assembly_guide_endpoint")
+
+    with timer.step("load_phase1"):
+        base = load_or_parse_phase1(request.file_id, request.original_filename)
+
+    try:
+        from core.pipeline import apply_review_edits
+        from core.review_generate import apply_merges, compute_panel_id_by_group
+        from core.services.assembly_logic import build_assembly_guide_payload
+
+        with timer.step("apply_review_edits"):
+            rebuilt = apply_review_edits(
+                base,
+                axis=request.axis,
+                min_real_area=request.min_area_m2,
+                splits=[s.dict() for s in (request.splits or [])],
+            )
+
+        with timer.step("apply_merges"):
+            merged = apply_merges(rebuilt, request.merges or [])
+
+        with timer.step("panel_id_by_group"):
+            pid_by_group = compute_panel_id_by_group(merged)
+
+        with timer.step("assembly_sequence"):
+            payload = build_assembly_guide_payload(
+                merged,
+                pid_by_group,
+                epsilon=request.epsilon,
+            )
+
+        timing_report = timer.report()
+        payload["timing"] = timing_report
+
+        if not payload["steps"]:
+            raise HTTPException(
+                status_code=422,
+                detail="No se pudo calcular la secuencia de ensamble (sin piezas válidas).",
+            )
+
+        return JSONResponse(content={
+            "message": "Secuencia de ensamble calculada.",
+            **payload,
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"[assembly-guide] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error en assembly-guide: {str(e)}")

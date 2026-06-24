@@ -18,3 +18,14 @@ temp/
 # Archivos del sistema operativo
 .DS_Store
 Thumbs.db
+
+# --- Frontend (React / Vite) ---
+# Dependencias y builds: no van al repo (se regeneran con npm install / npm run build)
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+
+# Artefactos de TypeScript / Vite
+*.tsbuildinfo
+frontend/.vite/
