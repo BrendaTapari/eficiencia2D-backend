@@ -108,6 +108,7 @@ class PipelineOptions:
     element_filter: Optional[ElementFilter] = None
     sheet_config: Optional[SheetConfig] = None
     min_area_m2: Optional[float] = None
+    page_mode: Optional[str] = None  # "one_per_sheet" | "single_page" (PDF de planchas)
 
 @dataclass
 class OutputFile:
