@@ -475,6 +475,28 @@ def compute_panel_id_by_group(
         return {}
 
 
+CARDBOARD_MARGIN_M = 0.010  # margen de impresión por lado en modo cartón (10 mm)
+
+
+def _paper_sheet_dims_m(paper_name: str, margin_m: float = CARDBOARD_MARGIN_M):
+    """Dimensiones útiles (short, long) en metros de un papel ISO menos el margen."""
+    from core.services.pdf_writer import PAPERS
+
+    p = PAPERS.get(paper_name, PAPERS["A4"])
+    short = min(p["w"], p["h"]) / 1000.0 - 2 * margin_m
+    long = max(p["w"], p["h"]) / 1000.0 - 2 * margin_m
+    return max(short, 0.05), max(long, 0.05)
+
+
+def _nest_both(wall_np, floor_np, sheet_cfg: SheetConfig, scale: float):
+    wn = nest_panels(wall_np, sheet_cfg, scale)
+    fn = nest_panels(floor_np, sheet_cfg, scale)
+    unplaced = len(wn.unplaced) + len(fn.unplaced)
+    sheets = wn.sheets + fn.sheets
+    util = sum(s.utilization for s in sheets) / len(sheets) if sheets else 0.0
+    return wn, fn, unplaced, util
+
+
 def compute_nesting(
     phase1: Phase1Result,
     opts: PipelineOptions,
@@ -490,14 +512,33 @@ def compute_nesting(
     )
 
     sc = opts.sheet_config
-    sheet_cfg = SheetConfig(
-        width_m=sc.width_m if sc else 1.0,
-        height_m=sc.height_m if sc else 0.6,
-        gap_m=sc.gap_m if sc else 0.003,
-    )
+    gap = sc.gap_m if sc else 0.003
     scale = opts.scale_denom
-    wall_nesting = nest_panels(_panels_to_nesting(wall_panels, scale), sheet_cfg, scale)
-    floor_nesting = nest_panels(_panels_to_nesting(floor_panels, scale), sheet_cfg, scale)
+    page_mode = opts.page_mode or "one_per_sheet"
+    wall_np = _panels_to_nesting(wall_panels, scale)
+    floor_np = _panels_to_nesting(floor_panels, scale)
+
+    if page_mode == "single_page":
+        # Modo láser: plancha = sheet_config físico (comportamiento actual).
+        sheet_cfg = SheetConfig(
+            width_m=sc.width_m if sc else 1.0,
+            height_m=sc.height_m if sc else 0.6,
+            gap_m=gap,
+        )
+        wall_nesting = nest_panels(wall_np, sheet_cfg, scale)
+        floor_nesting = nest_panels(floor_np, sheet_cfg, scale)
+    else:
+        # Modo cartón: plancha = papel − margen, auto-orientada (la que minimiza
+        # piezas sin ubicar; desempate por mayor aprovechamiento).
+        short, long = _paper_sheet_dims_m(opts.paper or "A4")
+        best = None  # (unplaced, -util, cfg, wn, fn)
+        for (w, h) in ((long, short), (short, long)):  # landscape, portrait
+            cfg = SheetConfig(width_m=w, height_m=h, gap_m=gap)
+            wn, fn, unplaced, util = _nest_both(wall_np, floor_np, cfg, scale)
+            key = (unplaced, -util)
+            if best is None or key < best[0]:
+                best = (key, cfg, wn, fn)
+        _, sheet_cfg, wall_nesting, floor_nesting = best
 
     return (
         work,
