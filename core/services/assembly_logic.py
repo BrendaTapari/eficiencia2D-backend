@@ -21,6 +21,10 @@ UpAxis = Literal["Y", "Z"]
 HORIZONTAL_DOT = 0.85
 VERTICAL_DOT = 0.50
 DEFAULT_EPSILON = 0.01
+# Grosor visual de placa para el instructivo 3D (corte láser / cartón).
+DEFAULT_VIEWER_THICKNESS_M = 0.012
+MAX_VIEWER_THICKNESS_M = 0.05
+VIEWER_SCHEMA = "oriented_box_v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +82,6 @@ class AssemblyPiece:
     center_3d: Optional[Vec3] = None
     panel_width_m: Optional[float] = None
     panel_height_m: Optional[float] = None
-    use_mesh: bool = True
 
     @property
     def centroid(self) -> Tuple[float, float, float]:
@@ -485,7 +488,6 @@ def pieces_from_panels(
                 center_3d=center,
                 panel_width_m=panel.width_m,
                 panel_height_m=panel.height_m,
-                use_mesh=not multi,
             )
         )
 
@@ -500,36 +502,6 @@ def _piece_color(category: Optional[str]) -> str:
     return "#334155"
 
 
-def _fan_triangles(face: Face3D) -> List[Tuple[Vec3, Vec3, Vec3]]:
-    verts = face.vertices
-    if len(verts) < 3:
-        return []
-    v0 = verts[0]
-    return [(v0, verts[i], verts[i + 1]) for i in range(1, len(verts) - 1)]
-
-
-def _mesh_positions_local(
-    group: GeometryGroup,
-    faces: Sequence[Face3D],
-    center: Tuple[float, float, float],
-) -> List[float]:
-    cx, cy, cz = center
-    positions: List[float] = []
-    for fi in group.face_indices:
-        if fi < 0 or fi >= len(faces):
-            continue
-        for tri in _fan_triangles(faces[fi]):
-            for v in tri:
-                positions.extend(
-                    [
-                        round(v.x - cx, 5),
-                        round(v.y - cy, 5),
-                        round(v.z - cz, 5),
-                    ]
-                )
-    return positions
-
-
 def _euler_from_normal(normal: Vec3) -> List[float]:
     """Euler XYZ en radianes (Three.js) para orientar la pieza según su normal."""
     n = normalize(normal)
@@ -540,11 +512,36 @@ def _euler_from_normal(normal: Vec3) -> List[float]:
     return [round(pitch, 6), round(yaw, 6), 0.0]
 
 
-def _oriented_size(piece: AssemblyPiece) -> Tuple[float, float, float]:
+def _panel_thickness_m(
+    piece: AssemblyPiece, group: Optional[GeometryGroup]
+) -> float:
+    """
+    Grosor de placa para el visor.
+
+    Usa el grosor detectado del muro (gemelas) si es razonable; nunca el AABB
+    completo del grupo (incluye ambas pieles y genera bloques gruesos).
+    """
+    if group is not None and group.thickness is not None:
+        t = float(group.thickness)
+        if 0.005 <= t <= MAX_VIEWER_THICKNESS_M:
+            return t
+    return DEFAULT_VIEWER_THICKNESS_M
+
+
+def _oriented_size(
+    piece: AssemblyPiece, group: Optional[GeometryGroup] = None
+) -> Tuple[float, float, float]:
+    """[ancho_plano, alto_plano, grosor] en metros — placa fina orientada por ``normal``."""
     if piece.panel_width_m and piece.panel_height_m:
-        thickness = max(_thickness_along_normal(piece.vertices, piece.normal), 0.01)
+        thickness = _panel_thickness_m(piece, group)
         return (piece.panel_width_m, piece.panel_height_m, thickness)
-    return piece.bbox.size
+    sx, sy, sz = piece.bbox.size
+    n = normalize(piece.normal)
+    if abs(n.y) >= HORIZONTAL_DOT:
+        return (sx, max(sz, DEFAULT_VIEWER_THICKNESS_M), sy)
+    if abs(n.x) >= HORIZONTAL_DOT:
+        return (sy, sz, max(sx, DEFAULT_VIEWER_THICKNESS_M))
+    return (sx, sy, max(sz, DEFAULT_VIEWER_THICKNESS_M))
 
 
 def build_viewer_pieces(
@@ -552,37 +549,36 @@ def build_viewer_pieces(
     groups: Sequence[GeometryGroup],
     faces: Sequence[Face3D],
 ) -> List[Dict]:
-    """Geometría 3D real (malla) o caja orientada por panel para React Three Fiber."""
+    """
+    Placa fina orientada por panel (2D de corte + grosor).
+
+    No exporta malla del grupo 3D: incluye ambas pieles del muro y se ve mal
+    en el instructivo interactivo.
+    """
+    del faces  # reservado; el visor usa cajas orientadas, no malla cruda.
     group_by_id = {g.id: g for g in groups}
     viewer: List[Dict] = []
 
     for p in pieces:
         cx, cy, cz = p.centroid
-        entry: Dict = {
-            "id": p.id,
-            "position": [round(cx, 4), round(cy, 4), round(cz, 4)],
-            "normal": [
-                round(p.normal.x, 5),
-                round(p.normal.y, 5),
-                round(p.normal.z, 5),
-            ],
-            "rotation": _euler_from_normal(p.normal),
-            "color": _piece_color(p.category),
-        }
-
         group = group_by_id.get(p.group_id) if p.group_id is not None else None
-        if p.use_mesh and group is not None:
-            positions = _mesh_positions_local(group, faces, (cx, cy, cz))
-            if len(positions) >= 9:
-                entry["mesh"] = {"positions": positions}
-            else:
-                sx, sy, sz = _oriented_size(p)
-                entry["size"] = [round(sx, 4), round(sy, 4), round(sz, 4)]
-        else:
-            sx, sy, sz = _oriented_size(p)
-            entry["size"] = [round(sx, 4), round(sy, 4), round(sz, 4)]
-
-        viewer.append(entry)
+        sx, sy, sz = _oriented_size(p, group)
+        viewer.append(
+            {
+                "id": p.id,
+                "kind": "oriented_box",
+                "position": [round(cx, 4), round(cy, 4), round(cz, 4)],
+                "size": [round(sx, 4), round(sy, 4), round(sz, 4)],
+                "normal": [
+                    round(p.normal.x, 5),
+                    round(p.normal.y, 5),
+                    round(p.normal.z, 5),
+                ],
+                "rotation": _euler_from_normal(p.normal),
+                "color": _piece_color(p.category),
+                "category": p.category or "unknown",
+            }
+        )
 
     return viewer
 
@@ -631,5 +627,6 @@ def build_assembly_guide_payload(
             "step_count": len(steps),
             "applied_axis": phase1.applied_axis,
             "epsilon": epsilon,
+            "viewer_schema": VIEWER_SCHEMA,
         },
     }
