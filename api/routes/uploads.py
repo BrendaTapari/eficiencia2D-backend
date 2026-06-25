@@ -613,7 +613,7 @@ async def nesting_preview_endpoint(request: NestingPreviewRequest):
         )
 
         with timer.step("compute_nesting"):
-            _, wall_nesting, floor_nesting, cfg, _ = compute_nesting(
+            _, wall_nesting, floor_nesting, cfg, _, _, _ = compute_nesting(
                 rebuilt,
                 opts,
                 overrides=request.overrides,
