@@ -8,6 +8,8 @@ fusiones y decisiones muro-muro, se descompone por grupo y se exporta DXF/PDF.
 from __future__ import annotations
 
 import copy
+import json
+import logging
 from dataclasses import replace
 from typing import Dict, List, Optional, Tuple
 
@@ -29,6 +31,8 @@ from core.services.facade_extractor import extract_facades
 from core.services.floor_plan_extractor import extract_floor_plans
 from core.services.joint_detector import detect_joints
 from core.services.pdf_writer import generate_nesting_pdf, generate_pdf
+from core.services.assembly_guide import generate_assembly_guide_pdf
+from core.services.assembly_logic import build_assembly_guide_payload
 from core.services.sheet_nester import (
     NestingPanel,
     NestingResult,
@@ -45,6 +49,8 @@ from core.services.types import OutputFile, PipelineOptions, Vec3, dot, normaliz
 # de normales mezcladas que al proyectar produce "paredes fantasma". Guardas:
 MERGE_PARALLEL_DOT = 0.95   # |n_m·n_s| > esto => paralelas/antiparalelas (mismo plano)
 MERGE_PLANE_TOL = 0.30      # m: separación máxima de plano (tolera grosor/pieles)
+
+logger = logging.getLogger("eficiencia2d.pipeline")
 
 
 def _coplanar_for_merge(member: GeometryGroup, survivor: GeometryGroup) -> bool:
@@ -505,7 +511,15 @@ def compute_nesting(
     merges: Optional[List[List[int]]] = None,
     marks: Optional[List[int]] = None,
     user_cuts: Optional[List[dict]] = None,
-) -> Tuple[Phase1Result, NestingResult, NestingResult, SheetConfig, Dict[int, str]]:
+) -> Tuple[
+    Phase1Result,
+    NestingResult,
+    NestingResult,
+    SheetConfig,
+    Dict[int, str],
+    List[Panel],
+    List[Panel],
+]:
     """Descompone y anida paneles. Compartido por /generate y /nesting-preview."""
     work, wall_panels, floor_panels = _decompose(
         phase1, opts, overrides, wall_wall_decisions, merges, marks, user_cuts
@@ -546,6 +560,8 @@ def compute_nesting(
         floor_nesting,
         sheet_cfg,
         panel_ids_by_group(wall_panels, floor_panels),
+        wall_panels,
+        floor_panels,
     )
 
 
@@ -558,7 +574,7 @@ def generate_from_review(
     marks: Optional[List[int]] = None,
     user_cuts: Optional[List[dict]] = None,
 ) -> List[OutputFile]:
-    work, wall_nesting, floor_nesting, sheet_cfg, _ = compute_nesting(
+    work, wall_nesting, floor_nesting, sheet_cfg, pid_by_group, wall_panels, floor_panels = compute_nesting(
         phase1, opts, overrides, wall_wall_decisions, merges, marks, user_cuts
     )
     scale = opts.scale_denom
@@ -600,5 +616,36 @@ def generate_from_review(
     plan_pdf = generate_pdf(facades, floor_plans, scale, opts.paper)
     if plan_pdf:
         files.append(OutputFile(name=f"{stem}_planos.pdf", blob=plan_pdf))
+
+    try:
+        guide_pdf = generate_assembly_guide_pdf(
+            wall_panels,
+            floor_panels,
+            work.faces,
+            work.groups,
+            overrides=overrides or {},
+            scale_denom=scale,
+            paper_name="A3",
+        )
+        if guide_pdf:
+            files.append(OutputFile(name="guia_ensamble.pdf", blob=guide_pdf))
+        else:
+            logger.warning("[%s] guia_ensamble.pdf vacío (sin paneles activos)", stem)
+    except Exception:
+        logger.exception("[%s] Error generando guia_ensamble.pdf", stem)
+
+    try:
+        guide_payload = build_assembly_guide_payload(work, pid_by_group)
+        if guide_payload.get("steps"):
+            files.append(
+                OutputFile(
+                    name="guia_ensamble.json",
+                    blob=json.dumps(guide_payload, ensure_ascii=False, indent=2).encode(
+                        "utf-8"
+                    ),
+                )
+            )
+    except Exception:
+        logger.exception("[%s] Error generando guia_ensamble.json", stem)
 
     return files
