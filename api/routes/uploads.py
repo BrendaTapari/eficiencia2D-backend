@@ -19,6 +19,7 @@ from core.profiler import PipelineTimer
 from core.services.obj_parser import parse_obj
 from core.services.stl_parser import parse_stl
 from core.pipeline import parse_pipeline, generate_pipeline, Phase1Result
+from core.services.cutting_sheet import build_placements
 from core.services.types import PipelineOptions, SheetConfig
 
 router = APIRouter()
@@ -110,6 +111,10 @@ def serialize_topology(result: Phase1Result, panel_id_by_group: Optional[Dict] =
         # Geometría empaquetada en buffers binarios (ver encode_faces_compact).
         "faces_packed": encode_faces_compact(result.faces),
         "raw_faces_packed": encode_faces_compact(result.raw_faces),
+        # Marco de proyección 3D por pieza (instructivo de armado): group_id -> {origin,
+        # u_axis, v_axis, normal, width_m, height_m, mirrored}. world = origin + u·u_axis
+        # + v·v_axis. Caras en el mismo espacio que faces_packed (eje Y).
+        "placements": build_placements(result.groups, result.faces, "Y"),
     }
     if panel_id_by_group is not None:
         topo["panel_id_by_group"] = {str(k): v for k, v in panel_id_by_group.items()}
@@ -242,17 +247,6 @@ class NestingPreviewRequest(BaseModel):
     scale_denom: float = 50.0
     paper: str = "A4"
     page_mode: str = "one_per_sheet"  # cartón (deriva plancha del papel) | láser
-
-
-class AssemblyGuideRequest(BaseModel):
-    file_id: str
-    original_filename: str = "model.obj"
-    axis: Optional[str] = None
-    min_area_m2: float = 1.0
-    merges: Optional[List[List[int]]] = None
-    splits: Optional[List[SplitModel]] = None
-    overrides: Optional[Dict[int, str]] = None
-    epsilon: float = 0.01  # tolerancia AABB para adyacencia (metros)
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +613,7 @@ async def nesting_preview_endpoint(request: NestingPreviewRequest):
         )
 
         with timer.step("compute_nesting"):
-            _, wall_nesting, floor_nesting, cfg, _, _, _ = compute_nesting(
+            _, wall_nesting, floor_nesting, cfg, _ = compute_nesting(
                 rebuilt,
                 opts,
                 overrides=request.overrides,
@@ -645,76 +639,3 @@ async def nesting_preview_endpoint(request: NestingPreviewRequest):
     except Exception as e:
         logger.exception(f"[nesting-preview] Error: {e}")
         raise HTTPException(status_code=500, detail=f"Error en nesting-preview: {str(e)}")
-
-
-# ---------------------------------------------------------------------------
-# Endpoint /assembly-guide — secuencia de ensamble 3D para el visor React
-# ---------------------------------------------------------------------------
-
-@router.post("/assembly-guide")
-@router.post("/assembly-preview")
-async def assembly_guide_endpoint(request: AssemblyGuideRequest):
-    """
-    Calcula la secuencia de ensamble paso a paso y la geometría simplificada
-    de cada pieza para el visor interactivo (React Three Fiber).
-    """
-    timer = PipelineTimer("assembly_guide_endpoint")
-
-    with timer.step("load_phase1"):
-        base = load_or_parse_phase1(request.file_id, request.original_filename)
-
-    try:
-        from core.pipeline import apply_review_edits
-        from core.review_generate import compute_nesting
-        from core.services.assembly_logic import build_assembly_guide_payload
-        from core.services.types import PipelineOptions
-
-        with timer.step("apply_review_edits"):
-            rebuilt = apply_review_edits(
-                base,
-                axis=request.axis,
-                min_real_area=request.min_area_m2,
-                splits=[s.dict() for s in (request.splits or [])],
-            )
-
-        with timer.step("decompose_panels"):
-            default_opts = PipelineOptions(
-                scale_denom=50.0,
-                paper="A4",
-                min_area_m2=request.min_area_m2,
-            )
-            work, _, _, _, pid_by_group, wall_panels, floor_panels = compute_nesting(
-                rebuilt,
-                default_opts,
-                overrides=request.overrides,
-                merges=request.merges,
-            )
-
-        with timer.step("assembly_sequence"):
-            payload = build_assembly_guide_payload(
-                work,
-                pid_by_group,
-                wall_panels=wall_panels,
-                floor_panels=floor_panels,
-                epsilon=request.epsilon,
-            )
-
-        timing_report = timer.report()
-        payload["timing"] = timing_report
-
-        if not payload["steps"]:
-            raise HTTPException(
-                status_code=422,
-                detail="No se pudo calcular la secuencia de ensamble (sin piezas válidas).",
-            )
-
-        return JSONResponse(content={
-            "message": "Secuencia de ensamble calculada.",
-            **payload,
-        })
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception(f"[assembly-guide] Error: {e}")
-        raise HTTPException(status_code=500, detail=f"Error en assembly-guide: {str(e)}")
