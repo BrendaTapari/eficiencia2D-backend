@@ -665,8 +665,9 @@ async def assembly_guide_endpoint(request: AssemblyGuideRequest):
 
     try:
         from core.pipeline import apply_review_edits
-        from core.review_generate import apply_merges, compute_panel_id_by_group
+        from core.review_generate import compute_nesting
         from core.services.assembly_logic import build_assembly_guide_payload
+        from core.services.types import PipelineOptions
 
         with timer.step("apply_review_edits"):
             rebuilt = apply_review_edits(
@@ -676,16 +677,25 @@ async def assembly_guide_endpoint(request: AssemblyGuideRequest):
                 splits=[s.dict() for s in (request.splits or [])],
             )
 
-        with timer.step("apply_merges"):
-            merged = apply_merges(rebuilt, request.merges or [])
-
-        with timer.step("panel_id_by_group"):
-            pid_by_group = compute_panel_id_by_group(merged)
+        with timer.step("decompose_panels"):
+            default_opts = PipelineOptions(
+                scale_denom=50.0,
+                paper="A4",
+                min_area_m2=request.min_area_m2,
+            )
+            work, _, _, _, pid_by_group, wall_panels, floor_panels = compute_nesting(
+                rebuilt,
+                default_opts,
+                overrides=request.overrides,
+                merges=request.merges,
+            )
 
         with timer.step("assembly_sequence"):
             payload = build_assembly_guide_payload(
-                merged,
+                work,
                 pid_by_group,
+                wall_panels=wall_panels,
+                floor_panels=floor_panels,
                 epsilon=request.epsilon,
             )
 

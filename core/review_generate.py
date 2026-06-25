@@ -635,7 +635,12 @@ def generate_from_review(
         logger.exception("[%s] Error generando guia_ensamble.pdf", stem)
 
     try:
-        guide_payload = build_assembly_guide_payload(work, pid_by_group)
+        guide_payload = build_assembly_guide_payload(
+            work,
+            pid_by_group,
+            wall_panels=wall_panels,
+            floor_panels=floor_panels,
+        )
         if guide_payload.get("steps"):
             files.append(
                 OutputFile(

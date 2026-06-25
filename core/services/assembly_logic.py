@@ -12,7 +12,9 @@ from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
 from core.group_classifier import GeometryGroup
 from core.pipeline import Phase1Result
-from core.services.types import Face3D, Vec3, dot, normalize
+from core.services.assembly_guide import _panel_centroid_3d
+from core.services.cutting_sheet import Panel
+from core.services.types import Face3D, Vec3, cross, dot, normalize, vlength
 
 UpAxis = Literal["Y", "Z"]
 
@@ -73,9 +75,15 @@ class AssemblyPiece:
     vertices: List[Vec3] = field(default_factory=list)
     category: Optional[str] = None
     group_id: Optional[int] = None
+    center_3d: Optional[Vec3] = None
+    panel_width_m: Optional[float] = None
+    panel_height_m: Optional[float] = None
+    use_mesh: bool = True
 
     @property
     def centroid(self) -> Tuple[float, float, float]:
+        if self.center_3d is not None:
+            return (self.center_3d.x, self.center_3d.y, self.center_3d.z)
         if self.vertices:
             n = len(self.vertices)
             sx = sum(v.x for v in self.vertices)
@@ -388,6 +396,102 @@ def pieces_from_phase1(
     )
 
 
+def _panels_per_group(panels: Sequence[Panel]) -> Dict[int, int]:
+    counts: Dict[int, int] = {}
+    for panel in panels:
+        gid = panel.source_group_id
+        counts[gid] = counts.get(gid, 0) + 1
+    return counts
+
+
+def _thickness_along_normal(vertices: Sequence[Vec3], normal: Vec3) -> float:
+    n = normalize(normal)
+    projs = [dot(v, n) for v in vertices]
+    return max(projs) - min(projs) if projs else 0.05
+
+
+def _approx_panel_bbox(
+    panel: Panel,
+    center: Vec3,
+    thickness: float,
+    normal: Vec3,
+) -> BoundingBox3D:
+    """AABB aproximado alrededor del centro del panel (cortes manuales)."""
+    n = normalize(normal)
+    up = Vec3(0.0, 1.0, 0.0)
+    if abs(dot(n, up)) > 0.95:
+        u = Vec3(1.0, 0.0, 0.0)
+    else:
+        u = normalize(cross(up, n))
+    v = normalize(cross(n, u))
+    hw = panel.width_m * 0.5
+    hh = panel.height_m * 0.5
+    ht = max(thickness, 0.01) * 0.5
+    corners: List[Vec3] = []
+    for su in (-1.0, 1.0):
+        for sv in (-1.0, 1.0):
+            for sn in (-1.0, 1.0):
+                corners.append(
+                    Vec3(
+                        center.x + u.x * hw * su + v.x * hh * sv + n.x * ht * sn,
+                        center.y + u.y * hw * su + v.y * hh * sv + n.y * ht * sn,
+                        center.z + u.z * hw * su + v.z * hh * sv + n.z * ht * sn,
+                    )
+                )
+    return _compute_bbox(corners)
+
+
+def pieces_from_panels(
+    wall_panels: Sequence[Panel],
+    floor_panels: Sequence[Panel],
+    groups: Sequence[GeometryGroup],
+    faces: Sequence[Face3D],
+) -> List[AssemblyPiece]:
+    """Una pieza por panel descompuesto (A1, B2, …) con posición 3D real."""
+    group_by_id = {g.id: g for g in groups}
+    all_panels = list(wall_panels) + list(floor_panels)
+    per_group = _panels_per_group(all_panels)
+    face_list = list(faces)
+    out: List[AssemblyPiece] = []
+
+    for panel in all_panels:
+        group = group_by_id.get(panel.source_group_id)
+        if group is None:
+            continue
+
+        vertices = _collect_group_vertices(group, face_list)
+        if not vertices:
+            continue
+
+        center = _panel_centroid_3d(panel, group, face_list)
+        thickness = _thickness_along_normal(vertices, group.representative_normal)
+        multi = per_group.get(panel.source_group_id, 1) > 1
+
+        if multi:
+            bbox = _approx_panel_bbox(
+                panel, center, thickness, group.representative_normal
+            )
+        else:
+            bbox = _compute_bbox(vertices)
+
+        out.append(
+            AssemblyPiece(
+                id=panel.id,
+                normal=group.representative_normal,
+                bbox=bbox,
+                vertices=vertices,
+                category=panel.category,
+                group_id=group.id,
+                center_3d=center,
+                panel_width_m=panel.width_m,
+                panel_height_m=panel.height_m,
+                use_mesh=not multi,
+            )
+        )
+
+    return out
+
+
 def _piece_color(category: Optional[str]) -> str:
     if category == "floor":
         return "#64748b"
@@ -396,20 +500,90 @@ def _piece_color(category: Optional[str]) -> str:
     return "#334155"
 
 
-def build_viewer_pieces(pieces: Sequence[AssemblyPiece]) -> List[Dict]:
-    """Geometría simplificada para React Three Fiber (centro + bounding box)."""
+def _fan_triangles(face: Face3D) -> List[Tuple[Vec3, Vec3, Vec3]]:
+    verts = face.vertices
+    if len(verts) < 3:
+        return []
+    v0 = verts[0]
+    return [(v0, verts[i], verts[i + 1]) for i in range(1, len(verts) - 1)]
+
+
+def _mesh_positions_local(
+    group: GeometryGroup,
+    faces: Sequence[Face3D],
+    center: Tuple[float, float, float],
+) -> List[float]:
+    cx, cy, cz = center
+    positions: List[float] = []
+    for fi in group.face_indices:
+        if fi < 0 or fi >= len(faces):
+            continue
+        for tri in _fan_triangles(faces[fi]):
+            for v in tri:
+                positions.extend(
+                    [
+                        round(v.x - cx, 5),
+                        round(v.y - cy, 5),
+                        round(v.z - cz, 5),
+                    ]
+                )
+    return positions
+
+
+def _euler_from_normal(normal: Vec3) -> List[float]:
+    """Euler XYZ en radianes (Three.js) para orientar la pieza según su normal."""
+    n = normalize(normal)
+    if vlength(n) < 1e-9:
+        return [0.0, 0.0, 0.0]
+    yaw = math.atan2(n.x, n.z)
+    pitch = -math.asin(max(-1.0, min(1.0, n.y)))
+    return [round(pitch, 6), round(yaw, 6), 0.0]
+
+
+def _oriented_size(piece: AssemblyPiece) -> Tuple[float, float, float]:
+    if piece.panel_width_m and piece.panel_height_m:
+        thickness = max(_thickness_along_normal(piece.vertices, piece.normal), 0.01)
+        return (piece.panel_width_m, piece.panel_height_m, thickness)
+    return piece.bbox.size
+
+
+def build_viewer_pieces(
+    pieces: Sequence[AssemblyPiece],
+    groups: Sequence[GeometryGroup],
+    faces: Sequence[Face3D],
+) -> List[Dict]:
+    """Geometría 3D real (malla) o caja orientada por panel para React Three Fiber."""
+    group_by_id = {g.id: g for g in groups}
     viewer: List[Dict] = []
+
     for p in pieces:
-        cx, cy, cz = p.bbox.center
-        sx, sy, sz = p.bbox.size
-        viewer.append(
-            {
-                "id": p.id,
-                "position": [round(cx, 4), round(cy, 4), round(cz, 4)],
-                "size": [round(sx, 4), round(sy, 4), round(sz, 4)],
-                "color": _piece_color(p.category),
-            }
-        )
+        cx, cy, cz = p.centroid
+        entry: Dict = {
+            "id": p.id,
+            "position": [round(cx, 4), round(cy, 4), round(cz, 4)],
+            "normal": [
+                round(p.normal.x, 5),
+                round(p.normal.y, 5),
+                round(p.normal.z, 5),
+            ],
+            "rotation": _euler_from_normal(p.normal),
+            "color": _piece_color(p.category),
+        }
+
+        group = group_by_id.get(p.group_id) if p.group_id is not None else None
+        if p.use_mesh and group is not None:
+            positions = _mesh_positions_local(group, faces, (cx, cy, cz))
+            if len(positions) >= 9:
+                entry["mesh"] = {"positions": positions}
+            else:
+                sx, sy, sz = _oriented_size(p)
+                entry["size"] = [round(sx, 4), round(sy, 4), round(sz, 4)]
+        else:
+            sx, sy, sz = _oriented_size(p)
+            entry["size"] = [round(sx, 4), round(sy, 4), round(sz, 4)]
+
+        viewer.append(entry)
+
     return viewer
 
 
@@ -417,6 +591,8 @@ def build_assembly_guide_payload(
     phase1: Phase1Result,
     panel_id_by_group: Optional[Dict[int, str]] = None,
     *,
+    wall_panels: Optional[Sequence[Panel]] = None,
+    floor_panels: Optional[Sequence[Panel]] = None,
     epsilon: float = DEFAULT_EPSILON,
 ) -> Dict:
     """
@@ -425,15 +601,22 @@ def build_assembly_guide_payload(
     Incluye claves en inglés (API) y español (compatibilidad con el frontend).
     """
     # Caras en Phase1Result están en espacio Y-up canónico (Z-up se rota al parsear).
-    pieces = pieces_from_phase1(phase1, panel_id_by_group)
+    if wall_panels is not None and floor_panels is not None:
+        pieces = pieces_from_panels(
+            wall_panels, floor_panels, phase1.groups, phase1.faces
+        )
+    else:
+        pieces = pieces_from_phase1(phase1, panel_id_by_group)
+
     steps = generate_assembly_sequence(pieces, epsilon=epsilon, up_axis="Y")
-    viewer_pieces = build_viewer_pieces(pieces)
+    viewer_pieces = build_viewer_pieces(pieces, phase1.groups, phase1.faces)
 
     pasos = [
         {
             "titulo": s["title"],
             "descripcion": s["description"],
             "piezaIds": s["part_ids"],
+            "camera_focus": s.get("camera_focus"),
         }
         for s in steps
     ]
