@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from api.deps import get_current_user
@@ -140,6 +140,13 @@ async def register(
             status_code=status.HTTP_409_CONFLICT,
             detail="No se pudo crear la cuenta",
         ) from None
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Error de base de datos al registrar usuario")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo conectar con la base de datos. Intentá de nuevo en unos segundos.",
+        ) from None
 
     db.refresh(user)
 
@@ -241,7 +248,15 @@ def verify_email(body: VerifyEmailRequest, db: Session = Depends(get_db)):
     user.estado = ESTADO_ACTIVO
     user.email_verification_token = None
     user.email_verified_at = datetime.now(timezone.utc)
-    db.commit()
+    try:
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Error de base de datos al verificar correo")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo conectar con la base de datos. Intentá de nuevo en unos segundos.",
+        ) from None
     db.refresh(user)
 
     logger.info("Cuenta verificada: %s", user.email)

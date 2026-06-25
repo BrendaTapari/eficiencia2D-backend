@@ -17,13 +17,31 @@ load_dotenv(PROJECT_DIR / ".env")
 
 Base = declarative_base()
 
-# En el servidor con Docker: host=localhost y puerto=5433 (mapeo en docker-compose).
-# Si la API corre dentro de la misma red Docker: host=postgres_db y puerto=5432.
-# La contraseña con "ñ" debe ir URL-encoded (%C3%B1) dentro de DATABASE_URL.
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql+psycopg2://eficiencia_db:%C3%B1StefaBren_bd@localhost:5433/eficiencia_db",
-)
+
+def _get_database_url() -> str:
+    """Lee DATABASE_URL del .env y la adapta para SQLAlchemy + psycopg2."""
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL no está definida. Configurala en el archivo .env del proyecto."
+        )
+
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    elif not url.startswith("postgresql+psycopg2://"):
+        raise RuntimeError(
+            "DATABASE_URL debe usar el esquema postgresql:// o postgresql+psycopg2://"
+        )
+
+    # Supabase exige SSL en conexiones remotas.
+    if "supabase.co" in url and "sslmode=" not in url:
+        separator = "&" if "?" in url else "?"
+        url = f"{url}{separator}sslmode=require"
+
+    return url
+
+
+DATABASE_URL = _get_database_url()
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -33,6 +51,9 @@ def get_db():
     db = SessionLocal()
     try:
         yield db
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 

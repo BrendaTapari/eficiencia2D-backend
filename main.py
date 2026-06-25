@@ -1,6 +1,7 @@
 import os
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -9,7 +10,8 @@ from fastapi.middleware.gzip import GZipMiddleware
 
 # Cargar variables de entorno (.env) y configurar logging una sola vez,
 # antes de importar/usar los módulos del pipeline.
-load_dotenv()
+PROJECT_DIR = Path(__file__).resolve().parent
+load_dotenv(PROJECT_DIR / ".env")
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s.%(msecs)03d [%(name)s] %(levelname)s — %(message)s",
@@ -40,8 +42,10 @@ async def lifespan(app: FastAPI):
 
 
 from api.routes.auth import router as auth_router
+from api.routes.projects import router as projects_router
 from api.routes.settings import router as settings_router
 from api.routes.uploads import router as uploads_router
+from api.routes.users import router as users_router
 
 app = FastAPI(
     title="Eficiencia2D Backend API",
@@ -108,6 +112,8 @@ app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=1)
 
 # Incluir las rutas
 app.include_router(auth_router, prefix="/api", tags=["Auth"])
+app.include_router(users_router, prefix="/api", tags=["Usuarios"])
+app.include_router(projects_router, prefix="/api", tags=["Proyectos"])
 app.include_router(settings_router, prefix="/api", tags=["Configuración"])
 app.include_router(uploads_router, prefix="/api", tags=["Procesamiento"])
 
