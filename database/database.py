@@ -123,6 +123,7 @@ def init_db() -> None:
     logger.info("Tablas verificadas/creadas correctamente")
     _migrate_configuraciones_usuario_schema()
     _migrate_usuario_email_verification_schema()
+    _migrate_usuario_password_reset_schema()
     _migrate_cupones_schema()
     _backfill_configuraciones_usuario()
 
@@ -210,6 +211,29 @@ def _migrate_usuario_email_verification_schema() -> None:
     logger.info("Esquema de verificación de correo en usuarios verificado")
 
 
+def _migrate_usuario_password_reset_schema() -> None:
+    """Agrega columnas de recuperación de contraseña en usuarios si aún no existen."""
+    statements = (
+        """
+        ALTER TABLE usuarios
+        ADD COLUMN IF NOT EXISTS password_reset_token VARCHAR(64)
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS ix_usuarios_password_reset_token
+        ON usuarios (password_reset_token)
+        WHERE password_reset_token IS NOT NULL
+        """,
+        """
+        ALTER TABLE usuarios
+        ADD COLUMN IF NOT EXISTS password_reset_expires_at TIMESTAMPTZ
+        """,
+    )
+    with engine.begin() as conn:
+        for sql in statements:
+            conn.execute(text(sql))
+    logger.info("Esquema de recuperación de contraseña en usuarios verificado")
+
+
 def _migrate_cupones_schema() -> None:
     """Crea tablas de cupones y registro de usos si aún no existen."""
     statements = (
@@ -276,6 +300,8 @@ class Usuario(Base):
     estado = Column(String, nullable=False, default='activo')
     email_verification_token = Column(String(64), nullable=True, unique=True)
     email_verified_at = Column(DateTime(timezone=True), nullable=True)
+    password_reset_token = Column(String(64), nullable=True, unique=True)
+    password_reset_expires_at = Column(DateTime(timezone=True), nullable=True)
 
     # Relaciones
     suscripcion = relationship("Suscripcion", back_populates="usuario", uselist=False) # Relación 1 a 1

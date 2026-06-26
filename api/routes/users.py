@@ -1,4 +1,5 @@
 import logging
+from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import JSONResponse
@@ -9,6 +10,7 @@ from sqlalchemy.orm import Session
 from api.deps import get_current_user
 from api.routes.projects import (
     ProyectoListResponse,
+    abrir_proyecto,
     create_proyecto_for_user,
     list_proyectos_for_user,
 )
@@ -124,6 +126,15 @@ def list_my_projects(
     db: Session = Depends(get_db),
 ):
     return list_proyectos_for_user(db, current_user)
+
+
+@router.post("/users/me/projects/{proyecto_id}/open")
+def open_my_project(
+    proyecto_id: UUID,
+    current_user: Usuario = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return abrir_proyecto(proyecto_id, current_user, db)
 
 
 @router.post("/users/me/projects", status_code=status.HTTP_201_CREATED)

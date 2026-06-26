@@ -10,6 +10,7 @@ import pickle
 import shutil
 import logging
 import dataclasses
+from pathlib import Path
 from typing import Dict, List, Optional
 from pydantic import BaseModel
 from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Depends
@@ -239,6 +240,73 @@ def _original_filename_for_proyecto(nombre: str, formato: str) -> str:
     return f"{nombre}.{formato}"
 
 
+def original_filename_for_proyecto(proyecto) -> str:
+    """Nombre de archivo real del modelo guardado (para parseo y descarga desde R2)."""
+    meta = proyecto.metadata_impresion or {}
+    archivo = meta.get("archivo_original")
+    if isinstance(archivo, str) and archivo.strip():
+        return archivo.strip()
+
+    if proyecto.url_archivo:
+        name = Path(proyecto.url_archivo).name
+        if name:
+            return name
+
+    return _original_filename_for_proyecto(proyecto.nombre, proyecto.formato)
+
+
+def _summarize_phase1(result: Phase1Result) -> dict:
+    return {
+        "walls": sum(1 for g in result.groups if g.category == "wall"),
+        "floors": sum(1 for g in result.groups if g.category == "floor"),
+        "discards": sum(1 for g in result.groups if g.category == "discard"),
+        "total_groups": len(result.groups),
+        "total_faces": len(result.faces),
+        "total_joints": len(result.joints),
+    }
+
+
+def build_geometry_payload(
+    file_id: str,
+    original_filename: str,
+    result: Phase1Result,
+    *,
+    file_size_mb: float | None = None,
+    summary: dict | None = None,
+    timing: dict | None = None,
+) -> dict:
+    """Respuesta de geometría compatible con /upload y abrir proyecto guardado."""
+    from core.review_generate import compute_panel_id_by_group
+
+    pid_by_group = compute_panel_id_by_group(result)
+    payload = {
+        "message": "Proyecto cargado correctamente.",
+        "file_id": file_id,
+        "proyecto_id": file_id,
+        "original_filename": original_filename,
+        "summary": summary or _summarize_phase1(result),
+        "topology": serialize_topology(result, pid_by_group),
+        "preview_obj": export_colored_obj(result.groups, result.faces),
+    }
+    if file_size_mb is not None:
+        payload["file_size_mb"] = file_size_mb
+    if timing is not None:
+        payload["timing"] = timing
+    return payload
+
+
+def load_saved_proyecto_phase1(proyecto) -> tuple[Phase1Result, str]:
+    """Descarga (si hace falta), parsea y devuelve Phase1 de un proyecto guardado."""
+    file_id = str(proyecto.id)
+    original_filename = original_filename_for_proyecto(proyecto)
+    result = load_or_parse_phase1(
+        file_id,
+        original_filename,
+        ruta_r2=proyecto.url_archivo,
+    )
+    return result, original_filename
+
+
 def resolve_phase1_source(
     *,
     file_id: str | None,
@@ -269,7 +337,7 @@ def resolve_phase1_source(
             raise HTTPException(status_code=404, detail="Proyecto no encontrado")
 
         resolved_file_id = str(proyecto.id)
-        resolved_filename = _original_filename_for_proyecto(proyecto.nombre, proyecto.formato)
+        resolved_filename = original_filename_for_proyecto(proyecto)
         return resolved_file_id, resolved_filename, proyecto.url_archivo
 
     if not file_id:

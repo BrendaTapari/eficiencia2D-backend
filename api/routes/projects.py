@@ -11,7 +11,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from api.deps import get_current_user
-from api.routes.uploads import process_model_file
+from api.routes.uploads import (
+    build_geometry_payload,
+    load_saved_proyecto_phase1,
+    process_model_file,
+)
+from core.profiler import PipelineTimer
 from database import Proyecto, Usuario, get_db
 from database.storage import eliminar_archivo, obtener_url_archivo, subir_archivo
 
@@ -177,6 +182,55 @@ def obtener_proyecto(
 ):
     proyecto = _get_user_proyecto(db, current_user, proyecto_id)
     return _proyecto_to_response(proyecto, include_download_url=True)
+
+
+@router.post("/projects/{proyecto_id}/open")
+def abrir_proyecto(
+    proyecto_id: UUID,
+    current_user: Usuario = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Carga la geometría de un proyecto guardado: descarga el modelo desde R2,
+    reprocesa el pipeline y devuelve topology + preview (igual que al subir).
+    """
+    proyecto = _get_user_proyecto(db, current_user, proyecto_id)
+    timer = PipelineTimer("open_project_endpoint")
+
+    try:
+        with timer.step("load_saved_proyecto"):
+            result, original_filename = load_saved_proyecto_phase1(proyecto)
+    except HTTPException:
+        raise
+    except RuntimeError as exc:
+        logger.exception("Error al descargar proyecto %s desde R2", proyecto.id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo descargar el archivo del proyecto desde el almacenamiento",
+        ) from exc
+    except Exception as exc:
+        logger.exception("Error al abrir proyecto %s", proyecto.id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="No se pudo procesar el proyecto guardado",
+        ) from exc
+
+    meta = proyecto.metadata_impresion or {}
+    summary = meta.get("summary")
+    file_size_mb = round(proyecto.tamano_bytes / 1024 / 1024, 2)
+
+    response_content = {
+        **_proyecto_to_response(proyecto).model_dump(),
+        **build_geometry_payload(
+            str(proyecto.id),
+            original_filename,
+            result,
+            file_size_mb=file_size_mb,
+            summary=summary,
+            timing=timer.report(),
+        ),
+    }
+    return JSONResponse(content=response_content)
 
 
 @router.get("/projects/{proyecto_id}/download")
