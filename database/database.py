@@ -1,7 +1,9 @@
 import logging
 import os
+import socket
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 
 from dotenv import load_dotenv
 from sqlalchemy import Boolean, Column, Integer, String, Numeric, BigInteger, ForeignKey, DateTime, create_engine, text
@@ -16,6 +18,51 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_DIR / ".env")
 
 Base = declarative_base()
+
+
+def _prefer_ipv4_database_url(url: str) -> str:
+    """
+    En VPS sin ruteo IPv6, Supabase puede resolverse a IPv6 y fallar con 'No route to host'.
+    Reemplaza el hostname por su dirección IPv4 cuando sea posible.
+    """
+    if "supabase.co" not in url:
+        return url
+
+    dialect_prefix = ""
+    parse_url = url
+    if url.startswith("postgresql+psycopg2://"):
+        dialect_prefix = "postgresql+psycopg2://"
+        parse_url = "postgresql://" + url[len(dialect_prefix) :]
+    elif url.startswith("postgresql://"):
+        dialect_prefix = "postgresql://"
+
+    parsed = urlparse(parse_url)
+    host = parsed.hostname
+    if not host or host.replace(".", "").isdigit():
+        return url
+
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or 5432, socket.AF_INET, socket.SOCK_STREAM)
+        ipv4 = infos[0][4][0]
+    except OSError:
+        logger.warning("No se pudo resolver IPv4 para %s; se usa el hostname original", host)
+        return url
+
+    port = parsed.port or 5432
+    userinfo = ""
+    if parsed.username:
+        userinfo = parsed.username
+        if parsed.password:
+            userinfo += f":{parsed.password}"
+        userinfo += "@"
+
+    rebuilt = urlunparse(parsed._replace(netloc=f"{userinfo}{ipv4}:{port}"))
+    if dialect_prefix == "postgresql+psycopg2://":
+        rebuilt = rebuilt.replace("postgresql://", dialect_prefix, 1)
+
+    if ipv4 != host:
+        logger.info("Conexión Supabase forzada a IPv4: %s -> %s", host, ipv4)
+    return rebuilt
 
 
 def _get_database_url() -> str:
@@ -38,6 +85,7 @@ def _get_database_url() -> str:
         separator = "&" if "?" in url else "?"
         url = f"{url}{separator}sslmode=require"
 
+    url = _prefer_ipv4_database_url(url)
     return url
 
 
