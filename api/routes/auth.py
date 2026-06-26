@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from api.deps import get_current_user
 from core.security import create_access_token, hash_password, verify_password
 from database import ConfiguracionUsuario, Usuario, get_db
+from database.database import get_db_config_status
 from utils.mailer import (
     build_verification_url,
     get_mail_config_status,
@@ -186,6 +187,15 @@ def mail_status():
     Compará password_length con 16 y env_file con la ruta del servidor.
     """
     return get_mail_config_status()
+
+
+@router.get("/auth/db-status")
+def db_status():
+    """
+    Muestra a qué base de datos está conectado el servidor (sin credenciales).
+    Verificá que database_host sea de Supabase y no localhost.
+    """
+    return get_db_config_status()
 
 
 @router.post("/auth/test-email", response_model=TestEmailResponse)

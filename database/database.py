@@ -41,6 +41,63 @@ def _get_database_url() -> str:
     return url
 
 
+def get_db_config_status() -> dict:
+    """Diagnóstico de conexión a BD (sin exponer credenciales)."""
+    raw_url = os.environ.get("DATABASE_URL", "")
+    env_path = PROJECT_DIR / ".env"
+    issues: list[str] = []
+
+    if not raw_url:
+        issues.append("DATABASE_URL no está definida")
+
+    host = ""
+    database = ""
+    uses_ssl = False
+    is_supabase = False
+    is_local = False
+
+    if raw_url:
+        try:
+            without_scheme = raw_url.split("://", 1)[-1]
+            host_part = without_scheme.split("@")[-1]
+            host = host_part.split("/")[0].split("?")[0]
+            database = host_part.split("/")[1].split("?")[0] if "/" in host_part else ""
+            uses_ssl = "sslmode=require" in raw_url or "supabase.co" in raw_url
+            is_supabase = "supabase.co" in raw_url
+            is_local = host.startswith("localhost") or host.startswith("127.0.0.1")
+            if is_local:
+                issues.append("DATABASE_URL apunta a PostgreSQL local, no a Supabase")
+        except Exception:
+            issues.append("DATABASE_URL tiene un formato inválido")
+
+    user_count = None
+    sample_emails: list[str] = []
+    if not issues:
+        try:
+            with engine.connect() as conn:
+                user_count = conn.execute(text("SELECT COUNT(*) FROM usuarios")).scalar()
+                rows = conn.execute(
+                    text("SELECT email FROM usuarios ORDER BY fecha_creacion LIMIT 5")
+                ).fetchall()
+                sample_emails = [row[0] for row in rows]
+        except Exception as exc:
+            issues.append(f"No se pudo conectar a la base de datos: {exc}")
+
+    return {
+        "env_file": str(env_path),
+        "env_file_exists": env_path.is_file(),
+        "database_host": host,
+        "database_name": database,
+        "is_supabase": is_supabase,
+        "is_localhost": is_local,
+        "uses_ssl": uses_ssl,
+        "usuarios_count": user_count,
+        "sample_emails": sample_emails,
+        "issues": issues,
+        "ok": len(issues) == 0,
+    }
+
+
 DATABASE_URL = _get_database_url()
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
