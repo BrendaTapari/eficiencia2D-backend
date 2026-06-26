@@ -10,22 +10,17 @@ import pickle
 import shutil
 import logging
 import dataclasses
-from pathlib import Path
 from typing import Dict, List, Optional
 from pydantic import BaseModel
-from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Depends
+from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
-from fastapi.security import HTTPAuthorizationCredentials
-from sqlalchemy.orm import Session
-
-from api.deps import bearer_scheme, get_current_user
-from database import Usuario, get_db
 
 from core.profiler import PipelineTimer
 from core.services.obj_parser import parse_obj
 from core.services.stl_parser import parse_stl
 from core.pipeline import parse_pipeline, generate_pipeline, Phase1Result
 from core.services.cutting_sheet import build_placements
+from core.group_classifier import compute_assembly_steps
 from core.services.types import PipelineOptions, SheetConfig
 
 router = APIRouter()
@@ -121,6 +116,7 @@ def serialize_topology(result: Phase1Result, panel_id_by_group: Optional[Dict] =
         # u_axis, v_axis, normal, width_m, height_m, mirrored}. world = origin + u·u_axis
         # + v·v_axis. Caras en el mismo espacio que faces_packed (eje Y).
         "placements": build_placements(result.groups, result.faces, "Y"),
+        "assembly_steps": compute_assembly_steps(result.groups),
     }
     if panel_id_by_group is not None:
         topo["panel_id_by_group"] = {str(k): v for k, v in panel_id_by_group.items()}
@@ -176,54 +172,21 @@ def serialize_nesting(nesting) -> Dict:
     }
 
 
-def ensure_model_on_disk(
-    file_id: str,
-    original_filename: str,
-    *,
-    ruta_r2: str | None = None,
-) -> str:
-    """Garantiza que el modelo esté en disco local; descarga desde R2 si hace falta."""
-    extension = original_filename.rsplit(".", 1)[-1].lower()
-    file_path = os.path.join(UPLOAD_DIR, f"{file_id}.{extension}")
-
-    if os.path.exists(file_path):
-        return file_path
-
-    file_path_obj = os.path.join(UPLOAD_DIR, f"{file_id}.obj")
-    file_path_stl = os.path.join(UPLOAD_DIR, f"{file_id}.stl")
-    if os.path.exists(file_path_obj):
-        return file_path_obj
-    if os.path.exists(file_path_stl):
-        return file_path_stl
-
-    if not ruta_r2:
-        raise HTTPException(
-            status_code=404,
-            detail="Archivo no encontrado. Por favor sube el archivo nuevamente.",
-        )
-
-    from database.storage import descargar_archivo
-
-    logger.info("[load] Descargando modelo desde R2: %s", ruta_r2)
-    data = descargar_archivo(ruta_r2)
-    with open(file_path, "wb") as out_file:
-        out_file.write(data)
-    return file_path
-
-
-def load_or_parse_phase1(
-    file_id: str,
-    original_filename: str,
-    *,
-    ruta_r2: str | None = None,
-) -> Phase1Result:
-    """Carga el Phase1 de caché o, si no está, re-parsea desde disco o R2."""
+def load_or_parse_phase1(file_id: str, original_filename: str) -> Phase1Result:
+    """Carga el Phase1 de caché o, si no está, re-parsea desde el archivo en disco."""
     phase1 = load_phase1_cache(file_id)
     if phase1 is not None:
         return phase1
 
     logger.info("[load] Caché no encontrado, re-procesando archivo...")
-    file_path = ensure_model_on_disk(file_id, original_filename, ruta_r2=ruta_r2)
+    file_path_obj = os.path.join(UPLOAD_DIR, f"{file_id}.obj")
+    file_path_stl = os.path.join(UPLOAD_DIR, f"{file_id}.stl")
+    file_path = file_path_obj if os.path.exists(file_path_obj) else file_path_stl
+    if not os.path.exists(file_path):
+        raise HTTPException(
+            status_code=404,
+            detail="Archivo no encontrado. Por favor sube el archivo nuevamente.",
+        )
     if file_path.lower().endswith(".stl"):
         parsed = parse_stl(file_path)
     else:
@@ -232,141 +195,6 @@ def load_or_parse_phase1(
     phase1 = parse_pipeline(original_filename, parsed["faces"], parsed["warnings"])
     save_phase1_cache(file_id, phase1)
     return phase1
-
-
-def _original_filename_for_proyecto(nombre: str, formato: str) -> str:
-    if nombre.lower().endswith(f".{formato}"):
-        return nombre
-    return f"{nombre}.{formato}"
-
-
-def original_filename_for_proyecto(proyecto) -> str:
-    """Nombre de archivo real del modelo guardado (para parseo y descarga desde R2)."""
-    meta = proyecto.metadata_impresion or {}
-    archivo = meta.get("archivo_original")
-    if isinstance(archivo, str) and archivo.strip():
-        return archivo.strip()
-
-    if proyecto.url_archivo:
-        name = Path(proyecto.url_archivo).name
-        if name:
-            return name
-
-    return _original_filename_for_proyecto(proyecto.nombre, proyecto.formato)
-
-
-def _summarize_phase1(result: Phase1Result) -> dict:
-    return {
-        "walls": sum(1 for g in result.groups if g.category == "wall"),
-        "floors": sum(1 for g in result.groups if g.category == "floor"),
-        "discards": sum(1 for g in result.groups if g.category == "discard"),
-        "total_groups": len(result.groups),
-        "total_faces": len(result.faces),
-        "total_joints": len(result.joints),
-    }
-
-
-def build_geometry_payload(
-    file_id: str,
-    original_filename: str,
-    result: Phase1Result,
-    *,
-    file_size_mb: float | None = None,
-    summary: dict | None = None,
-    timing: dict | None = None,
-) -> dict:
-    """Respuesta de geometría compatible con /upload y abrir proyecto guardado."""
-    from core.review_generate import compute_panel_id_by_group
-
-    pid_by_group = compute_panel_id_by_group(result)
-    payload = {
-        "message": "Proyecto cargado correctamente.",
-        "file_id": file_id,
-        "proyecto_id": file_id,
-        "original_filename": original_filename,
-        "summary": summary or _summarize_phase1(result),
-        "topology": serialize_topology(result, pid_by_group),
-        "preview_obj": export_colored_obj(result.groups, result.faces),
-    }
-    if file_size_mb is not None:
-        payload["file_size_mb"] = file_size_mb
-    if timing is not None:
-        payload["timing"] = timing
-    return payload
-
-
-def load_saved_proyecto_phase1(proyecto) -> tuple[Phase1Result, str]:
-    """Descarga (si hace falta), parsea y devuelve Phase1 de un proyecto guardado."""
-    file_id = str(proyecto.id)
-    original_filename = original_filename_for_proyecto(proyecto)
-    result = load_or_parse_phase1(
-        file_id,
-        original_filename,
-        ruta_r2=proyecto.url_archivo,
-    )
-    return result, original_filename
-
-
-def resolve_phase1_source(
-    *,
-    file_id: str | None,
-    original_filename: str,
-    proyecto_id: str | None,
-    db,
-    user_id,
-) -> tuple[str, str, str | None]:
-    """Resuelve file_id, original_filename y ruta R2 desde file_id o proyecto_id."""
-    if proyecto_id:
-        from uuid import UUID
-
-        from database import Proyecto
-
-        if user_id is None:
-            raise HTTPException(
-                status_code=401,
-                detail="Autenticación requerida para acceder a un proyecto guardado",
-            )
-
-        try:
-            proyecto_uuid = UUID(proyecto_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail="proyecto_id inválido") from exc
-
-        proyecto = db.get(Proyecto, proyecto_uuid)
-        if proyecto is None or proyecto.usuario_id != user_id:
-            raise HTTPException(status_code=404, detail="Proyecto no encontrado")
-
-        resolved_file_id = str(proyecto.id)
-        resolved_filename = original_filename_for_proyecto(proyecto)
-        return resolved_file_id, resolved_filename, proyecto.url_archivo
-
-    if not file_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Debes enviar file_id o proyecto_id",
-        )
-
-    return file_id, original_filename, None
-
-
-def _load_phase1_for_request(
-    request,
-    db: Session,
-    credentials: HTTPAuthorizationCredentials | None,
-) -> Phase1Result:
-    user_id = None
-    if request.proyecto_id:
-        user = get_current_user(credentials, db)
-        user_id = user.id
-
-    file_id, original_filename, ruta_r2 = resolve_phase1_source(
-        file_id=request.file_id,
-        original_filename=request.original_filename,
-        proyecto_id=request.proyecto_id,
-        db=db,
-        user_id=user_id,
-    )
-    return load_or_parse_phase1(file_id, original_filename, ruta_r2=ruta_r2)
 
 
 class SheetConfigModel(BaseModel):
@@ -381,8 +209,7 @@ class SplitModel(BaseModel):
 
 
 class GenerateRequest(BaseModel):
-    file_id: str | None = None
-    proyecto_id: str | None = None
+    file_id: str
     original_filename: str = "model.obj"
     scale_denom: float = 50.0
     paper: str = "A4"
@@ -399,8 +226,7 @@ class GenerateRequest(BaseModel):
 
 
 class RecomputeRequest(BaseModel):
-    file_id: str | None = None
-    proyecto_id: str | None = None
+    file_id: str
     original_filename: str = "model.obj"
     axis: Optional[str] = None  # "Y" | "Z"
     min_area_m2: float = 1.0
@@ -409,8 +235,7 @@ class RecomputeRequest(BaseModel):
 
 
 class NestingPreviewRequest(BaseModel):
-    file_id: str | None = None
-    proyecto_id: str | None = None
+    file_id: str
     original_filename: str = "model.obj"
     axis: Optional[str] = None
     min_area_m2: float = 1.0
@@ -508,25 +333,26 @@ def export_colored_obj(groups, faces) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Procesamiento compartido de modelos 3D
+# Endpoint /upload — optimizado
 # ---------------------------------------------------------------------------
 
-async def process_model_file(
-    file: UploadFile,
-    file_id: str,
-    background_tasks: BackgroundTasks,
-) -> dict:
-    """Recibe un modelo, lo guarda en disco temporal y devuelve la respuesta de procesamiento."""
+@router.post("/upload")
+async def upload_model(
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None,
+):
     timer = PipelineTimer("upload_endpoint")
 
-    extensiones_permitidas = (".stl", ".obj")
+    extensiones_permitidas = ('.stl', '.obj')
     if not file.filename.lower().endswith(extensiones_permitidas):
         raise HTTPException(status_code=400, detail="Formato no soportado. Use .obj o .stl")
 
-    file_extension = file.filename.split(".")[-1].lower()
+    file_id = str(uuid.uuid4())
+    file_extension = file.filename.split('.')[-1].lower()
     file_path = os.path.join(UPLOAD_DIR, f"{file_id}.{file_extension}")
 
     try:
+        # --- Paso 1: Streaming upload a disco (sin cargar todo en RAM) ---
         with timer.step("stream_upload_to_disk"):
             total_bytes = 0
             with open(file_path, "wb") as out_file:
@@ -547,6 +373,9 @@ async def process_model_file(
         file_size_mb = total_bytes / 1024 / 1024
         logger.info(f"[upload] Archivo recibido: {file.filename} ({file_size_mb:.2f} MB)")
 
+        # --- Paso 2+3: Parseo según formato ---
+        # OBJ: streaming de texto (sin cargar todo en RAM).
+        # STL: vía trimesh (lee binario/ASCII; NO se abre en modo texto).
         with timer.step("parse_model", size_mb=round(file_size_mb, 2), fmt=file_extension):
             if file_extension == "stl":
                 parsed = parse_stl(file_path)
@@ -557,32 +386,40 @@ async def process_model_file(
         face_count = len(parsed["faces"])
         logger.info(f"[upload] Caras parseadas: {face_count:,}")
 
+        # --- Paso 4: Pipeline completo ---
         with timer.step("parse_pipeline", face_count=face_count):
             result = parse_pipeline(file.filename, parsed["faces"], parsed["warnings"])
 
+        # --- Paso 5: Guardar caché de Phase1 en disco (en segundo plano) ---
+        # El pickle de las caras es costoso (~10-18s) y la respuesta no lo necesita.
+        # Starlette ejecuta las background tasks síncronas en un threadpool, así que
+        # /upload responde de inmediato y el caché se escribe después. Si /generate
+        # llega antes de que termine, su fallback re-procesa el OBJ.
         background_tasks.add_task(save_phase1_cache, file_id, result)
 
+        # --- Paso 6: Generar preview OBJ (limitado) ---
         with timer.step("export_colored_obj_preview"):
             preview_obj = export_colored_obj(result.groups, result.faces)
 
+        # --- Conteos ---
         wall_count = sum(1 for g in result.groups if g.category == "wall")
         floor_count = sum(1 for g in result.groups if g.category == "floor")
         discard_count = sum(1 for g in result.groups if g.category == "discard")
 
+        # Etiquetas de panel (A1, B2, ...) calculadas por el back (best-effort).
         with timer.step("panel_id_by_group"):
             from core.review_generate import compute_panel_id_by_group
             pid_by_group = compute_panel_id_by_group(result)
 
         timing_report = timer.report()
 
-        return {
+        # --- Respuesta: sin serializar faces individuales (ahorra GBs de JSON) ---
+        # El frontend usa groups + joints para la UI, no las faces crudas
+        return JSONResponse(content={
             "message": "Archivo procesado con éxito.",
             "file_id": file_id,
             "original_filename": file.filename,
             "file_size_mb": round(file_size_mb, 2),
-            "file_size_bytes": total_bytes,
-            "file_path": file_path,
-            "file_extension": file_extension,
             "summary": {
                 "walls": wall_count,
                 "floors": floor_count,
@@ -593,33 +430,16 @@ async def process_model_file(
             },
             "topology": serialize_topology(result, pid_by_group),
             "preview_obj": preview_obj,
-            "timing": timing_report,
-        }
+            "timing": timing_report,  # Debug: reporte de timing
+        })
 
     except HTTPException:
         raise
     except Exception as e:
         logger.exception(f"[upload] Error procesando {file.filename}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}") from e
+        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
     finally:
         await file.close()
-
-
-# ---------------------------------------------------------------------------
-# Endpoint /upload — optimizado
-# ---------------------------------------------------------------------------
-
-@router.post("/upload")
-async def upload_model(
-    file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = None,
-):
-    file_id = str(uuid.uuid4())
-    content = await process_model_file(file, file_id, background_tasks)
-    content.pop("file_path", None)
-    content.pop("file_size_bytes", None)
-    content.pop("file_extension", None)
-    return JSONResponse(content=content)
 
 
 # ---------------------------------------------------------------------------
@@ -627,11 +447,7 @@ async def upload_model(
 # ---------------------------------------------------------------------------
 
 @router.post("/generate")
-async def generate_pdf_endpoint(
-    request: GenerateRequest,
-    db: Session = Depends(get_db),
-    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
-):
+async def generate_pdf_endpoint(request: GenerateRequest):
     """
     Genera el PDF final. Usa caché de Phase1 si está disponible
     para evitar re-procesar el OBJ completo.
@@ -639,7 +455,7 @@ async def generate_pdf_endpoint(
     timer = PipelineTimer("generate_endpoint")
 
     with timer.step("load_phase1"):
-        base = _load_phase1_for_request(request, db, credentials)
+        base = load_or_parse_phase1(request.file_id, request.original_filename)
 
     try:
         # Re-derivar topología determinística: eje → área mínima → splits.
@@ -719,15 +535,11 @@ async def generate_pdf_endpoint(
 # ---------------------------------------------------------------------------
 
 @router.post("/recompute")
-async def recompute_endpoint(
-    request: RecomputeRequest,
-    db: Session = Depends(get_db),
-    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
-):
+async def recompute_endpoint(request: RecomputeRequest):
     timer = PipelineTimer("recompute_endpoint")
 
     with timer.step("load_phase1"):
-        base = _load_phase1_for_request(request, db, credentials)
+        base = load_or_parse_phase1(request.file_id, request.original_filename)
 
     try:
         from core.pipeline import apply_review_edits
@@ -765,15 +577,11 @@ async def recompute_endpoint(
 # ---------------------------------------------------------------------------
 
 @router.post("/nesting-preview")
-async def nesting_preview_endpoint(
-    request: NestingPreviewRequest,
-    db: Session = Depends(get_db),
-    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
-):
+async def nesting_preview_endpoint(request: NestingPreviewRequest):
     timer = PipelineTimer("nesting_preview_endpoint")
 
     with timer.step("load_phase1"):
-        base = _load_phase1_for_request(request, db, credentials)
+        base = load_or_parse_phase1(request.file_id, request.original_filename)
 
     try:
         from core.pipeline import apply_review_edits
@@ -807,7 +615,7 @@ async def nesting_preview_endpoint(
         )
 
         with timer.step("compute_nesting"):
-            _, wall_nesting, floor_nesting, cfg, _, _, _ = compute_nesting(
+            _, wall_nesting, floor_nesting, cfg, _ = compute_nesting(
                 rebuilt,
                 opts,
                 overrides=request.overrides,
