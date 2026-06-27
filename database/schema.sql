@@ -10,7 +10,8 @@ CREATE TABLE usuarios (
     fecha_creacion TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     estado VARCHAR NOT NULL DEFAULT 'activo',
     email_verification_token VARCHAR(64) UNIQUE,
-    email_verified_at TIMESTAMPTZ
+    email_verified_at TIMESTAMPTZ,
+    rol VARCHAR NOT NULL DEFAULT 'estudiante'
 );
 
 CREATE TABLE planes (

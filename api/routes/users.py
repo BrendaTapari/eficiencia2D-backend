@@ -26,6 +26,7 @@ class UserProfileResponse(BaseModel):
     email: str
     nombre: str | None
     estado: str
+    rol: str
     fecha_creacion: str
     email_verified_at: str | None
     total_proyectos: int
@@ -51,6 +52,7 @@ def _user_profile(db: Session, user: Usuario) -> UserProfileResponse:
         email=user.email,
         nombre=user.nombre,
         estado=user.estado,
+        rol=user.rol,
         fecha_creacion=user.fecha_creacion.isoformat(),
         email_verified_at=(
             user.email_verified_at.isoformat() if user.email_verified_at else None

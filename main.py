@@ -42,6 +42,7 @@ async def lifespan(app: FastAPI):
 
 
 from api.routes.auth import router as auth_router
+from api.routes.coupons import router as coupons_router
 from api.routes.projects import router as projects_router
 from api.routes.settings import router as settings_router
 from api.routes.uploads import router as uploads_router
@@ -112,6 +113,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=1)
 
 # Incluir las rutas
 app.include_router(auth_router, prefix="/api", tags=["Auth"])
+app.include_router(coupons_router, prefix="/api", tags=["Cupones"])
 app.include_router(users_router, prefix="/api", tags=["Usuarios"])
 app.include_router(projects_router, prefix="/api", tags=["Proyectos"])
 app.include_router(settings_router, prefix="/api", tags=["Configuración"])

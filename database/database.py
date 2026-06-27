@@ -172,6 +172,7 @@ def init_db() -> None:
     _migrate_configuraciones_usuario_schema()
     _migrate_usuario_email_verification_schema()
     _migrate_usuario_password_reset_schema()
+    _migrate_usuario_rol_schema()
     _migrate_cupones_schema()
     _backfill_configuraciones_usuario()
 
@@ -282,6 +283,23 @@ def _migrate_usuario_password_reset_schema() -> None:
     logger.info("Esquema de recuperación de contraseña en usuarios verificado")
 
 
+def _migrate_usuario_rol_schema() -> None:
+    """Agrega columna rol en usuarios si aún no existe."""
+    statements = (
+        """
+        ALTER TABLE usuarios
+        ADD COLUMN IF NOT EXISTS rol VARCHAR NOT NULL DEFAULT 'estudiante'
+        """,
+        """
+        UPDATE usuarios SET rol = 'estudiante' WHERE rol IS NULL
+        """,
+    )
+    with engine.begin() as conn:
+        for sql in statements:
+            conn.execute(text(sql))
+    logger.info("Esquema de rol en usuarios verificado")
+
+
 def _migrate_cupones_schema() -> None:
     """Crea tablas de cupones y registro de usos si aún no existen."""
     statements = (
@@ -350,6 +368,7 @@ class Usuario(Base):
     email_verified_at = Column(DateTime(timezone=True), nullable=True)
     password_reset_token = Column(String(64), nullable=True, unique=True)
     password_reset_expires_at = Column(DateTime(timezone=True), nullable=True)
+    rol = Column(String, nullable=False, default='estudiante', server_default='estudiante')
 
     # Relaciones
     suscripcion = relationship("Suscripcion", back_populates="usuario", uselist=False) # Relación 1 a 1

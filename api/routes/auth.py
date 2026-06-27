@@ -49,6 +49,7 @@ class UserResponse(BaseModel):
     email: str
     nombre: str | None
     estado: str
+    rol: str
 
 
 class AuthResponse(BaseModel):
@@ -98,6 +99,7 @@ def _user_to_response(user: Usuario) -> UserResponse:
         email=user.email,
         nombre=user.nombre,
         estado=user.estado,
+        rol=user.rol,
     )
 
 
