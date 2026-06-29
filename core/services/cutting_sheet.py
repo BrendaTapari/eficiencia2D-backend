@@ -552,6 +552,73 @@ def project_faces_to_2d(
 
 
 # ---------------------------------------------------------------------------
+# Marco de proyección 3D por pieza (instructivo de armado)
+#
+# Permite al front mapear un punto del panel local (u, v) en metros de vuelta a 3D:
+#     world = origin + u·u_axis + v·v_axis
+# `origin` es el punto 3D que proyecta a panel (0,0). {u_axis, v_axis, normal} es una
+# base ortonormal (la misma de project_faces_to_2d). `mirrored=True` avisa que el
+# contorno de corte viene espejado horizontalmente (u_local = width_m − u).
+# ---------------------------------------------------------------------------
+
+
+def compute_group_placement(
+    faces: List[Face3D], group_normal: Vec3, up: UpAxis = "Y"
+) -> Optional[Dict]:
+    res = project_faces_to_2d(faces, group_normal, up)
+    if not res:
+        return None
+
+    n = normalize(group_normal)
+    u, v = res.u_axis, res.v_axis
+
+    # d = desplazamiento del plano (n·X = d), promediado sobre los vértices (plano medio
+    # del grupo, robusto ante las dos pieles de un muro).
+    s = 0.0
+    cnt = 0
+    for f in faces:
+        for vv in f.vertices:
+            s += n.x * vv.x + n.y * vv.y + n.z * vv.z
+            cnt += 1
+    d = s / cnt if cnt else 0.0
+
+    ou, ov = res.origin_u, res.origin_v
+    origin = Vec3(
+        ou * u.x + ov * v.x + d * n.x,
+        ou * u.y + ov * v.y + d * n.y,
+        ou * u.z + ov * v.z + d * n.z,
+    )
+
+    def vec(w: Vec3) -> Dict:
+        return {"x": w.x, "y": w.y, "z": w.z}
+
+    return {
+        "origin": vec(origin),
+        "u_axis": vec(u),
+        "v_axis": vec(v),
+        "normal": vec(n),
+        "width_m": res.width_m,
+        "height_m": res.height_m,
+        "mirrored": True,
+    }
+
+
+def build_placements(groups, faces: List[Face3D], up: UpAxis = "Y") -> Dict[str, Dict]:
+    """Marco de proyección 3D por grupo (no-discard). group_id (str) -> placement."""
+    out: Dict[str, Dict] = {}
+    for g in groups:
+        if getattr(g, "category", None) == "discard":
+            continue
+        gfaces = [faces[fi] for fi in g.face_indices if 0 <= fi < len(faces)]
+        if not gfaces:
+            continue
+        pl = compute_group_placement(gfaces, g.representative_normal, up)
+        if pl:
+            out[str(g.id)] = pl
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Recortes y Simetría (Assembly Compensation)
 # ---------------------------------------------------------------------------
 

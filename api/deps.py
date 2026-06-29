@@ -59,3 +59,12 @@ def get_current_user(
         )
 
     return user
+
+
+def get_admin_user(current_user: Usuario = Depends(get_current_user)) -> Usuario:
+    if current_user.rol != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Se requiere rol de administrador",
+        )
+    return current_user

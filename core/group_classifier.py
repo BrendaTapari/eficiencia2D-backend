@@ -1,3 +1,4 @@
+import bisect
 import math
 import re
 import time
@@ -1362,3 +1363,77 @@ def peel_buried_walls(
     ORDER = {"floor": 0, "wall": 1, "discard": 2}
     out.sort(key=lambda g: (ORDER[g.category], -g.total_area))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Assembly ordering — construction sequence by floor level
+# ---------------------------------------------------------------------------
+
+_DIRECTION_ORDER = {
+    "Vertical - Norte": 0,
+    "Vertical - Este": 1,
+    "Vertical - Sur": 2,
+    "Vertical - Oeste": 3,
+    "Horizontal": -1,
+}
+
+
+def compute_assembly_steps(
+    groups: List[GeometryGroup],
+) -> List[Dict]:
+    """Return assembly steps sorted by construction order: floor level ascending,
+    floors before walls, then by cardinal direction and spatial position."""
+    active = [g for g in groups if g.category != "discard"]
+    if not active:
+        return []
+
+    floors = sorted(
+        [g for g in active if g.category == "floor"],
+        key=lambda g: (g.min_y if g.min_y is not None else 0.0),
+    )
+    floor_elevations = [
+        (f.min_y if f.min_y is not None else 0.0) for f in floors
+    ]
+
+    def _wall_level(g: GeometryGroup) -> int:
+        wall_bot = g.min_y if g.min_y is not None else 0.0
+        if not floor_elevations:
+            return 0
+        idx = bisect.bisect_right(floor_elevations, wall_bot + 0.05) - 1
+        return max(idx, 0)
+
+    floor_level_map: Dict[int, int] = {}
+    for lvl_idx, f in enumerate(floors):
+        floor_level_map[f.id] = lvl_idx
+
+    walls = [g for g in active if g.category == "wall"]
+
+    def _spatial_pos(g: GeometryGroup) -> float:
+        c = g.centroid
+        orient = g.orientation
+        if "Norte" in orient or "Sur" in orient:
+            return c.x
+        if "Este" in orient or "Oeste" in orient:
+            return c.z
+        return c.x
+
+    keyed: List[Tuple] = []
+    for g in active:
+        if g.category == "floor":
+            lvl = floor_level_map[g.id]
+            cat_ord = 0
+            dir_ord = -1
+            sp = g.centroid.x
+        else:
+            lvl = _wall_level(g)
+            cat_ord = 1
+            dir_ord = _DIRECTION_ORDER.get(g.orientation, 99)
+            sp = _spatial_pos(g)
+        keyed.append((lvl, cat_ord, dir_ord, sp, g))
+
+    keyed.sort(key=lambda t: (t[0], t[1], t[2], t[3]))
+
+    steps = []
+    for i, (lvl, _co, _do, _sp, g) in enumerate(keyed, start=1):
+        steps.append({"step": i, "group_id": g.id, "level": lvl})
+    return steps

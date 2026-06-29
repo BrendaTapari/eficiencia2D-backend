@@ -11,7 +11,8 @@ CREATE TABLE usuarios (
     estado VARCHAR NOT NULL DEFAULT 'activo',
     email_verification_token VARCHAR(64) UNIQUE,
     email_verified_at TIMESTAMPTZ
-    
+    rol_id INTEGER NOT NULL DEFAULT 1,
+    CONSTRAINT fk_usuarios_rol FOREIGN KEY (rol_id) REFERENCES Rol (id)
 );
 
 CREATE TABLE planes (
@@ -96,7 +97,7 @@ CREATE TABLE usos_cupon (
     CONSTRAINT fk_usos_cupon_usuario FOREIGN KEY (usuario_id) REFERENCES usuarios (id)
 );
 
-CREATE TABLE Rol(
+CREATE TABLE rol(
     id SERIAL PRIMARY KEY,
     rol VARCHAR NOT NULL
 );

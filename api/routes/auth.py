@@ -1,19 +1,22 @@
 import logging
+import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from api.deps import get_current_user
 from core.security import create_access_token, hash_password, verify_password
 from database import ConfiguracionUsuario, Usuario, get_db
+from database.database import get_db_config_status
 from utils.mailer import (
     build_verification_url,
     get_mail_config_status,
     is_mail_configured,
+    send_password_reset_email,
     send_verification_email,
     validate_mail_config,
 )
@@ -23,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 ESTADO_ACTIVO = "activo"
 ESTADO_PENDIENTE = "pendiente_verificacion"
+PASSWORD_RESET_EXPIRE_MINUTES = int(os.environ.get("PASSWORD_RESET_EXPIRE_MINUTES", "60"))
 
 
 class RegisterRequest(BaseModel):
@@ -45,6 +49,7 @@ class UserResponse(BaseModel):
     email: str
     nombre: str | None
     estado: str
+    rol: str
 
 
 class AuthResponse(BaseModel):
@@ -71,12 +76,30 @@ class TestEmailResponse(BaseModel):
     verification_url: str
 
 
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ForgotPasswordResponse(BaseModel):
+    message: str
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(min_length=36, max_length=64)
+    new_password: str = Field(min_length=6, max_length=128)
+
+
+class ResetPasswordResponse(BaseModel):
+    message: str
+
+
 def _user_to_response(user: Usuario) -> UserResponse:
     return UserResponse(
         id=str(user.id),
         email=user.email,
         nombre=user.nombre,
         estado=user.estado,
+        rol=user.rol,
     )
 
 
@@ -100,6 +123,21 @@ async def _send_verification_email_task(
     except Exception:
         logger.exception(
             "No se pudo enviar el correo de verificación en segundo plano a %s",
+            email,
+        )
+
+
+async def _send_password_reset_email_task(
+    email: str,
+    token: str,
+    nombre: str | None,
+) -> None:
+    logger.info("Iniciando envío de correo de recuperación a %s", email)
+    try:
+        await send_password_reset_email(recipient=email, token=token, nombre=nombre)
+    except Exception:
+        logger.exception(
+            "No se pudo enviar el correo de recuperación en segundo plano a %s",
             email,
         )
 
@@ -140,6 +178,13 @@ async def register(
             status_code=status.HTTP_409_CONFLICT,
             detail="No se pudo crear la cuenta",
         ) from None
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Error de base de datos al registrar usuario")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo conectar con la base de datos. Intentá de nuevo en unos segundos.",
+        ) from None
 
     db.refresh(user)
 
@@ -179,6 +224,15 @@ def mail_status():
     Compará password_length con 16 y env_file con la ruta del servidor.
     """
     return get_mail_config_status()
+
+
+@router.get("/auth/db-status")
+def db_status():
+    """
+    Muestra a qué base de datos está conectado el servidor (sin credenciales).
+    Verificá que database_host sea de Supabase y no localhost.
+    """
+    return get_db_config_status()
 
 
 @router.post("/auth/test-email", response_model=TestEmailResponse)
@@ -241,7 +295,15 @@ def verify_email(body: VerifyEmailRequest, db: Session = Depends(get_db)):
     user.estado = ESTADO_ACTIVO
     user.email_verification_token = None
     user.email_verified_at = datetime.now(timezone.utc)
-    db.commit()
+    try:
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Error de base de datos al verificar correo")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo conectar con la base de datos. Intentá de nuevo en unos segundos.",
+        ) from None
     db.refresh(user)
 
     logger.info("Cuenta verificada: %s", user.email)
@@ -270,6 +332,99 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
         )
 
     return _build_auth_response(user)
+
+
+@router.post("/auth/forgot-password", response_model=ForgotPasswordResponse)
+async def forgot_password(
+    body: ForgotPasswordRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """
+    Solicita un enlace de recuperación por correo.
+    Siempre responde igual aunque el email no exista (por seguridad).
+    """
+    email = body.email.lower()
+    user = db.query(Usuario).filter(Usuario.email == email).first()
+
+    if user is not None and is_mail_configured():
+        token = _create_verification_token()
+        user.password_reset_token = token
+        user.password_reset_expires_at = datetime.now(timezone.utc) + timedelta(
+            minutes=PASSWORD_RESET_EXPIRE_MINUTES
+        )
+        try:
+            db.commit()
+        except SQLAlchemyError:
+            db.rollback()
+            logger.exception("Error al guardar token de recuperación para %s", email)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="No se pudo procesar la solicitud. Intentá de nuevo en unos segundos.",
+            ) from None
+
+        background_tasks.add_task(
+            _send_password_reset_email_task,
+            user.email,
+            token,
+            user.nombre,
+        )
+        logger.info("Correo de recuperación programado para %s", user.email)
+    elif user is not None:
+        logger.error(
+            "Recuperación NO programada para %s — correo no configurado: %s",
+            email,
+            "; ".join(validate_mail_config()),
+        )
+
+    return ForgotPasswordResponse(
+        message=(
+            "Si el correo está registrado, recibirás un enlace para restablecer tu contraseña."
+        ),
+    )
+
+
+@router.post("/auth/reset-password", response_model=ResetPasswordResponse)
+def reset_password(body: ResetPasswordRequest, db: Session = Depends(get_db)):
+    """Restablece la contraseña usando el token recibido por correo."""
+    token = body.token.strip()
+    user = (
+        db.query(Usuario)
+        .filter(Usuario.password_reset_token == token)
+        .first()
+    )
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El enlace de recuperación es inválido o ya fue utilizado",
+        )
+
+    expires_at = user.password_reset_expires_at
+    if expires_at is None or expires_at < datetime.now(timezone.utc):
+        user.password_reset_token = None
+        user.password_reset_expires_at = None
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El enlace de recuperación expiró. Solicitá uno nuevo.",
+        )
+
+    user.password_hash = hash_password(body.new_password)
+    user.password_reset_token = None
+    user.password_reset_expires_at = None
+
+    try:
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Error al restablecer contraseña")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo restablecer la contraseña. Intentá de nuevo en unos segundos.",
+        ) from None
+
+    logger.info("Contraseña restablecida para %s", user.email)
+    return ResetPasswordResponse(message="Contraseña actualizada correctamente")
 
 
 @router.get("/auth/me", response_model=UserResponse)

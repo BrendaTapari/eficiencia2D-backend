@@ -1,7 +1,9 @@
 import logging
 import os
+import socket
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 
 from dotenv import load_dotenv
 from sqlalchemy import Boolean, Column, Integer, String, Numeric, BigInteger, ForeignKey, DateTime, create_engine, text
@@ -17,13 +19,134 @@ load_dotenv(PROJECT_DIR / ".env")
 
 Base = declarative_base()
 
-# En el servidor con Docker: host=localhost y puerto=5433 (mapeo en docker-compose).
-# Si la API corre dentro de la misma red Docker: host=postgres_db y puerto=5432.
-# La contraseña con "ñ" debe ir URL-encoded (%C3%B1) dentro de DATABASE_URL.
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql+psycopg2://eficiencia_db:%C3%B1StefaBren_bd@localhost:5433/eficiencia_db",
-)
+
+def _prefer_ipv4_database_url(url: str) -> str:
+    """
+    En VPS sin ruteo IPv6, Supabase puede resolverse a IPv6 y fallar con 'No route to host'.
+    Reemplaza el hostname por su dirección IPv4 cuando sea posible.
+    """
+    if "supabase.co" not in url:
+        return url
+
+    dialect_prefix = ""
+    parse_url = url
+    if url.startswith("postgresql+psycopg2://"):
+        dialect_prefix = "postgresql+psycopg2://"
+        parse_url = "postgresql://" + url[len(dialect_prefix) :]
+    elif url.startswith("postgresql://"):
+        dialect_prefix = "postgresql://"
+
+    parsed = urlparse(parse_url)
+    host = parsed.hostname
+    if not host or host.replace(".", "").isdigit():
+        return url
+
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or 5432, socket.AF_INET, socket.SOCK_STREAM)
+        ipv4 = infos[0][4][0]
+    except OSError:
+        logger.warning("No se pudo resolver IPv4 para %s; se usa el hostname original", host)
+        return url
+
+    port = parsed.port or 5432
+    userinfo = ""
+    if parsed.username:
+        userinfo = parsed.username
+        if parsed.password:
+            userinfo += f":{parsed.password}"
+        userinfo += "@"
+
+    rebuilt = urlunparse(parsed._replace(netloc=f"{userinfo}{ipv4}:{port}"))
+    if dialect_prefix == "postgresql+psycopg2://":
+        rebuilt = rebuilt.replace("postgresql://", dialect_prefix, 1)
+
+    if ipv4 != host:
+        logger.info("Conexión Supabase forzada a IPv4: %s -> %s", host, ipv4)
+    return rebuilt
+
+
+def _get_database_url() -> str:
+    """Lee DATABASE_URL del .env y la adapta para SQLAlchemy + psycopg2."""
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL no está definida. Configurala en el archivo .env del proyecto."
+        )
+
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    elif not url.startswith("postgresql+psycopg2://"):
+        raise RuntimeError(
+            "DATABASE_URL debe usar el esquema postgresql:// o postgresql+psycopg2://"
+        )
+
+    # Supabase exige SSL en conexiones remotas.
+    if "supabase.co" in url and "sslmode=" not in url:
+        separator = "&" if "?" in url else "?"
+        url = f"{url}{separator}sslmode=require"
+
+    url = _prefer_ipv4_database_url(url)
+    return url
+
+
+def get_db_config_status() -> dict:
+    """Diagnóstico de conexión a BD (sin exponer credenciales)."""
+    raw_url = os.environ.get("DATABASE_URL", "")
+    env_path = PROJECT_DIR / ".env"
+    issues: list[str] = []
+
+    if not raw_url:
+        issues.append("DATABASE_URL no está definida")
+
+    host = ""
+    database = ""
+    uses_ssl = False
+    is_supabase = False
+    is_local = False
+
+    if raw_url:
+        try:
+            without_scheme = raw_url.split("://", 1)[-1]
+            host_part = without_scheme.split("@")[-1]
+            host = host_part.split("/")[0].split("?")[0]
+            database = host_part.split("/")[1].split("?")[0] if "/" in host_part else ""
+            uses_ssl = "sslmode=require" in raw_url or "supabase.co" in raw_url
+            is_supabase = "supabase.co" in raw_url
+            is_local = host.startswith("localhost") or host.startswith("127.0.0.1")
+            if is_local:
+                issues.append("DATABASE_URL apunta a PostgreSQL local, no a Supabase")
+        except Exception:
+            issues.append("DATABASE_URL tiene un formato inválido")
+
+    user_count = None
+    sample_emails: list[str] = []
+    if not issues:
+        try:
+            with engine.connect() as conn:
+                user_count = conn.execute(text("SELECT COUNT(*) FROM usuarios")).scalar()
+                rows = conn.execute(
+                    text("SELECT email FROM usuarios ORDER BY fecha_creacion LIMIT 5")
+                ).fetchall()
+                sample_emails = [row[0] for row in rows]
+        except Exception as exc:
+            issues.append(f"No se pudo conectar a la base de datos: {exc}")
+
+    return {
+        "env_file": str(env_path),
+        "env_file_exists": env_path.is_file(),
+        "database_host": host,
+        "database_name": database,
+        "is_supabase": is_supabase,
+        "is_localhost": is_local,
+        "uses_ssl": uses_ssl,
+        "usuarios_count": user_count,
+        "sample_emails": sample_emails,
+        "issues": issues,
+        "ok": len(issues) == 0,
+    }
+
+
+DATABASE_URL = _get_database_url()
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -33,6 +156,9 @@ def get_db():
     db = SessionLocal()
     try:
         yield db
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 
@@ -45,6 +171,8 @@ def init_db() -> None:
     logger.info("Tablas verificadas/creadas correctamente")
     _migrate_configuraciones_usuario_schema()
     _migrate_usuario_email_verification_schema()
+    _migrate_usuario_password_reset_schema()
+    _migrate_usuario_rol_schema()
     _migrate_cupones_schema()
     _backfill_configuraciones_usuario()
 
@@ -132,6 +260,46 @@ def _migrate_usuario_email_verification_schema() -> None:
     logger.info("Esquema de verificación de correo en usuarios verificado")
 
 
+def _migrate_usuario_password_reset_schema() -> None:
+    """Agrega columnas de recuperación de contraseña en usuarios si aún no existen."""
+    statements = (
+        """
+        ALTER TABLE usuarios
+        ADD COLUMN IF NOT EXISTS password_reset_token VARCHAR(64)
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS ix_usuarios_password_reset_token
+        ON usuarios (password_reset_token)
+        WHERE password_reset_token IS NOT NULL
+        """,
+        """
+        ALTER TABLE usuarios
+        ADD COLUMN IF NOT EXISTS password_reset_expires_at TIMESTAMPTZ
+        """,
+    )
+    with engine.begin() as conn:
+        for sql in statements:
+            conn.execute(text(sql))
+    logger.info("Esquema de recuperación de contraseña en usuarios verificado")
+
+
+def _migrate_usuario_rol_schema() -> None:
+    """Agrega columna rol en usuarios si aún no existe."""
+    statements = (
+        """
+        ALTER TABLE usuarios
+        ADD COLUMN IF NOT EXISTS rol VARCHAR NOT NULL DEFAULT 'estudiante'
+        """,
+        """
+        UPDATE usuarios SET rol = 'estudiante' WHERE rol IS NULL
+        """,
+    )
+    with engine.begin() as conn:
+        for sql in statements:
+            conn.execute(text(sql))
+    logger.info("Esquema de rol en usuarios verificado")
+
+
 def _migrate_cupones_schema() -> None:
     """Crea tablas de cupones y registro de usos si aún no existen."""
     statements = (
@@ -198,6 +366,9 @@ class Usuario(Base):
     estado = Column(String, nullable=False, default='activo')
     email_verification_token = Column(String(64), nullable=True, unique=True)
     email_verified_at = Column(DateTime(timezone=True), nullable=True)
+    password_reset_token = Column(String(64), nullable=True, unique=True)
+    password_reset_expires_at = Column(DateTime(timezone=True), nullable=True)
+    rol = Column(String, nullable=False, default='estudiante', server_default='estudiante')
 
     # Relaciones
     suscripcion = relationship("Suscripcion", back_populates="usuario", uselist=False) # Relación 1 a 1

@@ -1,8 +1,9 @@
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from api.deps import get_current_user
@@ -61,11 +62,27 @@ def _get_or_create_config(db: Session, user: Usuario) -> ConfiguracionUsuario:
     if config is None:
         config = ConfiguracionUsuario(usuario_id=user.id)
         db.add(config)
-        db.commit()
+        try:
+            db.commit()
+        except SQLAlchemyError:
+            db.rollback()
+            logger.exception("Error de base de datos al crear configuración")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="No se pudo conectar con la base de datos. Intentá de nuevo en unos segundos.",
+            ) from None
         db.refresh(config)
         logger.info("Configuración creada para usuario %s", user.id)
     elif _normalize_config(config):
-        db.commit()
+        try:
+            db.commit()
+        except SQLAlchemyError:
+            db.rollback()
+            logger.exception("Error de base de datos al normalizar configuración")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="No se pudo conectar con la base de datos. Intentá de nuevo en unos segundos.",
+            ) from None
         db.refresh(config)
         logger.info("Configuración legacy normalizada para usuario %s", user.id)
     return config
@@ -93,6 +110,14 @@ def update_my_settings(
         setattr(config, field, value)
 
     _normalize_config(config)
-    db.commit()
+    try:
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Error de base de datos al actualizar configuración")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo conectar con la base de datos. Intentá de nuevo en unos segundos.",
+        ) from None
     db.refresh(config)
     return _config_to_response(config)
