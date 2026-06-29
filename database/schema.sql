@@ -11,6 +11,7 @@ CREATE TABLE usuarios (
     estado VARCHAR NOT NULL DEFAULT 'activo',
     email_verification_token VARCHAR(64) UNIQUE,
     email_verified_at TIMESTAMPTZ
+    
 );
 
 CREATE TABLE planes (
@@ -93,6 +94,11 @@ CREATE TABLE usos_cupon (
     fecha_uso TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT fk_usos_cupon_cupon FOREIGN KEY (cupon_id) REFERENCES cupones (id),
     CONSTRAINT fk_usos_cupon_usuario FOREIGN KEY (usuario_id) REFERENCES usuarios (id)
+);
+
+CREATE TABLE Rol(
+    id SERIAL PRIMARY KEY,
+    rol VARCHAR NOT NULL
 );
 
 CREATE INDEX ix_usos_cupon_cupon_usuario ON usos_cupon (cupon_id, usuario_id);
