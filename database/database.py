@@ -495,3 +495,10 @@ class UsoCupon(Base):
 
     cupon = relationship("Cupon", back_populates="usos")
     usuario = relationship("Usuario", back_populates="usos_cupon")
+
+
+class Rol(Base):
+    __tablename__ = 'rol'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    rol = Column(String, nullable=False)

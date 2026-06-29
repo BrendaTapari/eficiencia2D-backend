@@ -30,6 +30,7 @@ class UserProfileResponse(BaseModel):
     fecha_creacion: str
     email_verified_at: str | None
     total_proyectos: int
+    rol_id: int
 
 
 class UpdateUserRequest(BaseModel):
@@ -58,6 +59,7 @@ def _user_profile(db: Session, user: Usuario) -> UserProfileResponse:
             user.email_verified_at.isoformat() if user.email_verified_at else None
         ),
         total_proyectos=total_proyectos,
+        rol_id=user.rol_id,
     )
 
 
