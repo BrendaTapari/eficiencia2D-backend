@@ -375,7 +375,7 @@ def guardar_estado_parcial_proyecto(
     )
 
 
-@router.get("/projects/{proyecto_id}/state", response_model=dict[str, Any])
+@router.get("/projects/{proyecto_id}/state", response_model=ProyectoStateSaveResponse)
 def obtener_estado_proyecto(
     proyecto_id: UUID,
     current_user: Usuario = Depends(get_current_user),
@@ -385,12 +385,14 @@ def obtener_estado_proyecto(
     proyecto = _get_user_proyecto(db, current_user, proyecto_id)
     meta = proyecto.metadata_impresion or {}
     estado = _load_estado_proyecto(proyecto)
-    return {
-        "proyecto_id": str(proyecto.id),
-        "estado": estado,
-        "estado_r2": meta.get("estado_r2"),
-        "estado_actualizado_at": meta.get("estado_actualizado_at"),
-    }
+    return ProyectoStateSaveResponse(
+        proyecto_id=str(proyecto.id),
+        nombre=proyecto.nombre,
+        estado_r2=str(meta.get("estado_r2") or ""),
+        estado_actualizado_at=str(meta.get("estado_actualizado_at") or ""),
+        estado=estado,
+        message="Estado del proyecto cargado correctamente.",
+    )
 
 
 @router.get("/projects/{proyecto_id}/download")
