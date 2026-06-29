@@ -1,5 +1,7 @@
+import json
 import logging
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -12,16 +14,20 @@ from sqlalchemy.orm import Session
 
 from api.deps import get_current_user
 from api.routes.uploads import (
+    SheetConfigModel,
+    SplitModel,
     build_geometry_payload,
     load_saved_proyecto_phase1,
     process_model_file,
 )
 from core.profiler import PipelineTimer
 from database import Proyecto, Usuario, get_db
-from database.storage import eliminar_archivo, obtener_url_archivo, subir_archivo
+from database.storage import descargar_archivo, eliminar_archivo, obtener_url_archivo, subir_archivo
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+STATE_FILENAME = "estado.json"
 
 
 class ProyectoResponse(BaseModel):
@@ -38,6 +44,96 @@ class ProyectoResponse(BaseModel):
 class ProyectoListResponse(BaseModel):
     proyectos: list[ProyectoResponse]
     total: int
+
+
+class ProyectoPartialSaveRequest(BaseModel):
+    """Campos editables del proyecto; solo se actualizan los enviados en el body."""
+    nombre: str | None = Field(default=None, min_length=1, max_length=200)
+    axis: str | None = None
+    min_area_m2: float | None = None
+    merges: list[list[int]] | None = None
+    splits: list[SplitModel] | None = None
+    overrides: dict[int, str] | None = None
+    wall_wall_decisions: dict[int, int] | None = None
+    marks: list[int] | None = None
+    user_cuts: list[Any] | None = None
+    sheet_config: SheetConfigModel | None = None
+    scale_denom: float | None = None
+    paper: str | None = None
+    page_mode: str | None = None
+
+
+class ProyectoStateSaveResponse(BaseModel):
+    proyecto_id: str
+    nombre: str
+    estado_r2: str
+    estado_actualizado_at: str
+    estado: dict[str, Any]
+    message: str
+
+
+def _load_estado_proyecto(proyecto: Proyecto) -> dict[str, Any]:
+    meta = proyecto.metadata_impresion or {}
+    estado_r2 = meta.get("estado_r2")
+    if isinstance(estado_r2, str) and estado_r2.strip():
+        try:
+            raw = descargar_archivo(estado_r2.strip())
+            loaded = json.loads(raw.decode("utf-8"))
+            if isinstance(loaded, dict):
+                return loaded
+        except (RuntimeError, json.JSONDecodeError, UnicodeDecodeError):
+            logger.warning("No se pudo leer estado guardado de R2 para proyecto %s", proyecto.id)
+
+    estado = meta.get("estado")
+    return dict(estado) if isinstance(estado, dict) else {}
+
+
+def _merge_partial_estado(existing: dict[str, Any], patch: ProyectoPartialSaveRequest) -> dict[str, Any]:
+    merged = dict(existing)
+    for key, value in patch.model_dump(exclude_unset=True, exclude={"nombre"}).items():
+        merged[key] = value
+    return merged
+
+
+def _persist_estado_proyecto(
+    db: Session,
+    proyecto: Proyecto,
+    estado: dict[str, Any],
+) -> str:
+    estado_bytes = json.dumps(estado, ensure_ascii=False).encode("utf-8")
+    try:
+        ruta_r2 = subir_archivo(
+            estado_bytes,
+            proyecto.usuario_id,
+            proyecto.id,
+            STATE_FILENAME,
+            content_type="application/json",
+        )
+    except RuntimeError as exc:
+        logger.exception("Error al subir estado parcial del proyecto %s a R2", proyecto.id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo guardar el estado del proyecto en el almacenamiento en la nube",
+        ) from exc
+
+    actualizado_at = datetime.now(timezone.utc).isoformat()
+    meta = dict(proyecto.metadata_impresion or {})
+    meta["estado_r2"] = ruta_r2
+    meta["estado_actualizado_at"] = actualizado_at
+    proyecto.metadata_impresion = meta
+
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.exception("Error al persistir metadata de estado del proyecto %s", proyecto.id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo guardar el estado del proyecto en la base de datos",
+        ) from exc
+
+    db.refresh(proyecto)
+    return actualizado_at
 
 
 def _proyecto_to_response(proyecto: Proyecto, *, include_download_url: bool = False) -> ProyectoResponse:
@@ -218,6 +314,7 @@ def abrir_proyecto(
     meta = proyecto.metadata_impresion or {}
     summary = meta.get("summary")
     file_size_mb = round(proyecto.tamano_bytes / 1024 / 1024, 2)
+    saved_state = _load_estado_proyecto(proyecto)
 
     response_content = {
         **_proyecto_to_response(proyecto).model_dump(),
@@ -229,8 +326,71 @@ def abrir_proyecto(
             summary=summary,
             timing=timer.report(),
         ),
+        "saved_state": saved_state or None,
+        "estado_actualizado_at": meta.get("estado_actualizado_at"),
     }
     return JSONResponse(content=response_content)
+
+
+@router.patch("/projects/{proyecto_id}/state", response_model=ProyectoStateSaveResponse)
+def guardar_estado_parcial_proyecto(
+    proyecto_id: UUID,
+    body: ProyectoPartialSaveRequest,
+    current_user: Usuario = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Guarda de forma parcial las modificaciones del proyecto (clasificación, fusiones,
+    planchas, etc.) y sube el estado consolidado a R2 como estado.json.
+    """
+    if not body.model_fields_set:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Debes enviar al menos un campo para guardar",
+        )
+
+    proyecto = _get_user_proyecto(db, current_user, proyecto_id)
+    merged_estado = _merge_partial_estado(_load_estado_proyecto(proyecto), body)
+
+    if "nombre" in body.model_fields_set and body.nombre is not None:
+        nombre = body.nombre.strip()
+        if not nombre:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="El nombre del proyecto no puede estar vacío",
+            )
+        proyecto.nombre = nombre
+
+    estado_actualizado_at = _persist_estado_proyecto(db, proyecto, merged_estado)
+    meta = proyecto.metadata_impresion or {}
+
+    logger.info("Estado parcial guardado para proyecto %s (usuario %s)", proyecto.id, current_user.id)
+    return ProyectoStateSaveResponse(
+        proyecto_id=str(proyecto.id),
+        nombre=proyecto.nombre,
+        estado_r2=meta.get("estado_r2", ""),
+        estado_actualizado_at=estado_actualizado_at,
+        estado=merged_estado,
+        message="Estado del proyecto guardado correctamente.",
+    )
+
+
+@router.get("/projects/{proyecto_id}/state", response_model=dict[str, Any])
+def obtener_estado_proyecto(
+    proyecto_id: UUID,
+    current_user: Usuario = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Devuelve el último estado guardado del proyecto desde R2."""
+    proyecto = _get_user_proyecto(db, current_user, proyecto_id)
+    meta = proyecto.metadata_impresion or {}
+    estado = _load_estado_proyecto(proyecto)
+    return {
+        "proyecto_id": str(proyecto.id),
+        "estado": estado,
+        "estado_r2": meta.get("estado_r2"),
+        "estado_actualizado_at": meta.get("estado_actualizado_at"),
+    }
 
 
 @router.get("/projects/{proyecto_id}/download")
@@ -264,6 +424,8 @@ def eliminar_proyecto(
 ):
     proyecto = _get_user_proyecto(db, current_user, proyecto_id)
     ruta_r2 = proyecto.url_archivo
+    meta = proyecto.metadata_impresion or {}
+    estado_r2 = meta.get("estado_r2")
 
     db.delete(proyecto)
     try:
@@ -280,5 +442,11 @@ def eliminar_proyecto(
         eliminar_archivo(ruta_r2)
     except RuntimeError:
         logger.exception("Proyecto eliminado en BD pero no en R2: %s", ruta_r2)
+
+    if isinstance(estado_r2, str) and estado_r2.strip() and estado_r2 != ruta_r2:
+        try:
+            eliminar_archivo(estado_r2.strip())
+        except RuntimeError:
+            logger.exception("Estado del proyecto no eliminado en R2: %s", estado_r2)
 
     return None
