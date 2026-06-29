@@ -44,6 +44,7 @@ async def lifespan(app: FastAPI):
 from api.routes.auth import router as auth_router
 from api.routes.coupons import router as coupons_router
 from api.routes.projects import router as projects_router
+from api.routes.rols import router as rols_router
 from api.routes.settings import router as settings_router
 from api.routes.uploads import router as uploads_router
 from api.routes.users import router as users_router
@@ -117,6 +118,7 @@ app.include_router(coupons_router, prefix="/api", tags=["Cupones"])
 app.include_router(users_router, prefix="/api", tags=["Usuarios"])
 app.include_router(projects_router, prefix="/api", tags=["Proyectos"])
 app.include_router(settings_router, prefix="/api", tags=["Configuración"])
+app.include_router(rols_router, prefix="/api", tags=["Roles"])
 app.include_router(uploads_router, prefix="/api", tags=["Procesamiento"])
 
 @app.get("/")

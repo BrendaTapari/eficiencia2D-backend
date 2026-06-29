@@ -1,14 +1,11 @@
 import logging
-from typing import Any
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
-from sqlalchemy.exc import SQLAlchemyError
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from api.deps import get_current_user
 from database import Rol, Usuario, get_db
-
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
