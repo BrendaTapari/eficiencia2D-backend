@@ -20,6 +20,20 @@ from database import Proyecto, Usuario, get_db
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+DEFAULT_ROL_ID = 1
+ADMIN_ROL_ID = 2
+
+
+def _rol_id_for(user: Usuario) -> int:
+    """Resuelve rol_id aunque la columna aún no exista en todos los entornos."""
+    rol_id = getattr(user, "rol_id", None)
+    if isinstance(rol_id, int):
+        return rol_id
+    rol = (user.rol or "estudiante").strip().lower()
+    if rol == "admin":
+        return ADMIN_ROL_ID
+    return DEFAULT_ROL_ID
+
 
 class UserProfileResponse(BaseModel):
     id: str
@@ -59,7 +73,7 @@ def _user_profile(db: Session, user: Usuario) -> UserProfileResponse:
             user.email_verified_at.isoformat() if user.email_verified_at else None
         ),
         total_proyectos=total_proyectos,
-        rol_id=user.rol_id,
+        rol_id=_rol_id_for(user),
     )
 
 
