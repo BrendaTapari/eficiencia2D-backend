@@ -28,6 +28,7 @@ from core.services.obj_parser import parse_obj
 from core.services.stl_parser import parse_stl
 from core.pipeline import parse_pipeline, generate_pipeline, Phase1Result
 from core.services.cutting_sheet import build_placements
+from core.services.curvature import build_curvature_map
 from core.group_classifier import compute_assembly_steps
 from core.services.types import PipelineOptions, SheetConfig
 
@@ -125,6 +126,9 @@ def serialize_topology(result: Phase1Result, panel_id_by_group: Optional[Dict] =
         # + v·v_axis. Caras en el mismo espacio que faces_packed (eje Y).
         "placements": build_placements(result.groups, result.faces, "Y"),
         "assembly_steps": compute_assembly_steps(result.groups),
+        # Curvatura por grupo (contrato §2.1): el front marca componentes curvos y
+        # sugiere método kerf (simple) / auxético (doble) + spacing inicial.
+        "curvature": build_curvature_map(result.groups, result.faces),
     }
     if panel_id_by_group is not None:
         topo["panel_id_by_group"] = {str(k): v for k, v in panel_id_by_group.items()}
@@ -143,6 +147,7 @@ def _serialize_nesting_panel(p) -> Dict:
                 "b": {"x": e.b.x, "y": e.b.y},
                 "hole": e.hole,
                 "joint": getattr(e, "joint", False),
+                "flex": getattr(e, "flex", False),
             }
             for e in p.edges
         ],
@@ -406,6 +411,7 @@ class GenerateRequest(BaseModel):
     splits: Optional[List[SplitModel]] = None
     marks: Optional[List[int]] = None  # ids de componentes cuyas aberturas se graban
     user_cuts: Optional[List] = None  # reservado: corte manual futuro
+    flex: Optional[List[dict]] = None  # patrón de flexión por grupo (kerf / auxético)
 
 
 class RecomputeRequest(BaseModel):
@@ -430,6 +436,7 @@ class NestingPreviewRequest(BaseModel):
     wall_wall_decisions: Optional[Dict[int, int]] = None
     marks: Optional[List[int]] = None
     user_cuts: Optional[List[dict]] = None
+    flex: Optional[List[dict]] = None  # patrón de flexión por grupo (kerf / auxético)
     sheet_config: Optional[SheetConfigModel] = None
     scale_denom: float = 50.0
     paper: str = "A4"
@@ -691,6 +698,7 @@ async def generate_pdf_endpoint(
                 merges=request.merges,
                 marks=request.marks,
                 user_cuts=request.user_cuts,
+                flex=request.flex,
             )
 
         if not files:
@@ -826,6 +834,7 @@ async def nesting_preview_endpoint(
                 merges=request.merges,
                 marks=request.marks,
                 user_cuts=request.user_cuts,
+                flex=request.flex,
             )
 
         timer.report()
