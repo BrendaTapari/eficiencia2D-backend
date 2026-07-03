@@ -1,176 +1,470 @@
-"""Tests del patrón de flexión (kerf / auxético) y del desarrollo de superficies curvas."""
+"""
+Patrones de flexión para superficies curvas (kerf bending + auxéticos).
 
+Genera la geometría REAL de corte que permite doblar una plancha plana:
+- **kerf**: filas/columnas de ranuras paralelas interrumpidas por ligamentos (puentes).
+  La distancia entre columnas (`spacing_m`) fija el radio de doblez. Flexión en un eje.
+- **auxético** (`rotating` / `reentrant` / `chiral`): teselado de celdas con ligamentos
+  que, al expandirse, absorben doble curvatura. `spacing_m` = pitch de celda.
+
+Coordenadas en METROS, en el marco local del panel de `project_faces_to_2d`
+(u horizontal 0..width_m, v vertical 0..height_m), el mismo marco que usa `user_cuts`.
+El módulo devuelve `Edge2D(flex=True)`; el llamador las agrega a las aristas del panel.
+La geometría exacta de cada patrón la define el backend (el front sólo nombra el método).
+"""
+
+from __future__ import annotations
+
+import logging
 import math
+from dataclasses import dataclass, replace
+from typing import Dict, List, Literal, Optional, Tuple
 
-from core.services.cutting_sheet import Edge2D, emit_panel_entities
-from core.services.types import Face3D, Vec2, Vec3
-from core.services.flex_bending import apply_flex_to_panel, build_flex_by_group, parse_flex
-from core.services.curvature import detect_curvature, unroll
+log = logging.getLogger(__name__)
 
+# Tope de primitivas (ranuras/celdas) por panel. Evita que un panel grande con
+# spacing chico genere cientos de miles de aristas (DXF/preview inusables). Si se
+# excede, se sube el spacing efectivo (clamp) — respeta "descartar valores degenerados".
+MAX_PRIMITIVES = 2500
 
-def _rect_panel(w, h):
-    return w, h, [
-        Edge2D(a=Vec2(0, 0), b=Vec2(w, 0)),
-        Edge2D(a=Vec2(w, 0), b=Vec2(w, h)),
-        Edge2D(a=Vec2(w, h), b=Vec2(0, h)),
-        Edge2D(a=Vec2(0, h), b=Vec2(0, 0)),
-    ]
+from shapely import affinity
+from shapely.geometry import (
+    LineString,
+    MultiLineString,
+    MultiPolygon,
+    Polygon,
+)
+from shapely.geometry.base import BaseGeometry
+from shapely.ops import unary_union
+from shapely.validation import make_valid
 
+from core.services.cutting_sheet import Edge2D
+from core.services.types import Vec2
 
-def _face(a, b, c):
-    n = (
-        (b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1]),
-        (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2]),
-        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]),
-    )
-    l = math.sqrt(sum(x * x for x in n)) or 1.0
-    return Face3D(
-        vertices=[Vec3(*a), Vec3(*b), Vec3(*c)],
-        normal=Vec3(n[0] / l, n[1] / l, n[2] / l),
-        inner_loops=[],
-    )
+FlexMethod = Literal["kerf", "auxetic_rotating", "auxetic_reentrant", "auxetic_chiral"]
 
-
-# --- flex: geometría del patrón --------------------------------------------
-
-
-def test_parse_flex_validates_and_clamps():
-    specs = parse_flex(
-        [
-            {"group_id": "x", "method": "kerf", "spacing_m": 0.02},   # gid inválido
-            {"method": "nope", "spacing_m": 0.02},                    # método inválido
-            {"group_id": 5, "method": "kerf", "spacing_m": 0.02},     # ok
-            {"group_id": 6, "method": "kerf", "spacing_m": 0.0001},   # spacing clampeado
-        ]
-    )
-    assert [s.group_id for s in specs] == [5, 6]
-    assert specs[1].spacing_m >= 0.003  # clamp mínimo
+# Límites de material (metros). Evitan patrones degenerados que romperían la plancha.
+MIN_SPACING = 0.003        # separación mínima entre columnas / pitch de celda
+MAX_SPACING = 0.08         # separación máxima razonable
+MIN_LIGAMENT = 0.0008      # puente mínimo sin cortar
+DEFAULT_LIGAMENT = 0.003
+DEFAULT_KERF_WIDTH = 0.0015
+MIN_KERF_WIDTH = 0.0004
+EDGE_MARGIN = 0.004        # margen sin patrón contra el borde del panel
 
 
-def test_kerf_smaller_spacing_more_slots():
-    w, h, edges = _rect_panel(0.6, 0.4)
-    big = parse_flex([{"group_id": 1, "method": "kerf", "spacing_m": 0.03}])[0]
-    small = parse_flex([{"group_id": 1, "method": "kerf", "spacing_m": 0.008}])[0]
-    n_big = len(apply_flex_to_panel(w, h, edges, big))
-    n_small = len(apply_flex_to_panel(w, h, edges, small))
-    assert n_small > n_big > 0
+@dataclass
+class FlexSpec:
+    group_id: int
+    method: FlexMethod
+    spacing_m: float
+    ligament_m: float = DEFAULT_LIGAMENT
+    kerf_width_m: float = DEFAULT_KERF_WIDTH
+    axis_deg: float = 0.0
 
 
-def test_each_method_produces_clipped_flex_edges():
-    w, h, edges = _rect_panel(0.6, 0.4)
-    for method in ("kerf", "auxetic_rotating", "auxetic_reentrant", "auxetic_chiral"):
-        spec = parse_flex([{"group_id": 1, "method": method, "spacing_m": 0.02}])[0]
-        fe = apply_flex_to_panel(w, h, edges, spec)
-        assert fe, method
-        assert all(e.flex for e in fe), method
-        # Recortado al panel (con margen): todo dentro de [0,w]x[0,h].
-        for e in fe:
-            for p in (e.a, e.b):
-                assert -1e-6 <= p.x <= w + 1e-6 and -1e-6 <= p.y <= h + 1e-6, method
+_METHODS = ("kerf", "auxetic_rotating", "auxetic_reentrant", "auxetic_chiral")
 
 
-# --- curvatura: detección y desarrollo -------------------------------------
-
-
-def _flat_grid():
-    fs = []
-    for i in range(8):
-        for j in range(6):
-            x0, x1, y0, y1 = i * 0.1, (i + 1) * 0.1, j * 0.1, (j + 1) * 0.1
-            fs.append(_face((x0, y0, 0), (x1, y0, 0), (x1, y1, 0)))
-            fs.append(_face((x0, y0, 0), (x1, y1, 0), (x0, y1, 0)))
-    return fs
-
-
-def _cylinder(R=0.5, sweep=math.pi, N=24, H=6):
-    fs = []
-    for i in range(N):
-        for j in range(H):
-            t0, t1 = sweep * i / N, sweep * (i + 1) / N
-            y0, y1 = j * 0.15, (j + 1) * 0.15
-            p00 = (R * math.cos(t0), y0, R * math.sin(t0))
-            p10 = (R * math.cos(t1), y0, R * math.sin(t1))
-            p01 = (R * math.cos(t0), y1, R * math.sin(t0))
-            p11 = (R * math.cos(t1), y1, R * math.sin(t1))
-            fs.append(_face(p00, p10, p11))
-            fs.append(_face(p00, p11, p01))
-    return fs
-
-
-def _sphere_cap(R=0.5, M=16):
-    fs = []
-    for i in range(M):
-        for j in range(M // 2):
-            u0, u1 = math.pi * i / M, math.pi * (i + 1) / M
-            v0 = (math.pi / 2) * (j / (M / 2)) * 0.7
-            v1 = (math.pi / 2) * ((j + 1) / (M / 2)) * 0.7
-
-            def sp(u, v):
-                return (R * math.sin(v) * math.cos(u), R * math.cos(v), R * math.sin(v) * math.sin(u))
-
-            fs.append(_face(sp(u0, v0), sp(u1, v0), sp(u1, v1)))
-            fs.append(_face(sp(u0, v0), sp(u1, v1), sp(u0, v1)))
-    return fs
-
-
-def test_flat_is_not_curved():
-    info = detect_curvature(_flat_grid())
-    assert not info.curved and info.kind == "flat"
-
-
-def test_cylinder_is_single_curvature():
-    info = detect_curvature(_cylinder())
-    assert info.curved and info.kind == "single"
-    assert abs(info.bend_radius_m - 0.5) < 0.05
-
-
-def test_sphere_is_double_curvature():
-    info = detect_curvature(_sphere_cap())
-    assert info.curved and info.kind == "double"
-
-
-def test_cylinder_unroll_preserves_arc_length():
-    R = 0.5
-    faces = _cylinder(R=R, sweep=math.pi)
-    up = unroll(faces)
-    assert up is not None and up.kind == "single"
-    # ancho desarrollado ≈ media circunferencia R·π
-    assert abs(up.width_m - R * math.pi) < 0.05
-    assert abs(up.height_m - 0.9) < 0.05
-
-
-# --- integración DXF: el patrón cae en la capa FLEX_CUT --------------------
-
-
-def test_dxf_emits_flex_layer():
-    lines = []
-    edges = [
-        Edge2D(a=Vec2(0, 0), b=Vec2(0.1, 0)),               # contorno -> CUT_EXTERIOR
-        Edge2D(a=Vec2(0.02, 0.02), b=Vec2(0.02, 0.08), flex=True),  # patrón -> FLEX_CUT
-    ]
-    emit_panel_entities(lines, edges, 0.1, 0.1, "A1", 0.0, 0.0, include_text=False)
-    assert "FLEX_CUT" in lines
-    assert "CUT_EXTERIOR" in lines
-
-
-def test_dxf_no_flex_layer_without_flex_edges():
-    lines = []
-    edges = [Edge2D(a=Vec2(0, 0), b=Vec2(0.1, 0))]
-    emit_panel_entities(lines, edges, 0.1, 0.1, "A1", 0.0, 0.0, include_text=False)
-    assert "FLEX_CUT" not in lines
-
-
-if __name__ == "__main__":
-    import sys
-
-    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
-    failed = 0
-    for fn in fns:
+def parse_flex(raw: Optional[List[dict]]) -> List[FlexSpec]:
+    """Valida la lista cruda de specs (un objeto por grupo). Descarta inválidos."""
+    if not raw:
+        return []
+    out: List[FlexSpec] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        gid = item.get("group_id")
+        method = item.get("method")
+        if not isinstance(gid, int) or method not in _METHODS:
+            continue
         try:
-            fn()
-            print(f"PASS {fn.__name__}")
-        except Exception as exc:  # noqa: BLE001
-            failed += 1
-            print(f"FAIL {fn.__name__}: {exc}")
-    print(f"\n{len(fns) - failed}/{len(fns)} passed")
-    sys.exit(1 if failed else 0)
+            spacing = float(item.get("spacing_m"))
+        except (TypeError, ValueError):
+            continue
+        if not (spacing > 0):
+            continue
+        spacing = min(max(spacing, MIN_SPACING), MAX_SPACING)
+
+        ligament = item.get("ligament_m")
+        try:
+            ligament = float(ligament) if ligament is not None else DEFAULT_LIGAMENT
+        except (TypeError, ValueError):
+            ligament = DEFAULT_LIGAMENT
+        ligament = max(MIN_LIGAMENT, min(ligament, spacing * 0.8))
+
+        kerf = item.get("kerf_width_m")
+        try:
+            kerf = float(kerf) if kerf is not None else DEFAULT_KERF_WIDTH
+        except (TypeError, ValueError):
+            kerf = DEFAULT_KERF_WIDTH
+        kerf = max(MIN_KERF_WIDTH, min(kerf, spacing * 0.5))
+
+        axis = item.get("axis_deg")
+        try:
+            axis = float(axis) if axis is not None else 0.0
+        except (TypeError, ValueError):
+            axis = 0.0
+
+        out.append(
+            FlexSpec(
+                group_id=gid,
+                method=method,  # type: ignore[arg-type]
+                spacing_m=spacing,
+                ligament_m=ligament,
+                kerf_width_m=kerf,
+                axis_deg=axis,
+            )
+        )
+    return out
+
+
+def build_flex_by_group(
+    specs: List[FlexSpec],
+    merge_target: Optional[Dict[int, int]] = None,
+) -> Dict[int, FlexSpec]:
+    """Un patrón por grupo (si llegan varios, gana el último). Remapea grupos fusionados."""
+    merge_target = merge_target or {}
+    by_group: Dict[int, FlexSpec] = {}
+    for spec in specs:
+        gid = merge_target.get(spec.group_id, spec.group_id)
+        by_group[gid] = spec
+    return by_group
+
+
+# ---------------------------------------------------------------------------
+# Polígono del panel (para recortar el patrón al contorno real, incluidos huecos)
+# ---------------------------------------------------------------------------
+
+_SNAP = 10_000
+
+
+def _snap(v: float) -> float:
+    return round(v * _SNAP) / _SNAP
+
+
+def _edges_to_rings(edges: List[Edge2D]) -> List[List[Tuple[float, float]]]:
+    """Reconstruye anillos cerrados a partir de aristas sueltas (contorno + huecos)."""
+    adj: Dict[Tuple[float, float], List[Tuple[float, float]]] = {}
+
+    def key(x: float, y: float) -> Tuple[float, float]:
+        return (_snap(x), _snap(y))
+
+    for e in edges:
+        if getattr(e, "score", False) or getattr(e, "joint", False):
+            continue
+        ka, kb = key(e.a.x, e.a.y), key(e.b.x, e.b.y)
+        if ka == kb:
+            continue
+        adj.setdefault(ka, []).append(kb)
+        adj.setdefault(kb, []).append(ka)
+
+    used: set = set()
+    rings: List[List[Tuple[float, float]]] = []
+    for start in list(adj.keys()):
+        for first in adj[start]:
+            ekey = (start, first) if start < first else (first, start)
+            if ekey in used:
+                continue
+            ring = [start]
+            used.add(ekey)
+            prev, cur = start, first
+            guard = 0
+            while cur != start and guard < len(adj) * 4 + 8:
+                guard += 1
+                ring.append(cur)
+                nxt = None
+                for cand in adj.get(cur, []):
+                    if cand == prev:
+                        continue
+                    ek = (cur, cand) if cur < cand else (cand, cur)
+                    if ek in used:
+                        continue
+                    nxt = cand
+                    used.add(ek)
+                    break
+                if nxt is None:
+                    break
+                prev, cur = cur, nxt
+            if len(ring) >= 3 and cur == start:
+                rings.append(ring)
+    return rings
+
+
+def _panel_polygon(width_m: float, height_m: float, edges: List[Edge2D]) -> Polygon:
+    """Polígono del panel; usa el contorno real si se puede reconstruir, si no el bbox."""
+    rings = _edges_to_rings(edges)
+    polys: List[Polygon] = []
+    for ring in rings:
+        if len(ring) < 3:
+            continue
+        try:
+            p = Polygon(ring)
+            if not p.is_valid:
+                p = make_valid(p)
+            if p.area > 1e-6:
+                polys.append(p if isinstance(p, Polygon) else None)  # type: ignore
+        except Exception:
+            continue
+    polys = [p for p in polys if p is not None and not p.is_empty]
+    if polys:
+        # El anillo de mayor área es el exterior; los interiores son huecos.
+        polys.sort(key=lambda p: p.area, reverse=True)
+        outer = polys[0]
+        for hole in polys[1:]:
+            try:
+                outer = outer.difference(hole)
+            except Exception:
+                pass
+        if isinstance(outer, (Polygon, MultiPolygon)) and not outer.is_empty:
+            return outer  # type: ignore[return-value]
+    return Polygon([(0, 0), (width_m, 0), (width_m, height_m), (0, height_m)])
+
+
+# ---------------------------------------------------------------------------
+# Generadores de patrón (en el bbox [0,width]x[0,height], sin rotar)
+# ---------------------------------------------------------------------------
+
+
+def _kerf_slots(width_m: float, height_m: float, spec: FlexSpec) -> List[BaseGeometry]:
+    """Columnas de ranuras verticales interrumpidas por ligamentos, alternadas (brick)."""
+    spacing = spec.spacing_m
+    kerf = spec.kerf_width_m
+    ligament = spec.ligament_m
+    # Paso vertical entre puentes: regular y proporcional al espaciado.
+    bridge_pitch = max(spacing * 1.5, ligament * 6.0)
+
+    slots: List[BaseGeometry] = []
+    u = spacing
+    col = 0
+    while u < width_m - EDGE_MARGIN:
+        # Desfase brick: columnas impares corren medio paso.
+        offset = (bridge_pitch / 2.0) if (col % 2) else 0.0
+        v0 = EDGE_MARGIN + offset
+        # El primer/último tramo respetan el margen; los puentes parten la columna.
+        seg_start = v0
+        while seg_start < height_m - EDGE_MARGIN:
+            seg_end = min(seg_start + (bridge_pitch - ligament), height_m - EDGE_MARGIN)
+            if seg_end - seg_start > kerf:  # ignorar tramos degenerados
+                rect = Polygon(
+                    [
+                        (u - kerf / 2.0, seg_start),
+                        (u + kerf / 2.0, seg_start),
+                        (u + kerf / 2.0, seg_end),
+                        (u - kerf / 2.0, seg_end),
+                    ]
+                )
+                slots.append(rect)
+            seg_start = seg_end + ligament
+        u += spacing
+        col += 1
+    return slots
+
+
+def _auxetic_rotating(width_m: float, height_m: float, spec: FlexSpec) -> List[BaseGeometry]:
+    """Cuadrados rotatorios: rejilla de ranuras diagonales con bisagras en las esquinas.
+
+    Se cortan segmentos a lo largo de las diagonales de cada celda dejando un ligamento
+    en el centro de cada arista compartida (la bisagra). El material forma cuadrados que
+    rotan al traccionar → Poisson negativo.
+    """
+    p = spec.spacing_m
+    lig = spec.ligament_m
+    lines: List[BaseGeometry] = []
+    half = p / 2.0
+    nx = int((width_m - 2 * EDGE_MARGIN) // p)
+    ny = int((height_m - 2 * EDGE_MARGIN) // p)
+    if nx < 1 or ny < 1:
+        return lines
+    ox = (width_m - nx * p) / 2.0
+    oy = (height_m - ny * p) / 2.0
+
+    for j in range(ny):
+        for i in range(nx):
+            cx = ox + i * p + half
+            cy = oy + j * p + half
+            # Dos diagonales de la celda, con hueco de ligamento en el centro (bisagra).
+            checker = (i + j) % 2 == 0
+            d = half - lig / 2.0
+            if d <= lig:
+                continue
+            if checker:
+                lines.append(LineString([(cx - d, cy - d), (cx - lig / 2, cy - lig / 2)]))
+                lines.append(LineString([(cx + lig / 2, cy + lig / 2), (cx + d, cy + d)]))
+            else:
+                lines.append(LineString([(cx - d, cy + d), (cx - lig / 2, cy + lig / 2)]))
+                lines.append(LineString([(cx + lig / 2, cy - lig / 2), (cx + d, cy - d)]))
+    return lines
+
+
+def _auxetic_reentrant(width_m: float, height_m: float, spec: FlexSpec) -> List[BaseGeometry]:
+    """Honeycomb re-entrante: celdas hexagonales invertidas (paredes hacia adentro)."""
+    p = spec.spacing_m
+    lig = spec.ligament_m
+    cells: List[BaseGeometry] = []
+    # Celda re-entrante: hexágono con dos vértices empujados hacia adentro.
+    cw = p                     # ancho de celda
+    ch = p * 1.2               # alto de celda
+    inset = min(p * 0.30, cw / 2 - lig)  # profundidad re-entrante
+    if inset <= 0:
+        return cells
+    nx = int((width_m - 2 * EDGE_MARGIN) // cw)
+    ny = int((height_m - 2 * EDGE_MARGIN) // ch)
+    if nx < 1 or ny < 1:
+        return cells
+    ox = (width_m - nx * cw) / 2.0
+    oy = (height_m - ny * ch) / 2.0
+
+    def cell(cx: float, cy: float) -> Polygon:
+        hw, hh = cw / 2.0, ch / 2.0
+        return Polygon(
+            [
+                (cx - hw + inset, cy - hh),   # inf-izq (hacia adentro)
+                (cx + hw - inset, cy - hh),   # inf-der (hacia adentro)
+                (cx + hw, cy),                # der
+                (cx + hw - inset, cy + hh),   # sup-der (hacia adentro)
+                (cx - hw + inset, cy + hh),   # sup-izq (hacia adentro)
+                (cx - hw, cy),                # izq
+            ]
+        )
+
+    for j in range(ny):
+        for i in range(nx):
+            cx = ox + i * cw + cw / 2.0
+            cy = oy + j * ch + ch / 2.0
+            poly = cell(cx, cy).buffer(-lig / 2.0)
+            if not poly.is_empty and poly.area > (lig * lig):
+                cells.append(poly)
+    return cells
+
+
+def _auxetic_chiral(width_m: float, height_m: float, spec: FlexSpec) -> List[BaseGeometry]:
+    """Quiral: nodos circulares con ligamentos tangentes (rotan al traccionar)."""
+    p = spec.spacing_m
+    lig = spec.ligament_m
+    holes: List[BaseGeometry] = []
+    r = max(p / 2.0 - lig, lig)      # radio del nodo circular
+    nx = int((width_m - 2 * EDGE_MARGIN) // p)
+    ny = int((height_m - 2 * EDGE_MARGIN) // p)
+    if nx < 1 or ny < 1:
+        return holes
+    ox = (width_m - nx * p) / 2.0
+    oy = (height_m - ny * p) / 2.0
+    for j in range(ny):
+        for i in range(nx):
+            cx = ox + i * p + p / 2.0
+            cy = oy + j * p + p / 2.0
+            # Nodo circular; los ligamentos quirales quedan en el material entre nodos.
+            circle = _circle(cx, cy, r, 20)
+            holes.append(circle)
+    return holes
+
+
+def _circle(cx: float, cy: float, r: float, steps: int) -> Polygon:
+    pts = [
+        (cx + r * math.cos(2 * math.pi * k / steps), cy + r * math.sin(2 * math.pi * k / steps))
+        for k in range(steps)
+    ]
+    return Polygon(pts)
+
+
+# ---------------------------------------------------------------------------
+# Conversión de geometría shapely -> Edge2D(flex=True)
+# ---------------------------------------------------------------------------
+
+
+def _ring_to_edges(coords: List[Tuple[float, float]]) -> List[Edge2D]:
+    out: List[Edge2D] = []
+    for i in range(len(coords) - 1):
+        ax, ay = coords[i]
+        bx, by = coords[i + 1]
+        out.append(Edge2D(a=Vec2(ax, ay), b=Vec2(bx, by), flex=True))
+    return out
+
+
+def _geom_to_edges(geom: BaseGeometry) -> List[Edge2D]:
+    edges: List[Edge2D] = []
+    if geom.is_empty:
+        return edges
+    gt = geom.geom_type
+    if gt == "Polygon":
+        edges.extend(_ring_to_edges(list(geom.exterior.coords)))
+        for interior in geom.interiors:
+            edges.extend(_ring_to_edges(list(interior.coords)))
+    elif gt == "MultiPolygon":
+        for g in geom.geoms:
+            edges.extend(_geom_to_edges(g))
+    elif gt == "LineString":
+        edges.extend(_ring_to_edges(list(geom.coords)))
+    elif gt in ("MultiLineString", "GeometryCollection"):
+        for g in geom.geoms:
+            edges.extend(_geom_to_edges(g))
+    return edges
+
+
+_GENERATORS = {
+    "kerf": _kerf_slots,
+    "auxetic_rotating": _auxetic_rotating,
+    "auxetic_reentrant": _auxetic_reentrant,
+    "auxetic_chiral": _auxetic_chiral,
+}
+
+
+def apply_flex_to_panel(
+    width_m: float,
+    height_m: float,
+    edges: List[Edge2D],
+    spec: FlexSpec,
+) -> List[Edge2D]:
+    """Genera las aristas del patrón de flexión recortadas al contorno del panel.
+
+    Devuelve SÓLO las aristas nuevas del patrón (flex=True); el contorno del panel
+    (`edges`) no se modifica. El llamador hace `edges += apply_flex_to_panel(...)`.
+    """
+    if width_m < 3 * EDGE_MARGIN or height_m < 3 * EDGE_MARGIN:
+        return []
+
+    gen = _GENERATORS.get(spec.method)
+    if gen is None:
+        return []
+
+    # Clamp de densidad: acota el número de primitivas subiendo el spacing efectivo.
+    approx = (width_m * height_m) / (spec.spacing_m * spec.spacing_m)
+    if approx > MAX_PRIMITIVES:
+        eff = math.sqrt((width_m * height_m) / MAX_PRIMITIVES)
+        log.info(
+            "flex: panel %.2fx%.2fm con spacing %.4f generaría ~%d primitivas; "
+            "spacing efectivo elevado a %.4f",
+            width_m, height_m, spec.spacing_m, int(approx), eff,
+        )
+        spec = replace(spec, spacing_m=eff, ligament_m=min(spec.ligament_m, eff * 0.8))
+
+    raw = gen(width_m, height_m, spec)
+    if not raw:
+        return []
+
+    geom = unary_union(raw)
+
+    # Rotar el patrón por axis_deg alrededor del centro del panel.
+    if abs(spec.axis_deg) > 1e-6:
+        geom = affinity.rotate(
+            geom, spec.axis_deg, origin=(width_m / 2.0, height_m / 2.0), use_radians=False
+        )
+
+    # Recortar al contorno real del panel (respetando huecos y borde), con margen.
+    panel = _panel_polygon(width_m, height_m, edges)
+    try:
+        safe = panel.buffer(-EDGE_MARGIN)
+    except Exception:
+        safe = panel
+    if safe.is_empty:
+        safe = panel
+    try:
+        clipped = geom.intersection(safe)
+    except Exception:
+        try:
+            clipped = geom.intersection(panel)
+        except Exception:
+            return []
+
+    return _geom_to_edges(clipped)
