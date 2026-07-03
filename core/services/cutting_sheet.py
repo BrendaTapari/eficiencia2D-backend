@@ -113,6 +113,7 @@ class Edge2D:
     hole: bool = False  # True si la arista pertenece a un anillo interior (abertura)
     joint: bool = False  # True si es una línea de encastre (junta transversal 3D)
     score: bool = False  # True si es una línea de pliegue/score (corte manual tipo "line")
+    flex: bool = False  # True si es un corte del patrón de flexión (kerf / auxético)
 
 
 @dataclass
@@ -1113,6 +1114,7 @@ CS_LAYERS = [
     {"name": "ENGRAVE_RASTER", "aci": "8"},
     {"name": "CUT_INTERIOR", "aci": "3"},
     {"name": "MARK_VECTOR", "aci": "1"},  # rojo: aberturas a grabar (no cortar)
+    {"name": "FLEX_CUT", "aci": "4"},  # cian: patrón de flexión (kerf / auxético), a cortar
 ]
 
 
@@ -1198,7 +1200,10 @@ def emit_panel_entities(
         #  - joint  -> línea de encastre (junta transversal 3D) en CUT_INTERIOR (ACI 3)
         #  - hole en panel marcado -> abertura a grabar en MARK_VECTOR (ACI 1, rojo)
         #  - resto  -> contorno a cortar en CUT_EXTERIOR (ACI 7)
-        if getattr(edge, "score", False):
+        if getattr(edge, "flex", False):
+            # Patrón de flexión (kerf / auxético): se corta, en su propia capa (cian).
+            layer, aci = "FLEX_CUT", "4"
+        elif getattr(edge, "score", False):
             # Corte manual tipo "line" -> marca de pliegue/score (no corta): MARK_VECTOR.
             layer, aci = "MARK_VECTOR", "1"
         elif getattr(edge, "joint", False):
