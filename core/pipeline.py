@@ -183,6 +183,7 @@ def generate_pipeline(
     merges: Optional[List[List[int]]] = None,
     marks: Optional[List[int]] = None,
     user_cuts: Optional[List[dict]] = None,
+    flex: Optional[List[dict]] = None,
 ) -> List[OutputFile]:
     from core.review_generate import generate_from_review
 
@@ -194,6 +195,7 @@ def generate_pipeline(
         merges=merges,
         marks=marks,
         user_cuts=user_cuts,
+        flex=flex,
     )
 
 
