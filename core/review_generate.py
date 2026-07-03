@@ -25,6 +25,8 @@ from core.services.cutting_sheet import (
     project_faces_to_2d,
 )
 from core.services.plate_intersect import resolve_plate_joints
+from core.services.flex_bending import apply_flex_to_panel, build_flex_by_group, parse_flex
+from core.services.curvature import detect_curvature, unroll
 from core.services.facade_extractor import extract_facades
 from core.services.floor_plan_extractor import extract_floor_plans
 from core.services.joint_detector import detect_joints
@@ -186,6 +188,7 @@ def decompose_panels_from_groups(
     marks: Optional[List[int]] = None,
     plate_joints: Optional[List] = None,
     user_cuts: Optional[List[dict]] = None,
+    flex: Optional[List[dict]] = None,
 ) -> Tuple[List[Panel], List[Panel]]:
     overrides = overrides or {}
     marks_set = set(marks or [])  # ids de grupos cuyas aberturas se graban (no se cortan)
@@ -197,6 +200,9 @@ def decompose_panels_from_groups(
         gid = c.get("group_id") if isinstance(c, dict) else getattr(c, "group_id", None)
         if gid is not None:
             cuts_by_group.setdefault(int(gid), []).append(c)
+
+    # Patrón de flexión por grupo (flex): un FlexSpec por group_id (kerf / auxético).
+    flex_by_group = build_flex_by_group(parse_flex(flex))
 
     # Ranuras de encastre por placa CORTADA (Misión 1): cut_id -> [(P_a, P_b, ancho), ...]
     # en 3D. `ancho` = grosor de la placa cortante (define el ancho de la ranura).
@@ -312,6 +318,55 @@ def decompose_panels_from_groups(
                     )
             continue
 
+        # Patrón de flexión (flex): superficies curvas. Si el grupo es curvo se
+        # DESARROLLA a plano (unroll desarrollable / aplanado aproximado) antes de
+        # cortar el patrón; si es plano se usa la proyección normal. Rama aislada
+        # (como user_cuts): se omiten trims de ensamble/encastres. El patrón se corta
+        # en su propia capa (FLEX_CUT). El contorno del panel desarrollado puede ser
+        # mayor que el plano ingenuo → se nestea ese tamaño real.
+        spec = flex_by_group.get(group.id)
+        if spec is not None:
+            fw, fh, base_edges = width_m, height_m, edges
+            info = detect_curvature(faces)
+            if info.curved:
+                dev = unroll(faces, info)
+                if dev is not None:
+                    fw, fh, base_edges = dev.width_m, dev.height_m, dev.edges
+            if fw * fh >= min_area:
+                m_edges = mirror_edges_horizontal(base_edges, fw)
+                m_edges = list(m_edges) + apply_flex_to_panel(fw, fh, m_edges, spec)
+                if is_floor:
+                    floor_count += 1
+                    floor_panels.append(
+                        Panel(
+                            id=f"B{floor_count}",
+                            group_name=f"floor_{floor_count}",
+                            category="floor",
+                            floor_index=0,
+                            width_m=fw,
+                            height_m=fh,
+                            edges=m_edges,
+                            source_group_id=group.id,
+                            is_mark=group.id in marks_set,
+                        )
+                    )
+                else:
+                    wall_count += 1
+                    wall_panels.append(
+                        Panel(
+                            id=f"A{wall_count}",
+                            group_name=f"wall_{wall_count}",
+                            category="wall",
+                            floor_index=0,
+                            width_m=fw,
+                            height_m=fh,
+                            edges=m_edges,
+                            source_group_id=group.id,
+                            is_mark=group.id in marks_set,
+                        )
+                    )
+            continue
+
         height_delta = height_adj.get(group.id, 0.0)
         if height_delta < 0 and not is_floor:
             strip = min(-height_delta, height_m - 0.01)
@@ -417,6 +472,7 @@ def _panels_to_nesting(panels: List[Panel], scale_denom: float) -> List[NestingP
                         hole=e.hole,
                         joint=getattr(e, "joint", False),
                         score=getattr(e, "score", False),
+                        flex=getattr(e, "flex", False),
                     )
                     for e in p.edges
                 ],
@@ -434,6 +490,7 @@ def _decompose(
     merges: Optional[List[List[int]]],
     marks: Optional[List[int]],
     user_cuts: Optional[List[dict]] = None,
+    flex: Optional[List[dict]] = None,
 ) -> Tuple[Phase1Result, List[Panel], List[Panel], List]:
     """Aplica merges, resuelve encastres 3D y descompone a paneles 2D."""
     work = apply_merges(phase1, merges or [])
@@ -441,7 +498,7 @@ def _decompose(
     # topología final (post-merges), antes de proyectar.
     plate_joints = resolve_plate_joints(work.groups, work.faces)
     wall_panels, floor_panels = decompose_panels_from_groups(
-        work, opts, overrides, wall_wall_decisions, marks, plate_joints, user_cuts
+        work, opts, overrides, wall_wall_decisions, marks, plate_joints, user_cuts, flex
     )
     return work, wall_panels, floor_panels, plate_joints
 
@@ -505,10 +562,11 @@ def compute_nesting(
     merges: Optional[List[List[int]]] = None,
     marks: Optional[List[int]] = None,
     user_cuts: Optional[List[dict]] = None,
+    flex: Optional[List[dict]] = None,
 ) -> Tuple[Phase1Result, NestingResult, NestingResult, SheetConfig, Dict[int, str], List]:
     """Descompone y anida paneles. Compartido por /generate y /nesting-preview."""
     work, wall_panels, floor_panels, plate_joints = _decompose(
-        phase1, opts, overrides, wall_wall_decisions, merges, marks, user_cuts
+        phase1, opts, overrides, wall_wall_decisions, merges, marks, user_cuts, flex
     )
 
     sc = opts.sheet_config
@@ -558,9 +616,10 @@ def generate_from_review(
     merges: Optional[List[List[int]]] = None,
     marks: Optional[List[int]] = None,
     user_cuts: Optional[List[dict]] = None,
+    flex: Optional[List[dict]] = None,
 ) -> List[OutputFile]:
     work, wall_nesting, floor_nesting, sheet_cfg, _, _ = compute_nesting(
-        phase1, opts, overrides, wall_wall_decisions, merges, marks, user_cuts
+        phase1, opts, overrides, wall_wall_decisions, merges, marks, user_cuts, flex
     )
     scale = opts.scale_denom
     stem = work.stem
