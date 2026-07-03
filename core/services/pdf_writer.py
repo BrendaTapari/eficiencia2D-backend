@@ -416,7 +416,9 @@ def _render_sheets_page(
             cs.append("0.3 w")
             cur_color = None
             for edge in edges:
-                if getattr(edge, "score", False):
+                if getattr(edge, "flex", False):
+                    color = "0 0.7 0.7 RG"        # cian: patrón de flexión (kerf/auxético)
+                elif getattr(edge, "score", False):
                     color = "1 0 0 RG"            # rojo: pliegue/score (corte manual línea)
                 elif getattr(edge, "joint", False):
                     color = "0 0.6 0 RG"          # verde: línea de encastre (junta)
