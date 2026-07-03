@@ -1,12 +1,13 @@
 import os
 import logging
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from api.deps import get_current_user, get_db
-from database.models import Plan, Suscripcion
+from api.deps import get_current_user
+from database import Plan, Suscripcion, Usuario, get_db
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -16,15 +17,15 @@ FRONTEND_URL = os.environ.get("FRONTEND_URL_VERCEL") or os.environ.get("FRONTEND
 
 
 class SuscripcionRequest(BaseModel):
-    plan_id: str
+    plan_id: int
 
 
 def serialize_suscripcion(s: Suscripcion) -> dict:
     return {
         "plan_id": s.plan_id,
         "estado": s.estado,
-        "periodo_fin": s.periodo_fin.isoformat() if s.periodo_fin else None,
-        "cancela_al_fin": s.cancela_al_fin,
+        "periodo_fin": s.fecha_fin.isoformat() if s.fecha_fin else None,
+        "cancela_al_fin": bool(s.cancela_al_fin),
     }
 
 
@@ -44,8 +45,8 @@ def _create_mp_preapproval(plan: Plan, user_id: str) -> dict:
         "auto_recurring": {
             "frequency": 1,
             "frequency_type": "months",
-            "transaction_amount": plan.precio_mensual,
-            "currency_id": plan.moneda,
+            "transaction_amount": float(plan.precio_mensual or plan.precio),
+            "currency_id": plan.moneda or "ARS",
         },
         "back_url": f"{FRONTEND_URL}/payment-callback?sub=1",
         "external_reference": user_id,
@@ -65,10 +66,10 @@ def _create_mp_preapproval(plan: Plan, user_id: str) -> dict:
 
 @router.get("/users/me/suscripcion")
 def get_suscripcion(
-    user_id: str = Depends(get_current_user),
+    user: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    sub = db.query(Suscripcion).filter(Suscripcion.user_id == user_id).first()
+    sub = db.query(Suscripcion).filter(Suscripcion.usuario_id == user.id).first()
     if not sub:
         return _empty_suscripcion()
     return serialize_suscripcion(sub)
@@ -77,51 +78,62 @@ def get_suscripcion(
 @router.post("/users/me/suscripcion")
 def create_or_change_suscripcion(
     body: SuscripcionRequest,
-    user_id: str = Depends(get_current_user),
+    user: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     plan = db.query(Plan).filter(Plan.id == body.plan_id, Plan.activo.is_(True)).first()
     if not plan:
         raise HTTPException(status_code=404, detail="Plan no encontrado o inactivo")
 
-    sub = db.query(Suscripcion).filter(Suscripcion.user_id == user_id).first()
+    sub = db.query(Suscripcion).filter(Suscripcion.usuario_id == user.id).first()
 
     if sub and sub.plan_id == body.plan_id and sub.estado == "activa":
         raise HTTPException(status_code=409, detail="Ya suscripto a este plan")
 
-    if plan.precio_mensual == 0:
+    precio = float(plan.precio_mensual or plan.precio or 0)
+
+    if precio == 0:
+        now = datetime.now(timezone.utc)
         if sub:
             sub.plan_id = plan.id
             sub.estado = "activa"
-            sub.periodo_fin = None
+            sub.fecha_inicio = now
+            sub.fecha_fin = now
             sub.cancela_al_fin = False
             sub.proveedor = None
-            sub.proveedor_ref = None
+            sub.proveedor_pago_id = None
         else:
             sub = Suscripcion(
-                user_id=user_id,
+                usuario_id=user.id,
                 plan_id=plan.id,
                 estado="activa",
+                fecha_inicio=now,
+                fecha_fin=now,
             )
             db.add(sub)
         db.commit()
         db.refresh(sub)
         return serialize_suscripcion(sub)
 
-    mp = _create_mp_preapproval(plan, user_id)
+    mp = _create_mp_preapproval(plan, str(user.id))
+    now = datetime.now(timezone.utc)
     if sub:
         sub.plan_id = plan.id
         sub.estado = "pendiente"
         sub.proveedor = "mercadopago"
-        sub.proveedor_ref = mp["id"]
+        sub.proveedor_pago_id = mp["id"]
         sub.cancela_al_fin = False
+        sub.fecha_inicio = now
+        sub.fecha_fin = now
     else:
         sub = Suscripcion(
-            user_id=user_id,
+            usuario_id=user.id,
             plan_id=plan.id,
             estado="pendiente",
             proveedor="mercadopago",
-            proveedor_ref=mp["id"],
+            proveedor_pago_id=mp["id"],
+            fecha_inicio=now,
+            fecha_fin=now,
         )
         db.add(sub)
     db.commit()
@@ -130,10 +142,10 @@ def create_or_change_suscripcion(
 
 @router.delete("/users/me/suscripcion")
 def cancel_suscripcion(
-    user_id: str = Depends(get_current_user),
+    user: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    sub = db.query(Suscripcion).filter(Suscripcion.user_id == user_id).first()
+    sub = db.query(Suscripcion).filter(Suscripcion.usuario_id == user.id).first()
     if not sub or sub.estado not in ("activa", "pendiente"):
         raise HTTPException(status_code=404, detail="No hay suscripción activa para cancelar")
 
