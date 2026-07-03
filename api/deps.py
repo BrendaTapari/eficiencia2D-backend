@@ -1,45 +1,70 @@
-import os
-import logging
-from typing import Generator
+from uuid import UUID
 
-import jwt
-from fastapi import Header, HTTPException
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
-from database.database import SessionLocal
+from core.security import decode_access_token
+from database import Usuario, get_db
 
-log = logging.getLogger(__name__)
-
-JWT_SECRET = os.environ.get("JWT_SECRET", "")
-JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
-JWT_USER_CLAIM = os.environ.get("JWT_USER_CLAIM", "sub")
+bearer_scheme = HTTPBearer(auto_error=False)
 
 
-def get_db() -> Generator[Session, None, None]:
-    db = SessionLocal()
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+) -> Usuario:
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="No autenticado",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user_id = decode_access_token(credentials.credentials)
+    if user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token inválido o expirado",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     try:
-        yield db
-    finally:
-        db.close()
+        user_uuid = UUID(user_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token inválido",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+
+    user = db.get(Usuario, user_uuid)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Usuario no encontrado",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if user.estado == "pendiente_verificacion":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Debes verificar tu correo electrónico",
+        )
+
+    if user.estado != "activo":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cuenta inactiva",
+        )
+
+    return user
 
 
-def get_current_user(authorization: str = Header(...)) -> str:
-    if not JWT_SECRET:
-        raise HTTPException(status_code=500, detail="JWT_SECRET no configurado")
-
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not token:
-        raise HTTPException(status_code=401, detail="Token inválido o ausente")
-
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expirado")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Token inválido")
-
-    user_id = payload.get(JWT_USER_CLAIM)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Token sin identificador de usuario")
-
-    return str(user_id)
+def get_admin_user(current_user: Usuario = Depends(get_current_user)) -> Usuario:
+    if current_user.rol != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Se requiere rol de administrador",
+        )
+    return current_user
