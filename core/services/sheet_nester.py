@@ -30,6 +30,7 @@ class Edge:
     hole: bool = False  # True si la arista pertenece a un anillo interior (abertura)
     joint: bool = False  # True si es una línea de encastre (junta transversal 3D)
     score: bool = False  # True si es una línea de pliegue/score (corte manual "line")
+    flex: bool = False  # True si es un corte del patrón de flexión (kerf / auxético)
 
 
 @dataclass
