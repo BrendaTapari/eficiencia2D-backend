@@ -419,7 +419,7 @@ def _seed_planes() -> None:
                                         descripcion, features, destacado, activo, orden,
                                         limite_almacenamiento_mb, limite_proyectos)
                     VALUES (:nombre, :slug, :precio, :precio_mensual, :moneda, :periodo,
-                            :descripcion, :features::jsonb, :destacado, :activo, :orden,
+                            :descripcion, CAST(:features AS jsonb), :destacado, :activo, :orden,
                             :limite_almacenamiento_mb, :limite_proyectos)
                 """),
                 s,
