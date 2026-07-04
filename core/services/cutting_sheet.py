@@ -1114,7 +1114,7 @@ CS_LAYERS = [
     {"name": "ENGRAVE_RASTER", "aci": "8"},
     {"name": "CUT_INTERIOR", "aci": "3"},
     {"name": "MARK_VECTOR", "aci": "1"},  # rojo: aberturas a grabar (no cortar)
-    {"name": "FLEX_CUT", "aci": "4"},  # cian: patrón de flexión (kerf / auxético), a cortar
+    {"name": "FLEX_CUT", "aci": "7"},  # negro: patrón de flexión (kerf/auxético) — SE CORTA
 ]
 
 
@@ -1201,8 +1201,9 @@ def emit_panel_entities(
         #  - hole en panel marcado -> abertura a grabar en MARK_VECTOR (ACI 1, rojo)
         #  - resto  -> contorno a cortar en CUT_EXTERIOR (ACI 7)
         if getattr(edge, "flex", False):
-            # Patrón de flexión (kerf / auxético): se corta, en su propia capa (cian).
-            layer, aci = "FLEX_CUT", "4"
+            # Patrón de flexión (kerf/auxético): SE CORTA. Capa propia FLEX_CUT en negro
+            # (color de corte) para que el láser lo corte y el material pueda plegarse.
+            layer, aci = "FLEX_CUT", "7"
         elif getattr(edge, "score", False):
             # Corte manual tipo "line" -> marca de pliegue/score (no corta): MARK_VECTOR.
             layer, aci = "MARK_VECTOR", "1"
