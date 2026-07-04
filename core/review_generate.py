@@ -333,8 +333,19 @@ def decompose_panels_from_groups(
                 if dev is not None:
                     fw, fh, base_edges = dev.width_m, dev.height_m, dev.edges
             if fw * fh >= min_area:
+                # spacing/ligament/kerf llegan en METROS DE LA MAQUETA (el material físico
+                # a cortar). El panel acá está en metros del edificio; se escalan por
+                # scale_denom para que, tras el 1/scale_denom del nesting, el patrón tenga
+                # el espaciado físico pedido en la plancha.
+                scale = opts.scale_denom or 1.0
+                spec_m = replace(
+                    spec,
+                    spacing_m=spec.spacing_m * scale,
+                    ligament_m=spec.ligament_m * scale,
+                    kerf_width_m=spec.kerf_width_m * scale,
+                )
                 m_edges = mirror_edges_horizontal(base_edges, fw)
-                m_edges = list(m_edges) + apply_flex_to_panel(fw, fh, m_edges, spec)
+                m_edges = list(m_edges) + apply_flex_to_panel(fw, fh, m_edges, spec_m)
                 if is_floor:
                     floor_count += 1
                     floor_panels.append(
