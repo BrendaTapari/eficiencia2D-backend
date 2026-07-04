@@ -227,38 +227,36 @@ def _panel_polygon(width_m: float, height_m: float, edges: List[Edge2D]) -> Poly
 
 
 def _kerf_slots(width_m: float, height_m: float, spec: FlexSpec) -> List[BaseGeometry]:
-    """Columnas de ranuras verticales interrumpidas por ligamentos, alternadas (brick)."""
-    spacing = spec.spacing_m
-    kerf = spec.kerf_width_m
-    ligament = spec.ligament_m
-    # Paso vertical entre puentes: regular y proporcional al espaciado.
-    bridge_pitch = max(spacing * 1.5, ligament * 6.0)
+    """Living hinge: columnas de RANURAS RECTAS (líneas de corte) interrumpidas por
+    puentes (ligamentos), alternadas en patrón brick entre columnas contiguas.
 
-    slots: List[BaseGeometry] = []
+    Cada ranura es una LÍNEA (el corte del láser; su propio ancho es el kerf físico).
+    La distancia entre columnas (`spacing`) fija el radio de doblez; los puentes de
+    `ligament` mantienen la integridad de la plancha. Es el patrón de las fotos de
+    referencia: cortes paralelos discontinuos que dejan flexar el MDF/cartón.
+    """
+    spacing = spec.spacing_m
+    ligament = spec.ligament_m
+    # Longitud de cada ranura recta; el puente entre ranuras consecutivas = ligament.
+    slit_len = max(spacing * 2.5, ligament * 4.0)
+    period = slit_len + ligament  # paso vertical (ranura + puente)
+
+    lines: List[BaseGeometry] = []
     u = spacing
     col = 0
     while u < width_m - EDGE_MARGIN:
-        # Desfase brick: columnas impares corren medio paso.
-        offset = (bridge_pitch / 2.0) if (col % 2) else 0.0
-        v0 = EDGE_MARGIN + offset
-        # El primer/último tramo respetan el margen; los puentes parten la columna.
-        seg_start = v0
-        while seg_start < height_m - EDGE_MARGIN:
-            seg_end = min(seg_start + (bridge_pitch - ligament), height_m - EDGE_MARGIN)
-            if seg_end - seg_start > kerf:  # ignorar tramos degenerados
-                rect = Polygon(
-                    [
-                        (u - kerf / 2.0, seg_start),
-                        (u + kerf / 2.0, seg_start),
-                        (u + kerf / 2.0, seg_end),
-                        (u - kerf / 2.0, seg_end),
-                    ]
-                )
-                slots.append(rect)
-            seg_start = seg_end + ligament
+        # Brick: las columnas impares arrancan medio período más abajo, de modo que
+        # los puentes de una columna caen frente a las ranuras de la vecina.
+        offset = (period / 2.0) if (col % 2) else 0.0
+        v = EDGE_MARGIN + offset
+        while v < height_m - EDGE_MARGIN:
+            v_end = min(v + slit_len, height_m - EDGE_MARGIN)
+            if v_end - v > 1e-4:
+                lines.append(LineString([(u, v), (u, v_end)]))
+            v = v_end + ligament
         u += spacing
         col += 1
-    return slots
+    return lines
 
 
 def _auxetic_rotating(width_m: float, height_m: float, spec: FlexSpec) -> List[BaseGeometry]:
@@ -283,17 +281,18 @@ def _auxetic_rotating(width_m: float, height_m: float, spec: FlexSpec) -> List[B
         for i in range(nx):
             cx = ox + i * p + half
             cy = oy + j * p + half
-            # Dos diagonales de la celda, con hueco de ligamento en el centro (bisagra).
+            # Dos diagonales de la celda, con hueco de bisagra (gap) en el centro.
             checker = (i + j) % 2 == 0
-            d = half - lig / 2.0
-            if d <= lig:
+            gap = min(lig / 2.0, half * 0.4)   # media abertura de la bisagra central
+            d = half - gap                      # la ranura llega casi hasta la esquina
+            if d <= gap:
                 continue
             if checker:
-                lines.append(LineString([(cx - d, cy - d), (cx - lig / 2, cy - lig / 2)]))
-                lines.append(LineString([(cx + lig / 2, cy + lig / 2), (cx + d, cy + d)]))
+                lines.append(LineString([(cx - d, cy - d), (cx - gap, cy - gap)]))
+                lines.append(LineString([(cx + gap, cy + gap), (cx + d, cy + d)]))
             else:
-                lines.append(LineString([(cx - d, cy + d), (cx - lig / 2, cy + lig / 2)]))
-                lines.append(LineString([(cx + lig / 2, cy - lig / 2), (cx + d, cy - d)]))
+                lines.append(LineString([(cx - d, cy + d), (cx - gap, cy + gap)]))
+                lines.append(LineString([(cx + gap, cy - gap), (cx + d, cy - d)]))
     return lines
 
 
