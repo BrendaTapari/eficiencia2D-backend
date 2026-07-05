@@ -117,6 +117,10 @@ class CouponListResponse(BaseModel):
     total: int
 
 
+class UpdateCouponRequest(BaseModel):
+    activo: bool
+
+
 def _decimal_to_float(value: Decimal | None) -> float | None:
     if value is None:
         return None
@@ -315,4 +319,41 @@ def obtener_cupon(
     cupon = db.get(Cupon, cupon_id)
     if cupon is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cupón no encontrado")
+    return _coupon_to_response(cupon, usos_totales=count_usos_totales(db, cupon.id), db=db)
+
+
+@router.patch("/cupones/{cupon_id}", response_model=CouponResponse)
+def actualizar_cupon(
+    cupon_id: UUID,
+    body: UpdateCouponRequest,
+    admin: Usuario = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """Actualiza un cupón (p. ej. desactivarlo). Solo admin."""
+    cupon = db.get(Cupon, cupon_id)
+    if cupon is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cupón no encontrado")
+
+    if cupon.activo == body.activo:
+        return _coupon_to_response(
+            cupon,
+            usos_totales=count_usos_totales(db, cupon.id),
+            db=db,
+        )
+
+    cupon.activo = body.activo
+
+    try:
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Error al actualizar cupón %s", cupon_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo actualizar el cupón",
+        ) from None
+
+    db.refresh(cupon)
+    action = "activado" if body.activo else "desactivado"
+    logger.info("Cupón %s (%s) por admin %s", action, cupon.codigo, admin.id)
     return _coupon_to_response(cupon, usos_totales=count_usos_totales(db, cupon.id), db=db)
