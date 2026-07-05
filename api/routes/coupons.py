@@ -1,11 +1,12 @@
 import logging
+import math
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
@@ -16,6 +17,7 @@ from api.services.cupon_service import (
     assert_cupon_vigente,
     calcular_precio_con_descuento,
     count_usos_totales,
+    count_usos_totales_batch,
     cupon_tipo,
     get_cupon_por_codigo,
     mensaje_cupon_valido,
@@ -115,6 +117,9 @@ class ValidarCuponResponse(BaseModel):
 class CouponListResponse(BaseModel):
     cupones: list[CouponResponse]
     total: int
+    page: int
+    page_size: int
+    total_pages: int
 
 
 class UpdateCouponRequest(BaseModel):
@@ -178,6 +183,59 @@ def _validate_plan(db: Session, plan_id: int | None) -> Plan | None:
             detail="Plan no encontrado",
         )
     return plan
+
+
+def _normalize_filter_datetime(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _build_cupones_query(
+    db: Session,
+    *,
+    activo: bool | None,
+    tipo: Literal["plan", "descuento"] | None,
+    descuento_tipo: Literal["porcentaje", "monto"] | None,
+    plan_id: int | None,
+    fecha_inicio_desde: datetime | None,
+    fecha_inicio_hasta: datetime | None,
+):
+    query = db.query(Cupon).options(joinedload(Cupon.plan))
+
+    if activo is not None:
+        query = query.filter(Cupon.activo.is_(activo))
+
+    if tipo == "plan":
+        query = query.filter(Cupon.plan_id.isnot(None))
+    elif tipo == "descuento":
+        query = query.filter(Cupon.plan_id.is_(None))
+
+    if descuento_tipo == "porcentaje":
+        query = query.filter(
+            Cupon.descuento_porcentaje.isnot(None),
+            Cupon.descuento_porcentaje > 0,
+        )
+    elif descuento_tipo == "monto":
+        query = query.filter(
+            Cupon.descuento_monto.isnot(None),
+            Cupon.descuento_monto > 0,
+        )
+
+    if plan_id is not None:
+        query = query.filter(Cupon.plan_id == plan_id)
+
+    if fecha_inicio_desde is not None:
+        query = query.filter(Cupon.fecha_inicio >= fecha_inicio_desde)
+    if fecha_inicio_hasta is not None:
+        query = query.filter(Cupon.fecha_inicio <= fecha_inicio_hasta)
+
+    return query.order_by(
+        Cupon.fecha_inicio.desc().nullslast(),
+        Cupon.fecha_creacion.desc(),
+    )
 
 
 @router.post("/cupones", response_model=CouponResponse, status_code=status.HTTP_201_CREATED)
@@ -297,15 +355,63 @@ def validar_cupon(
 def listar_cupones(
     admin: Usuario = Depends(get_admin_user),
     db: Session = Depends(get_db),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    activo: bool | None = Query(default=None),
+    tipo: Literal["plan", "descuento"] | None = Query(default=None),
+    descuento_tipo: Literal["porcentaje", "monto"] | None = Query(default=None),
+    plan_id: int | None = Query(default=None, ge=1),
+    fecha_inicio_desde: datetime | None = Query(default=None),
+    fecha_inicio_hasta: datetime | None = Query(default=None),
 ):
-    """Lista todos los cupones. Solo admin."""
-    cupones = db.query(Cupon).order_by(Cupon.fecha_creacion.desc()).all()
+    """Lista cupones con paginación y filtros. Solo admin."""
+    if descuento_tipo is not None and tipo == "plan":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="descuento_tipo no aplica a cupones de plan",
+        )
+    if plan_id is not None:
+        _validate_plan(db, plan_id)
+
+    desde = _normalize_filter_datetime(fecha_inicio_desde)
+    hasta = _normalize_filter_datetime(fecha_inicio_hasta)
+    if desde is not None and hasta is not None and hasta < desde:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="fecha_inicio_hasta debe ser posterior o igual a fecha_inicio_desde",
+        )
+
+    query = _build_cupones_query(
+        db,
+        activo=activo,
+        tipo=tipo,
+        descuento_tipo=descuento_tipo,
+        plan_id=plan_id,
+        fecha_inicio_desde=desde,
+        fecha_inicio_hasta=hasta,
+    )
+
+    total = query.count()
+    total_pages = math.ceil(total / page_size) if total else 0
+    offset = (page - 1) * page_size
+    cupones = query.offset(offset).limit(page_size).all()
+
+    usos_map = count_usos_totales_batch(db, [c.id for c in cupones])
+
     return CouponListResponse(
         cupones=[
-            _coupon_to_response(c, usos_totales=count_usos_totales(db, c.id), db=db)
+            _coupon_to_response(
+                c,
+                usos_totales=usos_map.get(c.id, 0),
+                plan=c.plan if c.plan_id else None,
+                db=db,
+            )
             for c in cupones
         ],
-        total=len(cupones),
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
     )
 
 
