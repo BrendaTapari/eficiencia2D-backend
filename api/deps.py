@@ -67,6 +67,33 @@ def get_current_user(
     return user
 
 
+def get_optional_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+) -> Usuario | None:
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        return None
+
+    user_id = decode_access_token(credentials.credentials)
+    if user_id is None:
+        return None
+
+    try:
+        user_uuid = UUID(user_id)
+    except ValueError:
+        return None
+
+    user = (
+        db.query(Usuario)
+        .options(joinedload(Usuario.rol))
+        .filter(Usuario.id == user_uuid)
+        .first()
+    )
+    if user is None or user.estado != "activo":
+        return None
+    return user
+
+
 def get_admin_user(current_user: Usuario = Depends(get_current_user)) -> Usuario:
     if not is_admin_user(current_user):
         raise HTTPException(

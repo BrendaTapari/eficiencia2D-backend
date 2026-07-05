@@ -175,6 +175,7 @@ def init_db() -> None:
     _migrate_usuario_rol_schema()
     _migrate_cupones_schema()
     _migrate_planes_contract_schema()
+    _migrate_precios_plan_schema()
     _migrate_suscripciones_contract_schema()
     _backfill_configuraciones_usuario()
     _seed_planes()
@@ -419,23 +420,84 @@ def _migrate_cupones_schema() -> None:
 
 
 def _migrate_planes_contract_schema() -> None:
-    """Agrega columnas del contrato de planes de pago si aún no existen."""
+    """Columnas de catálogo en planes (sin precios embebidos)."""
     statements = (
         "ALTER TABLE planes ADD COLUMN IF NOT EXISTS slug VARCHAR UNIQUE",
-        "ALTER TABLE planes ADD COLUMN IF NOT EXISTS precio_mensual NUMERIC(10, 2)",
-        "ALTER TABLE planes ADD COLUMN IF NOT EXISTS moneda VARCHAR DEFAULT 'ARS'",
-        "ALTER TABLE planes ADD COLUMN IF NOT EXISTS periodo VARCHAR DEFAULT 'mes'",
         "ALTER TABLE planes ADD COLUMN IF NOT EXISTS descripcion VARCHAR DEFAULT ''",
         "ALTER TABLE planes ADD COLUMN IF NOT EXISTS features JSONB DEFAULT '[]'::jsonb",
         "ALTER TABLE planes ADD COLUMN IF NOT EXISTS destacado BOOLEAN DEFAULT FALSE",
         "ALTER TABLE planes ADD COLUMN IF NOT EXISTS activo BOOLEAN DEFAULT TRUE",
         "ALTER TABLE planes ADD COLUMN IF NOT EXISTS orden INTEGER DEFAULT 0",
-        "UPDATE planes SET precio_mensual = precio WHERE precio_mensual IS NULL",
     )
     with engine.begin() as conn:
         for sql in statements:
             conn.execute(text(sql))
-    logger.info("Esquema de planes (contrato) verificado")
+    logger.info("Esquema de planes (catálogo) verificado")
+
+
+def _migrate_precios_plan_schema() -> None:
+    """Tabla precios_plan y migración desde columnas legacy en planes."""
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS precios_plan (
+                    id SERIAL PRIMARY KEY,
+                    precio NUMERIC(10, 2) NOT NULL,
+                    moneda VARCHAR DEFAULT 'ARS',
+                    periodo VARCHAR DEFAULT 'mes',
+                    planes_id INTEGER NOT NULL,
+                    CONSTRAINT fk_precios_plan_planes
+                        FOREIGN KEY (planes_id) REFERENCES planes (id)
+                )
+                """
+            )
+        )
+
+        legacy_cols = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'planes'
+                      AND column_name IN ('precio', 'precio_mensual', 'moneda', 'periodo')
+                    """
+                )
+            ).fetchall()
+        }
+
+        if not legacy_cols:
+            return
+
+        if "precio_mensual" in legacy_cols and "precio" in legacy_cols:
+            precio_expr = "COALESCE(p.precio_mensual, p.precio, 0)"
+        elif "precio_mensual" in legacy_cols:
+            precio_expr = "COALESCE(p.precio_mensual, 0)"
+        elif "precio" in legacy_cols:
+            precio_expr = "COALESCE(p.precio, 0)"
+        else:
+            precio_expr = "0"
+
+        moneda_expr = "COALESCE(p.moneda, 'ARS')" if "moneda" in legacy_cols else "'ARS'"
+        periodo_expr = "COALESCE(p.periodo, 'mes')" if "periodo" in legacy_cols else "'mes'"
+
+        conn.execute(
+            text(
+                f"""
+                INSERT INTO precios_plan (precio, moneda, periodo, planes_id)
+                SELECT {precio_expr}, {moneda_expr}, {periodo_expr}, p.id
+                FROM planes p
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM precios_plan pp WHERE pp.planes_id = p.id
+                )
+                """
+            )
+        )
+
+    logger.info("Esquema de precios_plan verificado")
 
 
 def _migrate_suscripciones_contract_schema() -> None:
@@ -451,7 +513,7 @@ def _migrate_suscripciones_contract_schema() -> None:
 
 
 def _seed_planes() -> None:
-    """Inserta los planes del contrato si la tabla está vacía o sin slugs."""
+    """Inserta planes y precios iniciales si no hay slugs."""
     with SessionLocal() as session:
         existing = session.execute(
             text("SELECT COUNT(*) FROM planes WHERE slug IS NOT NULL")
@@ -462,7 +524,7 @@ def _seed_planes() -> None:
         seeds = [
             {
                 "nombre": "Gratis", "slug": "gratis", "precio": 0,
-                "precio_mensual": 0, "moneda": "ARS", "periodo": "mes",
+                "moneda": "ARS", "periodo": "mes",
                 "descripcion": "Para probar la herramienta.",
                 "features": '["1 proyecto activo", "Visor 3D y revisión", "Exporta con marca de agua"]',
                 "destacado": False, "activo": True, "orden": 1,
@@ -470,7 +532,7 @@ def _seed_planes() -> None:
             },
             {
                 "nombre": "Pro", "slug": "pro", "precio": 8000,
-                "precio_mensual": 8000, "moneda": "ARS", "periodo": "mes",
+                "moneda": "ARS", "periodo": "mes",
                 "descripcion": "Para uso profesional.",
                 "features": '["Proyectos ilimitados", "Exporta sin marca de agua", "Instructivo de armado", "Soporte prioritario"]',
                 "destacado": True, "activo": True, "orden": 2,
@@ -478,7 +540,7 @@ def _seed_planes() -> None:
             },
             {
                 "nombre": "Estudio", "slug": "estudio", "precio": 20000,
-                "precio_mensual": 20000, "moneda": "ARS", "periodo": "mes",
+                "moneda": "ARS", "periodo": "mes",
                 "descripcion": "Para equipos y estudios.",
                 "features": '["Todo lo de Pro", "Múltiples usuarios", "Prioridad de cómputo", "Facturación por equipo"]',
                 "destacado": False, "activo": True, "orden": 3,
@@ -486,16 +548,31 @@ def _seed_planes() -> None:
             },
         ]
         for s in seeds:
-            session.execute(
-                text("""
-                    INSERT INTO planes (nombre, slug, precio, precio_mensual, moneda, periodo,
-                                        descripcion, features, destacado, activo, orden,
+            plan_row = session.execute(
+                text(
+                    """
+                    INSERT INTO planes (nombre, slug, descripcion, features, destacado, activo, orden,
                                         limite_almacenamiento_mb, limite_proyectos)
-                    VALUES (:nombre, :slug, :precio, :precio_mensual, :moneda, :periodo,
-                            :descripcion, CAST(:features AS jsonb), :destacado, :activo, :orden,
-                            :limite_almacenamiento_mb, :limite_proyectos)
-                """),
-                s,
+                    VALUES (:nombre, :slug, :descripcion, CAST(:features AS jsonb), :destacado, :activo,
+                            :orden, :limite_almacenamiento_mb, :limite_proyectos)
+                    RETURNING id
+                    """
+                ),
+                {k: v for k, v in s.items() if k not in ("precio", "moneda", "periodo")},
+            ).fetchone()
+            session.execute(
+                text(
+                    """
+                    INSERT INTO precios_plan (precio, moneda, periodo, planes_id)
+                    VALUES (:precio, :moneda, :periodo, :planes_id)
+                    """
+                ),
+                {
+                    "precio": s["precio"],
+                    "moneda": s["moneda"],
+                    "periodo": s["periodo"],
+                    "planes_id": plan_row[0],
+                },
             )
         session.commit()
         logger.info("Seed: %d planes insertados", len(seeds))
@@ -551,13 +628,9 @@ class Plan(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     nombre = Column(String, nullable=False)
-    precio = Column(Numeric(10, 2), nullable=False)
     limite_almacenamiento_mb = Column(Integer, nullable=True)
     limite_proyectos = Column(Integer, nullable=True)
-    slug = Column(String, unique=True, nullable=True)
-    precio_mensual = Column(Numeric(10, 2), nullable=True)
-    moneda = Column(String, default="ARS")
-    periodo = Column(String, default="mes")
+    slug = Column(String, unique=True, nullable=True)  
     descripcion = Column(String, default="")
     features = Column(JSONB, default=list)
     destacado = Column(Boolean, default=False)
@@ -567,6 +640,19 @@ class Plan(Base):
     # Relaciones
     suscripciones = relationship("Suscripcion", back_populates="plan")
     cupones = relationship("Cupon", back_populates="plan")
+    precios = relationship("PrecioPlan", back_populates="plan", cascade="all, delete-orphan")
+
+
+class PrecioPlan(Base):
+    __tablename__ = 'precios_plan'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    precio = Column(Numeric(10, 2), nullable=False)
+    moneda = Column(String, default="ARS")
+    periodo = Column(String, default="mes")
+    planes_id = Column(Integer, ForeignKey('planes.id', ondelete='RESTRICT'), nullable=False)
+
+    plan = relationship("Plan", back_populates="precios")
 
 
 class Suscripcion(Base):
