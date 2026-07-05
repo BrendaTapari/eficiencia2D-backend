@@ -287,20 +287,93 @@ def _migrate_usuario_password_reset_schema() -> None:
 
 
 def _migrate_usuario_rol_schema() -> None:
-    """Agrega columna rol en usuarios si aún no existe."""
-    statements = (
+    """Migra roles legacy (columna VARCHAR) a tabla rol + usuarios.rol_id."""
+    bootstrap = (
         """
-        ALTER TABLE usuarios
-        ADD COLUMN IF NOT EXISTS rol VARCHAR NOT NULL DEFAULT 'estudiante'
+        CREATE TABLE IF NOT EXISTS rol (
+            id SERIAL PRIMARY KEY,
+            rol VARCHAR NOT NULL UNIQUE
+        )
         """,
         """
-        UPDATE usuarios SET rol = 'estudiante' WHERE rol IS NULL
+        INSERT INTO rol (id, rol) VALUES (1, 'estudiante')
+        ON CONFLICT (id) DO NOTHING
+        """,
+        """
+        INSERT INTO rol (id, rol) VALUES (2, 'admin')
+        ON CONFLICT (id) DO NOTHING
+        """,
+        """
+        ALTER TABLE usuarios
+        ADD COLUMN IF NOT EXISTS rol_id INTEGER
         """,
     )
     with engine.begin() as conn:
-        for sql in statements:
+        for sql in bootstrap:
             conn.execute(text(sql))
-    logger.info("Esquema de rol en usuarios verificado")
+
+        legacy_rol = conn.execute(
+            text(
+                """
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'usuarios'
+                  AND column_name = 'rol'
+                """
+            )
+        ).fetchone()
+
+        if legacy_rol:
+            conn.execute(
+                text(
+                    """
+                    UPDATE usuarios u
+                    SET rol_id = r.id
+                    FROM rol r
+                    WHERE u.rol_id IS NULL
+                      AND LOWER(u.rol::text) = LOWER(r.rol)
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    UPDATE usuarios
+                    SET rol_id = 2
+                    WHERE rol_id IS NULL AND LOWER(rol::text) = 'admin'
+                    """
+                )
+            )
+            conn.execute(text("ALTER TABLE usuarios DROP COLUMN rol"))
+
+        finalize = (
+            """
+            UPDATE usuarios SET rol_id = 1 WHERE rol_id IS NULL
+            """,
+            """
+            ALTER TABLE usuarios ALTER COLUMN rol_id SET DEFAULT 1
+            """,
+            """
+            ALTER TABLE usuarios ALTER COLUMN rol_id SET NOT NULL
+            """,
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint WHERE conname = 'fk_usuarios_rol'
+                ) THEN
+                    ALTER TABLE usuarios
+                    ADD CONSTRAINT fk_usuarios_rol
+                    FOREIGN KEY (rol_id) REFERENCES rol (id);
+                END IF;
+            END $$
+            """,
+        )
+        for sql in finalize:
+            conn.execute(text(sql))
+
+    logger.info("Esquema de roles (tabla rol + usuarios.rol_id) verificado")
 
 
 def _migrate_cupones_schema() -> None:
@@ -454,13 +527,20 @@ class Usuario(Base):
     email_verified_at = Column(DateTime(timezone=True), nullable=True)
     password_reset_token = Column(String(64), nullable=True, unique=True)
     password_reset_expires_at = Column(DateTime(timezone=True), nullable=True)
-    rol = Column(String, nullable=False, default='estudiante', server_default='estudiante')
+    rol_id = Column(
+        Integer,
+        ForeignKey('rol.id', ondelete='RESTRICT'),
+        nullable=False,
+        default=1,
+        server_default='1',
+    )
 
     # Relaciones
     suscripcion = relationship("Suscripcion", back_populates="usuario", uselist=False) # Relación 1 a 1
     proyectos = relationship("Proyecto", back_populates="usuario")
     pagos = relationship("Pago", back_populates="usuario")
     usos_cupon = relationship("UsoCupon", back_populates="usuario")
+    rol = relationship("Rol", back_populates="usuarios")
     configuracion_usuario = relationship(
         "ConfiguracionUsuario", back_populates="usuario", uselist=False
     )
@@ -598,4 +678,6 @@ class Rol(Base):
     __tablename__ = 'rol'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    rol = Column(String, nullable=False)
+    rol = Column(String, nullable=False, unique=True)
+
+    usuarios = relationship("Usuario", back_populates="rol")

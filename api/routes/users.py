@@ -5,7 +5,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPExcepti
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from api.deps import get_current_user
 from api.routes.projects import (
@@ -14,25 +14,12 @@ from api.routes.projects import (
     create_proyecto_for_user,
     list_proyectos_for_user,
 )
+from api.schemas.rol import RolResponse, user_rol_fields
 from core.security import hash_password, verify_password
 from database import Proyecto, Usuario, get_db
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-
-DEFAULT_ROL_ID = 1
-ADMIN_ROL_ID = 2
-
-
-def _rol_id_for(user: Usuario) -> int:
-    """Resuelve rol_id aunque la columna aún no exista en todos los entornos."""
-    rol_id = getattr(user, "rol_id", None)
-    if isinstance(rol_id, int):
-        return rol_id
-    rol = (user.rol or "estudiante").strip().lower()
-    if rol == "admin":
-        return ADMIN_ROL_ID
-    return DEFAULT_ROL_ID
 
 
 class UserProfileResponse(BaseModel):
@@ -40,11 +27,11 @@ class UserProfileResponse(BaseModel):
     email: str
     nombre: str | None
     estado: str
-    rol: str
+    rol_id: int
+    rol: RolResponse
     fecha_creacion: str
     email_verified_at: str | None
     total_proyectos: int
-    rol_id: int
 
 
 class UpdateUserRequest(BaseModel):
@@ -62,19 +49,32 @@ class ChangePasswordResponse(BaseModel):
 
 def _user_profile(db: Session, user: Usuario) -> UserProfileResponse:
     total_proyectos = db.query(Proyecto).filter(Proyecto.usuario_id == user.id).count()
+    rol_id, rol_name = user_rol_fields(user)
     return UserProfileResponse(
         id=str(user.id),
         email=user.email,
         nombre=user.nombre,
         estado=user.estado,
-        rol=user.rol,
+        rol_id=rol_id,
+        rol=RolResponse(id=rol_id, rol=rol_name),
         fecha_creacion=user.fecha_creacion.isoformat(),
         email_verified_at=(
             user.email_verified_at.isoformat() if user.email_verified_at else None
         ),
         total_proyectos=total_proyectos,
-        rol_id=_rol_id_for(user),
     )
+
+
+def _load_user_with_rol(db: Session, user_id: UUID) -> Usuario:
+    user = (
+        db.query(Usuario)
+        .options(joinedload(Usuario.rol))
+        .filter(Usuario.id == user_id)
+        .first()
+    )
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuario no encontrado")
+    return user
 
 
 @router.get("/users/me", response_model=UserProfileResponse)
@@ -82,7 +82,8 @@ def get_my_profile(
     current_user: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    return _user_profile(db, current_user)
+    user = _load_user_with_rol(db, current_user.id)
+    return _user_profile(db, user)
 
 
 @router.patch("/users/me", response_model=UserProfileResponse)
@@ -102,7 +103,8 @@ def update_my_profile(
             detail="No se pudo actualizar el perfil",
         ) from None
     db.refresh(current_user)
-    return _user_profile(db, current_user)
+    user = _load_user_with_rol(db, current_user.id)
+    return _user_profile(db, user)
 
 
 @router.patch("/users/me/password", response_model=ChangePasswordResponse)

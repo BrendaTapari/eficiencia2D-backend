@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from api.deps import get_current_user
+from api.schemas.rol import DEFAULT_ROL_ID, RolResponse, user_rol_fields
 from core.security import create_access_token, hash_password, verify_password
 from database import ConfiguracionUsuario, Usuario, get_db
 from database.database import get_db_config_status
@@ -49,7 +50,8 @@ class UserResponse(BaseModel):
     email: str
     nombre: str | None
     estado: str
-    rol: str
+    rol_id: int
+    rol: RolResponse
 
 
 class AuthResponse(BaseModel):
@@ -94,12 +96,14 @@ class ResetPasswordResponse(BaseModel):
 
 
 def _user_to_response(user: Usuario) -> UserResponse:
+    rol_id, rol_name = user_rol_fields(user)
     return UserResponse(
         id=str(user.id),
         email=user.email,
         nombre=user.nombre,
         estado=user.estado,
-        rol=user.rol,
+        rol_id=rol_id,
+        rol=RolResponse(id=rol_id, rol=rol_name),
     )
 
 
@@ -163,6 +167,7 @@ async def register(
         nombre=body.nombre.strip() if body.nombre else None,
         estado=ESTADO_PENDIENTE,
         email_verification_token=verification_token,
+        rol_id=DEFAULT_ROL_ID,
     )
     config = ConfiguracionUsuario(usuario=user)
 

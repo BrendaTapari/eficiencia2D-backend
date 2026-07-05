@@ -2,8 +2,9 @@ from uuid import UUID
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
+from api.schemas.rol import is_admin_user
 from core.security import decode_access_token
 from database import Usuario, get_db
 
@@ -38,7 +39,12 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         ) from exc
 
-    user = db.get(Usuario, user_uuid)
+    user = (
+        db.query(Usuario)
+        .options(joinedload(Usuario.rol))
+        .filter(Usuario.id == user_uuid)
+        .first()
+    )
     if user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -62,7 +68,7 @@ def get_current_user(
 
 
 def get_admin_user(current_user: Usuario = Depends(get_current_user)) -> Usuario:
-    if current_user.rol != "admin":
+    if not is_admin_user(current_user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Se requiere rol de administrador",
