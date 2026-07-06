@@ -227,73 +227,93 @@ def _panel_polygon(width_m: float, height_m: float, edges: List[Edge2D]) -> Poly
 
 
 def _kerf_slots(width_m: float, height_m: float, spec: FlexSpec) -> List[BaseGeometry]:
-    """Living hinge: columnas de RANURAS RECTAS (líneas de corte) interrumpidas por
-    puentes (ligamentos), alternadas en patrón brick entre columnas contiguas.
+    """Living hinge por REMOCIÓN de ranuras rectangulares (huecos), peine interdigitado.
 
-    Cada ranura es una LÍNEA (el corte del láser; su propio ancho es el kerf físico).
-    La distancia entre columnas (`spacing`) fija el radio de doblez; los puentes de
-    `ligament` mantienen la integridad de la plancha. Es el patrón de las fotos de
-    referencia: cortes paralelos discontinuos que dejan flexar el MDF/cartón.
+    El kerf bending real NO es un trazo: se REMUEVE material. Cada columna es un
+    rectángulo abierto (hueco) que se corta y cae; el diente (`ligament`) entre columnas
+    mantiene la integridad y el puente en un extremo (alternado por columna) forma la
+    bisagra viva tipo acordeón. El sheet flexa alrededor del eje paralelo a las ranuras.
+
+    - `pitch = spacing` (distancia entre columnas; única variable del usuario).
+    - `slot_w = spacing − ligament` → al AUMENTAR spacing, el hueco se ensancha (se
+      remueve más material). Coincide con la referencia física (pitch 3 mm, diente
+      1.8 mm ⇒ ranura 1.2 mm).
+    - Largo de ranura = alto de banda − puente; puente ≈12% del largo, alternando el
+      extremo (columna par: puente arriba; impar: puente abajo).
     """
     spacing = spec.spacing_m
     ligament = spec.ligament_m
-    # Longitud de cada ranura recta; el puente entre ranuras consecutivas = ligament.
-    slit_len = max(spacing * 2.5, ligament * 4.0)
-    period = slit_len + ligament  # paso vertical (ranura + puente)
+    slot_w = max(spacing - ligament, spacing * 0.25)  # ancho del hueco (crece con spacing)
 
-    lines: List[BaseGeometry] = []
-    u = spacing
+    band = height_m - 2.0 * EDGE_MARGIN
+    if band <= 0 or slot_w <= 0:
+        return []
+    bridge = min(max(band * 0.12, 0.002), band * 0.4)  # puente ~12% del largo
+    slot_len = band - bridge
+    if slot_len <= slot_w:
+        return []
+
+    slots: List[BaseGeometry] = []
+    u = EDGE_MARGIN + spacing / 2.0
     col = 0
-    while u < width_m - EDGE_MARGIN:
-        # Brick: las columnas impares arrancan medio período más abajo, de modo que
-        # los puentes de una columna caen frente a las ranuras de la vecina.
-        offset = (period / 2.0) if (col % 2) else 0.0
-        v = EDGE_MARGIN + offset
-        while v < height_m - EDGE_MARGIN:
-            v_end = min(v + slit_len, height_m - EDGE_MARGIN)
-            if v_end - v > 1e-4:
-                lines.append(LineString([(u, v), (u, v_end)]))
-            v = v_end + ligament
+    while u <= width_m - EDGE_MARGIN:
+        # Puente alternado: columna par arriba (ranura desde el margen inferior),
+        # impar abajo (ranura hasta el margen superior). Peine interdigitado.
+        if col % 2 == 0:
+            v0 = EDGE_MARGIN
+            v1 = EDGE_MARGIN + slot_len
+        else:
+            v1 = height_m - EDGE_MARGIN
+            v0 = v1 - slot_len
+        slots.append(
+            Polygon(
+                [
+                    (u - slot_w / 2.0, v0),
+                    (u + slot_w / 2.0, v0),
+                    (u + slot_w / 2.0, v1),
+                    (u - slot_w / 2.0, v1),
+                ]
+            )
+        )
         u += spacing
         col += 1
-    return lines
+    return slots
 
 
 def _auxetic_rotating(width_m: float, height_m: float, spec: FlexSpec) -> List[BaseGeometry]:
-    """Cuadrados rotatorios: rejilla de ranuras diagonales con bisagras en las esquinas.
+    """Cuadrados rotatorios por REMOCIÓN de celdas: huecos rómbicos (cuadrados a 45°) en
+    grilla de pitch `spacing`, dejando ligamentos en las esquinas que actúan de bisagra.
 
-    Se cortan segmentos a lo largo de las diagonales de cada celda dejando un ligamento
-    en el centro de cada arista compartida (la bisagra). El material forma cuadrados que
-    rotan al traccionar → Poisson negativo.
+    Al remover los rombos, el material restante forma cuadrados unidos por las esquinas
+    que rotan al traccionar → Poisson negativo (auxético). No son líneas: son huecos.
     """
     p = spec.spacing_m
     lig = spec.ligament_m
-    lines: List[BaseGeometry] = []
-    half = p / 2.0
+    half_diag = max((p - lig) / 2.0, p * 0.15)  # media diagonal del rombo removido
+    holes: List[BaseGeometry] = []
     nx = int((width_m - 2 * EDGE_MARGIN) // p)
     ny = int((height_m - 2 * EDGE_MARGIN) // p)
     if nx < 1 or ny < 1:
-        return lines
+        return holes
     ox = (width_m - nx * p) / 2.0
     oy = (height_m - ny * p) / 2.0
 
     for j in range(ny):
         for i in range(nx):
-            cx = ox + i * p + half
-            cy = oy + j * p + half
-            # Dos diagonales de la celda, con hueco de bisagra (gap) en el centro.
-            checker = (i + j) % 2 == 0
-            gap = min(lig / 2.0, half * 0.4)   # media abertura de la bisagra central
-            d = half - gap                      # la ranura llega casi hasta la esquina
-            if d <= gap:
-                continue
-            if checker:
-                lines.append(LineString([(cx - d, cy - d), (cx - gap, cy - gap)]))
-                lines.append(LineString([(cx + gap, cy + gap), (cx + d, cy + d)]))
-            else:
-                lines.append(LineString([(cx - d, cy + d), (cx - gap, cy + gap)]))
-                lines.append(LineString([(cx + gap, cy - gap), (cx + d, cy - d)]))
-    return lines
+            cx = ox + i * p + p / 2.0
+            cy = oy + j * p + p / 2.0
+            # Rombo (cuadrado rotado 45°) centrado en la celda.
+            holes.append(
+                Polygon(
+                    [
+                        (cx, cy - half_diag),
+                        (cx + half_diag, cy),
+                        (cx, cy + half_diag),
+                        (cx - half_diag, cy),
+                    ]
+                )
+            )
+    return holes
 
 
 def _auxetic_reentrant(width_m: float, height_m: float, spec: FlexSpec) -> List[BaseGeometry]:
@@ -427,20 +447,27 @@ def apply_flex_to_panel(
     if gen is None:
         return []
 
-    # Clamp de densidad: acota el número de primitivas subiendo el spacing efectivo.
-    approx = (width_m * height_m) / (spec.spacing_m * spec.spacing_m)
-    if approx > MAX_PRIMITIVES:
-        eff = math.sqrt((width_m * height_m) / MAX_PRIMITIVES)
-        log.info(
-            "flex: panel %.2fx%.2fm con spacing %.4f generaría ~%d primitivas; "
-            "spacing efectivo elevado a %.4f",
-            width_m, height_m, spec.spacing_m, int(approx), eff,
-        )
-        spec = replace(spec, spacing_m=eff, ligament_m=min(spec.ligament_m, eff * 0.8))
-
     raw = gen(width_m, height_m, spec)
     if not raw:
         return []
+
+    # Clamp de densidad POR CONTEO REAL: si el patrón excede el tope de primitivas
+    # (agnóstico al método), sube el spacing efectivo y regenera una vez. Evita que un
+    # panel grande con spacing chico produzca un DXF/preview inmanejable.
+    if len(raw) > MAX_PRIMITIVES:
+        factor = math.sqrt(len(raw) / MAX_PRIMITIVES)
+        eff = spec.spacing_m * factor
+        log.info(
+            "flex: panel %.2fx%.2fm método %s spacing %.4f generó %d primitivas; "
+            "spacing efectivo elevado a %.4f",
+            width_m, height_m, spec.method, spec.spacing_m, len(raw), eff,
+        )
+        spec = replace(
+            spec, spacing_m=eff, ligament_m=min(spec.ligament_m, eff * 0.8)
+        )
+        raw = gen(width_m, height_m, spec)
+        if not raw:
+            return []
 
     geom = unary_union(raw)
 
