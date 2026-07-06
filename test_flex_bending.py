@@ -56,6 +56,39 @@ def test_kerf_smaller_spacing_more_slots():
     assert n_small > n_big > 0
 
 
+def test_kerf_removes_rectangular_holes():
+    """v2: el kerf REMUEVE ranuras rectangulares (huecos cerrados), no líneas."""
+    from shapely.geometry import Polygon as _P
+
+    from core.services.flex_bending import FlexSpec, _kerf_slots
+
+    spec = FlexSpec(group_id=1, method="kerf", spacing_m=0.03, ligament_m=0.012)
+    slots = _kerf_slots(0.6, 0.4, spec)
+    assert slots, "kerf debe generar huecos"
+    assert all(isinstance(s, _P) and s.area > 0 for s in slots), "deben ser rectángulos cerrados"
+
+
+def test_kerf_wider_spacing_removes_more_material():
+    """v2: al aumentar spacing la ranura se ensancha (slot_w = spacing − ligament)."""
+    from core.services.flex_bending import FlexSpec, _kerf_slots
+
+    lig = 0.012
+    s3 = _kerf_slots(0.6, 0.4, FlexSpec(1, "kerf", 0.03, lig))
+    s5 = _kerf_slots(0.6, 0.4, FlexSpec(1, "kerf", 0.05, lig))
+    width = lambda s: s.bounds[2] - s.bounds[0]
+    assert width(s5[0]) > width(s3[0]), "más spacing ⇒ ranura más ancha"
+
+
+def test_auxetic_rotating_removes_cells():
+    """v2: los auxéticos también REMUEVEN celdas (huecos), no líneas."""
+    from shapely.geometry import Polygon as _P
+
+    from core.services.flex_bending import FlexSpec, _auxetic_rotating
+
+    holes = _auxetic_rotating(0.4, 0.4, FlexSpec(1, "auxetic_rotating", 0.03, 0.008))
+    assert holes and all(isinstance(h, _P) and h.area > 0 for h in holes)
+
+
 def test_each_method_produces_clipped_flex_edges():
     w, h, edges = _rect_panel(0.6, 0.4)
     for method in ("kerf", "auxetic_rotating", "auxetic_reentrant", "auxetic_chiral"):
