@@ -191,8 +191,16 @@ def _edges_to_rings(edges: List[Edge2D]) -> List[List[Tuple[float, float]]]:
     return rings
 
 
-def _panel_polygon(width_m: float, height_m: float, edges: List[Edge2D]) -> Polygon:
-    """Polígono del panel; usa el contorno real si se puede reconstruir, si no el bbox."""
+def _panel_polygon(width_m: float, height_m: float, edges: List[Edge2D]):
+    """Polígono(s) del MATERIAL real del panel: soporta VARIAS piezas separadas
+    (paredes distintas de un grupo fusionado) y aberturas (ventanas/puertas).
+
+    El patrón de flexión se recorta a este material → nunca cae en los huecos entre
+    paredes ni sobre las aberturas ("exclusivamente dentro de los bordes de las paredes").
+    Clasifica los anillos por regla par-impar (un anillo contenido en un nº impar de
+    anillos mayores es hueco; par es isla/material). Fallback al bbox sólo si no se
+    puede reconstruir nada.
+    """
     rings = _edges_to_rings(edges)
     polys: List[Polygon] = []
     for ring in rings:
@@ -202,23 +210,44 @@ def _panel_polygon(width_m: float, height_m: float, edges: List[Edge2D]) -> Poly
             p = Polygon(ring)
             if not p.is_valid:
                 p = make_valid(p)
-            if p.area > 1e-6:
-                polys.append(p if isinstance(p, Polygon) else None)  # type: ignore
+            if getattr(p, "area", 0) > 1e-6 and isinstance(p, Polygon):
+                polys.append(p)
         except Exception:
             continue
-    polys = [p for p in polys if p is not None and not p.is_empty]
-    if polys:
-        # El anillo de mayor área es el exterior; los interiores son huecos.
-        polys.sort(key=lambda p: p.area, reverse=True)
-        outer = polys[0]
-        for hole in polys[1:]:
+    polys = [p for p in polys if not p.is_empty]
+    if not polys:
+        return Polygon([(0, 0), (width_m, 0), (width_m, height_m), (0, height_m)])
+
+    polys.sort(key=lambda p: p.area, reverse=True)  # mayores primero
+    islands: List[dict] = []  # {'outer': Polygon, 'holes': [Polygon,...]}
+    for i, p in enumerate(polys):
+        rp = p.representative_point()
+        depth = sum(1 for q in polys[:i] if q.contains(rp))  # anillos mayores que lo contienen
+        if depth % 2 == 0:
+            islands.append({"outer": p, "holes": []})       # material (isla)
+        else:
+            # hueco: asignarlo a la isla más chica que lo contiene
+            for isl in reversed(islands):
+                if isl["outer"].contains(rp):
+                    isl["holes"].append(p)
+                    break
+
+    built: List[Polygon] = []
+    for isl in islands:
+        poly = isl["outer"]
+        for hole in isl["holes"]:
             try:
-                outer = outer.difference(hole)
+                poly = poly.difference(hole)
             except Exception:
                 pass
-        if isinstance(outer, (Polygon, MultiPolygon)) and not outer.is_empty:
-            return outer  # type: ignore[return-value]
-    return Polygon([(0, 0), (width_m, 0), (width_m, height_m), (0, height_m)])
+        if not poly.is_empty:
+            built.append(poly)
+    if not built:
+        return Polygon([(0, 0), (width_m, 0), (width_m, height_m), (0, height_m)])
+    material = unary_union(built)
+    return material if not material.is_empty else Polygon(
+        [(0, 0), (width_m, 0), (width_m, height_m), (0, height_m)]
+    )
 
 
 # ---------------------------------------------------------------------------
