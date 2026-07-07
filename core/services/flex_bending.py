@@ -34,8 +34,9 @@ from shapely.geometry import (
     MultiPolygon,
     Polygon,
 )
+from shapely.geometry import Point
 from shapely.geometry.base import BaseGeometry
-from shapely.ops import unary_union
+from shapely.ops import polygonize, unary_union
 from shapely.validation import make_valid
 
 from core.services.cutting_sheet import Edge2D
@@ -191,63 +192,59 @@ def _edges_to_rings(edges: List[Edge2D]) -> List[List[Tuple[float, float]]]:
     return rings
 
 
+def _bbox(width_m: float, height_m: float) -> Polygon:
+    return Polygon([(0, 0), (width_m, 0), (width_m, height_m), (0, height_m)])
+
+
 def _panel_polygon(width_m: float, height_m: float, edges: List[Edge2D]):
     """Polígono(s) del MATERIAL real del panel: soporta VARIAS piezas separadas
     (paredes distintas de un grupo fusionado) y aberturas (ventanas/puertas).
 
     El patrón de flexión se recorta a este material → nunca cae en los huecos entre
     paredes ni sobre las aberturas ("exclusivamente dentro de los bordes de las paredes").
-    Clasifica los anillos por regla par-impar (un anillo contenido en un nº impar de
-    anillos mayores es hueco; par es isla/material). Fallback al bbox sólo si no se
-    puede reconstruir nada.
+
+    Reconstrucción ROBUSTA con shapely: se nodan los segmentos del contorno
+    (`unary_union`) y se arman las caras mínimas (`polygonize`); cada cara es material
+    si está a profundidad IMPAR (regla par-impar) respecto de las caras que la contienen.
+    Esto tolera contornos escalonados/en L, colineales y auto-contactos que el trazado
+    manual de anillos podía no cerrar (cayendo antes al bbox y desbordando el patrón).
     """
-    rings = _edges_to_rings(edges)
-    polys: List[Polygon] = []
-    for ring in rings:
-        if len(ring) < 3:
+    segs = []
+    for e in edges:
+        if getattr(e, "score", False) or getattr(e, "joint", False) or getattr(e, "flex", False):
             continue
+        if (e.a.x - e.b.x) ** 2 + (e.a.y - e.b.y) ** 2 > 1e-12:
+            segs.append(LineString([(e.a.x, e.a.y), (e.b.x, e.b.y)]))
+    if not segs:
+        return _bbox(width_m, height_m)
+
+    try:
+        faces = list(polygonize(unary_union(segs)))
+    except Exception:
+        faces = []
+    faces = [f for f in faces if not f.is_empty and f.area > 1e-6]
+    if not faces:
+        return _bbox(width_m, height_m)
+
+    # Anillos exteriores de todas las caras → clasificación par-impar por contención.
+    ring_polys = []
+    for f in faces:
         try:
-            p = Polygon(ring)
-            if not p.is_valid:
-                p = make_valid(p)
-            if getattr(p, "area", 0) > 1e-6 and isinstance(p, Polygon):
-                polys.append(p)
+            ring_polys.append(Polygon(f.exterior.coords))
         except Exception:
-            continue
-    polys = [p for p in polys if not p.is_empty]
-    if not polys:
-        return Polygon([(0, 0), (width_m, 0), (width_m, height_m), (0, height_m)])
+            ring_polys.append(f)
 
-    polys.sort(key=lambda p: p.area, reverse=True)  # mayores primero
-    islands: List[dict] = []  # {'outer': Polygon, 'holes': [Polygon,...]}
-    for i, p in enumerate(polys):
-        rp = p.representative_point()
-        depth = sum(1 for q in polys[:i] if q.contains(rp))  # anillos mayores que lo contienen
-        if depth % 2 == 0:
-            islands.append({"outer": p, "holes": []})       # material (isla)
-        else:
-            # hueco: asignarlo a la isla más chica que lo contiene
-            for isl in reversed(islands):
-                if isl["outer"].contains(rp):
-                    isl["holes"].append(p)
-                    break
+    material_faces = []
+    for f in faces:
+        rp = f.representative_point()
+        depth = sum(1 for rpoly in ring_polys if rpoly.contains(rp))
+        if depth % 2 == 1:            # profundidad impar = material (las caras ya traen sus huecos)
+            material_faces.append(f)
+    if not material_faces:
+        return _bbox(width_m, height_m)
 
-    built: List[Polygon] = []
-    for isl in islands:
-        poly = isl["outer"]
-        for hole in isl["holes"]:
-            try:
-                poly = poly.difference(hole)
-            except Exception:
-                pass
-        if not poly.is_empty:
-            built.append(poly)
-    if not built:
-        return Polygon([(0, 0), (width_m, 0), (width_m, height_m), (0, height_m)])
-    material = unary_union(built)
-    return material if not material.is_empty else Polygon(
-        [(0, 0), (width_m, 0), (width_m, height_m), (0, height_m)]
-    )
+    material = unary_union(material_faces)
+    return material if not material.is_empty else _bbox(width_m, height_m)
 
 
 # ---------------------------------------------------------------------------
