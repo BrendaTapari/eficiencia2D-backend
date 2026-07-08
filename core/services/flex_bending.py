@@ -62,6 +62,7 @@ class FlexSpec:
     ligament_m: float = DEFAULT_LIGAMENT
     kerf_width_m: float = DEFAULT_KERF_WIDTH
     axis_deg: float = 0.0
+    direction: str = "vertical"  # "vertical" | "horizontal" (elegido por el usuario, kerf)
 
 
 _METHODS = ("kerf", "auxetic_rotating", "auxetic_reentrant", "auxetic_chiral")
@@ -107,6 +108,12 @@ def parse_flex(raw: Optional[List[dict]]) -> List[FlexSpec]:
         except (TypeError, ValueError):
             axis = 0.0
 
+        # Dirección elegida por el usuario (fuente de verdad); axis_deg queda como
+        # compat (0 = horizontal, 90 = vertical). Si no viene direction, se deriva de axis.
+        direction = item.get("direction")
+        if direction not in ("vertical", "horizontal"):
+            direction = "horizontal" if abs(axis) < 45 else "vertical"
+
         out.append(
             FlexSpec(
                 group_id=gid,
@@ -115,6 +122,7 @@ def parse_flex(raw: Optional[List[dict]]) -> List[FlexSpec]:
                 ligament_m=ligament,
                 kerf_width_m=kerf,
                 axis_deg=axis,
+                direction=direction,
             )
         )
     return out
@@ -256,53 +264,61 @@ def _kerf_slots(width_m: float, height_m: float, spec: FlexSpec) -> List[BaseGeo
     """Living hinge por REMOCIÓN de ranuras rectangulares (huecos), peine interdigitado.
 
     El kerf bending real NO es un trazo: se REMUEVE material. Cada columna es un
-    rectángulo abierto (hueco) que se corta y cae; el diente (`ligament`) entre columnas
-    mantiene la integridad y el puente en un extremo (alternado por columna) forma la
-    bisagra viva tipo acordeón. El sheet flexa alrededor del eje paralelo a las ranuras.
+    rectángulo abierto (hueco); el diente (`ligament`) entre columnas mantiene la
+    integridad y el puente en un extremo (alternado por columna) forma la bisagra viva.
 
-    - `pitch = spacing` (distancia entre columnas; única variable del usuario).
-    - `slot_w = spacing − ligament` → al AUMENTAR spacing, el hueco se ensancha (se
-      remueve más material). Coincide con la referencia física (pitch 3 mm, diente
-      1.8 mm ⇒ ranura 1.2 mm).
-    - Largo de ranura = alto de banda − puente; puente ≈12% del largo, alternando el
-      extremo (columna par: puente arriba; impar: puente abajo).
+    - `pitch = spacing`; `slot_w = spacing − ligament` (al subir spacing, más vacío).
+    - **Dirección** (elegida por el usuario): `"vertical"` ⇒ columnas verticales (ranuras
+      corren en v, avanzan en u); `"horizontal"` ⇒ columnas horizontales (ranuras corren
+      en u, avanzan en v). NO se rota el panel — sólo cambia la orientación de las ranuras.
+    - **Registro**: el patrón se **centra** y arranca/termina con MATERIAL (margen sólido
+      ≥ ligamento en los bordes); la primera y última columna nunca son un hueco al ras.
+    - Largo de ranura = banda − puente; puente ≈12% del largo, alternando el extremo.
     """
     spacing = spec.spacing_m
     ligament = spec.ligament_m
     slot_w = max(spacing - ligament, spacing * 0.25)  # ancho del hueco (crece con spacing)
+    margin = max(ligament, spacing * 0.5, EDGE_MARGIN)  # material sólido en los bordes
 
-    band = height_m - 2.0 * EDGE_MARGIN
-    if band <= 0 or slot_w <= 0:
+    # Ejes según dirección: 'along' = a lo largo de la ranura; 'across' = avance de columnas.
+    horizontal = spec.direction == "horizontal"
+    along = width_m if horizontal else height_m
+    across = width_m if not horizontal else height_m
+
+    band = along - 2.0 * margin
+    usable = across - 2.0 * margin
+    if band <= 0 or usable <= 0 or slot_w <= 0:
         return []
-    bridge = min(max(band * 0.12, 0.002), band * 0.4)  # puente ~12% del largo
+    bridge = min(max(band * 0.12, ligament), band * 0.4)  # puente ~12% del largo
     slot_len = band - bridge
     if slot_len <= slot_w:
         return []
 
+    # Columnas CENTRADAS en 'across' → material simétrico en ambos extremos.
+    ncol = int(usable // spacing) + 1
+    if ncol < 1:
+        return []
+    total = (ncol - 1) * spacing
+    start = (across - total) / 2.0  # ≥ margin por construcción
+
     slots: List[BaseGeometry] = []
-    u = EDGE_MARGIN + spacing / 2.0
-    col = 0
-    while u <= width_m - EDGE_MARGIN:
-        # Puente alternado: columna par arriba (ranura desde el margen inferior),
-        # impar abajo (ranura hasta el margen superior). Peine interdigitado.
+    for col in range(ncol):
+        c = start + col * spacing  # posición de la columna en 'across'
+        # Puente alternado por columna (peine interdigitado).
         if col % 2 == 0:
-            v0 = EDGE_MARGIN
-            v1 = EDGE_MARGIN + slot_len
+            a0, a1 = margin, margin + slot_len
         else:
-            v1 = height_m - EDGE_MARGIN
-            v0 = v1 - slot_len
-        slots.append(
-            Polygon(
-                [
-                    (u - slot_w / 2.0, v0),
-                    (u + slot_w / 2.0, v0),
-                    (u + slot_w / 2.0, v1),
-                    (u - slot_w / 2.0, v1),
-                ]
-            )
-        )
-        u += spacing
-        col += 1
+            a1 = along - margin
+            a0 = a1 - slot_len
+        if horizontal:
+            # across = v (y), along = u (x): ranura horizontal
+            rect = [(a0, c - slot_w / 2), (a1, c - slot_w / 2),
+                    (a1, c + slot_w / 2), (a0, c + slot_w / 2)]
+        else:
+            # across = u (x), along = v (y): ranura vertical
+            rect = [(c - slot_w / 2, a0), (c + slot_w / 2, a0),
+                    (c + slot_w / 2, a1), (c - slot_w / 2, a1)]
+        slots.append(Polygon(rect))
     return slots
 
 
@@ -495,28 +511,42 @@ def apply_flex_to_panel(
         if not raw:
             return []
 
-    geom = unary_union(raw)
+    # El kerf ya se orienta por `direction` en el generador (no se rota el panel). Sólo
+    # los auxéticos admiten rotación libre por axis_deg.
+    if spec.method != "kerf" and abs(spec.axis_deg) > 1e-6:
+        raw = [
+            affinity.rotate(g, spec.axis_deg, origin=(width_m / 2.0, height_m / 2.0),
+                            use_radians=False)
+            for g in raw
+        ]
 
-    # Rotar el patrón por axis_deg alrededor del centro del panel.
-    if abs(spec.axis_deg) > 1e-6:
-        geom = affinity.rotate(
-            geom, spec.axis_deg, origin=(width_m / 2.0, height_m / 2.0), use_radians=False
-        )
-
-    # Recortar al contorno real del panel (respetando huecos y borde), con margen.
+    # Material real del panel (contorno + aberturas + piezas separadas).
     panel = _panel_polygon(width_m, height_m, edges)
+    # Margen sólido en los bordes (≥ ligamento): ninguna ranura toca el contorno.
+    border = max(spec.ligament_m, spec.spacing_m * 0.5, EDGE_MARGIN)
     try:
-        safe = panel.buffer(-EDGE_MARGIN)
+        safe = panel.buffer(-border)
     except Exception:
         safe = panel
     if safe.is_empty:
-        safe = panel
-    try:
-        clipped = geom.intersection(safe)
-    except Exception:
         try:
-            clipped = geom.intersection(panel)
+            safe = panel.buffer(-EDGE_MARGIN)
         except Exception:
-            return []
+            safe = panel
+    if safe.is_empty:
+        safe = panel
 
-    return _geom_to_edges(clipped)
+    # REGISTRO: se conserva cada primitiva SÓLO si entra COMPLETA en el material seguro.
+    # Las que caerían sobre el borde o una abertura se OMITEN (no se truncan) → el
+    # contorno exterior queda intacto y no hay huecos al ras del borde.
+    kept: List[BaseGeometry] = []
+    for g in raw:
+        try:
+            if safe.contains(g):
+                kept.append(g)
+        except Exception:
+            continue
+    if not kept:
+        return []
+
+    return _geom_to_edges(unary_union(kept))
