@@ -26,7 +26,6 @@ from core.services.cutting_sheet import (
 )
 from core.services.plate_intersect import resolve_plate_joints
 from core.services.flex_bending import apply_flex_to_panel, build_flex_by_group, parse_flex
-from core.services.curvature import detect_curvature, unroll
 from core.services.facade_extractor import extract_facades
 from core.services.floor_plan_extractor import extract_floor_plans
 from core.services.joint_detector import detect_joints
@@ -318,66 +317,6 @@ def decompose_panels_from_groups(
                     )
             continue
 
-        # Patrón de flexión (flex): superficies curvas. Si el grupo es curvo se
-        # DESARROLLA a plano (unroll desarrollable / aplanado aproximado) antes de
-        # cortar el patrón; si es plano se usa la proyección normal. Rama aislada
-        # (como user_cuts): se omiten trims de ensamble/encastres. El patrón se corta
-        # en su propia capa (FLEX_CUT). El contorno del panel desarrollado puede ser
-        # mayor que el plano ingenuo → se nestea ese tamaño real.
-        spec = flex_by_group.get(group.id)
-        if spec is not None:
-            fw, fh, base_edges = width_m, height_m, edges
-            info = detect_curvature(faces)
-            if info.curved:
-                dev = unroll(faces, info)
-                if dev is not None:
-                    fw, fh, base_edges = dev.width_m, dev.height_m, dev.edges
-            if fw * fh >= min_area:
-                # spacing/ligament/kerf llegan en METROS DE LA MAQUETA (el material físico
-                # a cortar). El panel acá está en metros del edificio; se escalan por
-                # scale_denom para que, tras el 1/scale_denom del nesting, el patrón tenga
-                # el espaciado físico pedido en la plancha.
-                scale = opts.scale_denom or 1.0
-                spec_m = replace(
-                    spec,
-                    spacing_m=spec.spacing_m * scale,
-                    ligament_m=spec.ligament_m * scale,
-                    kerf_width_m=spec.kerf_width_m * scale,
-                )
-                m_edges = mirror_edges_horizontal(base_edges, fw)
-                m_edges = list(m_edges) + apply_flex_to_panel(fw, fh, m_edges, spec_m)
-                if is_floor:
-                    floor_count += 1
-                    floor_panels.append(
-                        Panel(
-                            id=f"B{floor_count}",
-                            group_name=f"floor_{floor_count}",
-                            category="floor",
-                            floor_index=0,
-                            width_m=fw,
-                            height_m=fh,
-                            edges=m_edges,
-                            source_group_id=group.id,
-                            is_mark=group.id in marks_set,
-                        )
-                    )
-                else:
-                    wall_count += 1
-                    wall_panels.append(
-                        Panel(
-                            id=f"A{wall_count}",
-                            group_name=f"wall_{wall_count}",
-                            category="wall",
-                            floor_index=0,
-                            width_m=fw,
-                            height_m=fh,
-                            edges=m_edges,
-                            source_group_id=group.id,
-                            is_mark=group.id in marks_set,
-                        )
-                    )
-            continue
-
         height_delta = height_adj.get(group.id, 0.0)
         if height_delta < 0 and not is_floor:
             strip = min(-height_delta, height_m - 0.01)
@@ -431,6 +370,23 @@ def decompose_panels_from_groups(
             edges.extend(
                 _slot_edges(width_m - ua, va, width_m - ub, vb, slot_w)
             )
+
+        # Patrón de flexión (flex): se corta DENTRO del panel YA proyectado, trimado y
+        # espejado — es decir, sobre EXACTAMENTE la misma silueta/orientación que sin
+        # flex. Aplicar kerf sólo AGREGA huecos internos; no re-rota ni re-desarrolla el
+        # panel (Problema 1 del contrato v3). spacing/ligament/kerf llegan en metros de
+        # maqueta → se escalan por scale_denom (tras el 1/scale_denom del nesting quedan
+        # con el tamaño físico pedido en la plancha).
+        spec = flex_by_group.get(group.id)
+        if spec is not None:
+            scale = opts.scale_denom or 1.0
+            spec_m = replace(
+                spec,
+                spacing_m=spec.spacing_m * scale,
+                ligament_m=spec.ligament_m * scale,
+                kerf_width_m=spec.kerf_width_m * scale,
+            )
+            edges = list(edges) + apply_flex_to_panel(width_m, height_m, edges, spec_m)
 
         if is_floor:
             floor_count += 1
