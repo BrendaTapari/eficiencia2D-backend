@@ -25,7 +25,12 @@ from core.services.cutting_sheet import (
     project_faces_to_2d,
 )
 from core.services.plate_intersect import resolve_plate_joints
-from core.services.flex_bending import apply_flex_to_panel, build_flex_by_group, parse_flex
+from core.services.flex_bending import (
+    apply_flex_to_panel,
+    apply_mark_lines_to_panel,
+    build_flex_by_group,
+    parse_flex,
+)
 from core.services.facade_extractor import extract_facades
 from core.services.floor_plan_extractor import extract_floor_plans
 from core.services.joint_detector import detect_joints
@@ -188,6 +193,7 @@ def decompose_panels_from_groups(
     plate_joints: Optional[List] = None,
     user_cuts: Optional[List[dict]] = None,
     flex: Optional[List[dict]] = None,
+    mark_lines: Optional[List[dict]] = None,
 ) -> Tuple[List[Panel], List[Panel]]:
     overrides = overrides or {}
     marks_set = set(marks or [])  # ids de grupos cuyas aberturas se graban (no se cortan)
@@ -202,6 +208,26 @@ def decompose_panels_from_groups(
 
     # Patrón de flexión por grupo (flex): un FlexSpec por group_id (kerf / auxético).
     flex_by_group = build_flex_by_group(parse_flex(flex))
+
+    # Líneas de marca rojas por grupo (mark_lines): group_id -> [polilínea, ...] en UV
+    # del panel (metros). Se graban (score/MARK_VECTOR), no cortan.
+    mark_lines_by_group: Dict[int, list] = {}
+    for ml in mark_lines or []:
+        if not isinstance(ml, dict):
+            continue
+        gid = ml.get("group_id")
+        pts = ml.get("points")
+        if gid is None or not isinstance(pts, list) or len(pts) < 2:
+            continue
+        poly = []
+        for p in pts:
+            try:
+                poly.append((float(p[0]), float(p[1])))
+            except (TypeError, ValueError, IndexError):
+                poly = []
+                break
+        if len(poly) >= 2:
+            mark_lines_by_group.setdefault(int(gid), []).append(poly)
 
     # Ranuras de encastre por placa CORTADA (Misión 1): cut_id -> [(P_a, P_b, ancho), ...]
     # en 3D. `ancho` = grosor de la placa cortante (define el ancho de la ranura).
@@ -388,6 +414,12 @@ def decompose_panels_from_groups(
             )
             edges = list(edges) + apply_flex_to_panel(width_m, height_m, edges, spec_m)
 
+        # Líneas de marca ROJAS (grabado/score): se graban sobre el panel ya proyectado,
+        # recortadas al material (contorno + aberturas). No cortan ni cambian la silueta.
+        mlines = mark_lines_by_group.get(group.id)
+        if mlines:
+            edges = list(edges) + apply_mark_lines_to_panel(width_m, height_m, edges, mlines)
+
         if is_floor:
             floor_count += 1
             floor_panels.append(
@@ -458,6 +490,7 @@ def _decompose(
     marks: Optional[List[int]],
     user_cuts: Optional[List[dict]] = None,
     flex: Optional[List[dict]] = None,
+    mark_lines: Optional[List[dict]] = None,
 ) -> Tuple[Phase1Result, List[Panel], List[Panel], List]:
     """Aplica merges, resuelve encastres 3D y descompone a paneles 2D."""
     work = apply_merges(phase1, merges or [])
@@ -465,7 +498,8 @@ def _decompose(
     # topología final (post-merges), antes de proyectar.
     plate_joints = resolve_plate_joints(work.groups, work.faces)
     wall_panels, floor_panels = decompose_panels_from_groups(
-        work, opts, overrides, wall_wall_decisions, marks, plate_joints, user_cuts, flex
+        work, opts, overrides, wall_wall_decisions, marks, plate_joints,
+        user_cuts, flex, mark_lines,
     )
     return work, wall_panels, floor_panels, plate_joints
 
@@ -530,10 +564,12 @@ def compute_nesting(
     marks: Optional[List[int]] = None,
     user_cuts: Optional[List[dict]] = None,
     flex: Optional[List[dict]] = None,
+    mark_lines: Optional[List[dict]] = None,
 ) -> Tuple[Phase1Result, NestingResult, NestingResult, SheetConfig, Dict[int, str], List]:
     """Descompone y anida paneles. Compartido por /generate y /nesting-preview."""
     work, wall_panels, floor_panels, plate_joints = _decompose(
-        phase1, opts, overrides, wall_wall_decisions, merges, marks, user_cuts, flex
+        phase1, opts, overrides, wall_wall_decisions, merges, marks,
+        user_cuts, flex, mark_lines,
     )
 
     sc = opts.sheet_config
@@ -584,9 +620,11 @@ def generate_from_review(
     marks: Optional[List[int]] = None,
     user_cuts: Optional[List[dict]] = None,
     flex: Optional[List[dict]] = None,
+    mark_lines: Optional[List[dict]] = None,
 ) -> List[OutputFile]:
     work, wall_nesting, floor_nesting, sheet_cfg, _, _ = compute_nesting(
-        phase1, opts, overrides, wall_wall_decisions, merges, marks, user_cuts, flex
+        phase1, opts, overrides, wall_wall_decisions, merges, marks,
+        user_cuts, flex, mark_lines,
     )
     scale = opts.scale_denom
     stem = work.stem
