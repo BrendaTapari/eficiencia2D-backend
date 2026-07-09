@@ -148,6 +148,7 @@ def _serialize_nesting_panel(p) -> Dict:
                 "hole": e.hole,
                 "joint": getattr(e, "joint", False),
                 "flex": getattr(e, "flex", False),
+                "score": getattr(e, "score", False),
             }
             for e in p.edges
         ],
@@ -412,6 +413,7 @@ class GenerateRequest(BaseModel):
     marks: Optional[List[int]] = None  # ids de componentes cuyas aberturas se graban
     user_cuts: Optional[List] = None  # reservado: corte manual futuro
     flex: Optional[List[dict]] = None  # patrón de flexión por grupo (kerf / auxético)
+    mark_lines: Optional[List[dict]] = None  # polilíneas rojas a grabar (score) por grupo
 
 
 class RecomputeRequest(BaseModel):
@@ -437,6 +439,7 @@ class NestingPreviewRequest(BaseModel):
     marks: Optional[List[int]] = None
     user_cuts: Optional[List[dict]] = None
     flex: Optional[List[dict]] = None  # patrón de flexión por grupo (kerf / auxético)
+    mark_lines: Optional[List[dict]] = None  # polilíneas rojas a grabar (score) por grupo
     sheet_config: Optional[SheetConfigModel] = None
     scale_denom: float = 50.0
     paper: str = "A4"
@@ -699,6 +702,7 @@ async def generate_pdf_endpoint(
                 marks=request.marks,
                 user_cuts=request.user_cuts,
                 flex=request.flex,
+                mark_lines=request.mark_lines,
             )
 
         if not files:
@@ -835,6 +839,7 @@ async def nesting_preview_endpoint(
                 marks=request.marks,
                 user_cuts=request.user_cuts,
                 flex=request.flex,
+                mark_lines=request.mark_lines,
             )
 
         timer.report()
