@@ -550,3 +550,57 @@ def apply_flex_to_panel(
         return []
 
     return _geom_to_edges(unary_union(kept))
+
+
+# ---------------------------------------------------------------------------
+# Líneas de marca ROJAS arbitrarias (grabado / score, NO corte)
+# ---------------------------------------------------------------------------
+
+
+def _linestring_to_score_edges(geom: BaseGeometry) -> List[Edge2D]:
+    out: List[Edge2D] = []
+    if geom.is_empty:
+        return out
+    gt = geom.geom_type
+    if gt == "LineString":
+        cs = list(geom.coords)
+        for i in range(len(cs) - 1):
+            out.append(Edge2D(a=Vec2(*cs[i]), b=Vec2(*cs[i + 1]), score=True))
+    elif gt in ("MultiLineString", "GeometryCollection"):
+        for g in geom.geoms:
+            out.extend(_linestring_to_score_edges(g))
+    return out
+
+
+def apply_mark_lines_to_panel(
+    width_m: float,
+    height_m: float,
+    edges: List[Edge2D],
+    lines: List[List[Tuple[float, float]]],
+) -> List[Edge2D]:
+    """Graba polilíneas ROJAS (score) recortadas al material real del panel.
+
+    `lines` son polilíneas en el marco UV de `project_faces_to_2d` (pre-espejo, 0-based,
+    el mismo marco que `user_cuts`); acá se espejan al marco final del panel (u→width−u)
+    y se recortan al material (contorno + aberturas). Devuelve aristas `score=True`
+    (capa MARK_VECTOR, roja). NO corta ni cambia la silueta: sólo agrega trazos a grabar.
+    """
+    if not lines:
+        return []
+    material = _panel_polygon(width_m, height_m, edges)
+    if material.is_empty:
+        return []
+    out: List[Edge2D] = []
+    for pts in lines:
+        if not pts or len(pts) < 2:
+            continue
+        mirrored = [(width_m - float(u), float(v)) for (u, v) in pts]
+        try:
+            ls = LineString(mirrored)
+            if ls.is_empty or ls.length < 1e-9:
+                continue
+            clipped = ls.intersection(material)   # omite tramos fuera del material/aberturas
+        except Exception:
+            continue
+        out.extend(_linestring_to_score_edges(clipped))
+    return out
