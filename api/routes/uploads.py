@@ -29,6 +29,7 @@ from core.services.stl_parser import parse_stl
 from core.pipeline import parse_pipeline, generate_pipeline, Phase1Result
 from core.services.cutting_sheet import build_placements
 from core.services.curvature import build_curvature_map
+from core.services.assembly_check import compute_assembly_warnings
 from core.group_classifier import compute_assembly_steps
 from core.services.types import PipelineOptions, SheetConfig
 
@@ -830,7 +831,7 @@ async def nesting_preview_endpoint(
         )
 
         with timer.step("compute_nesting"):
-            _, wall_nesting, floor_nesting, cfg, _, plate_joints = compute_nesting(
+            work, wall_nesting, floor_nesting, cfg, panel_id_by_group, plate_joints = compute_nesting(
                 rebuilt,
                 opts,
                 overrides=request.overrides,
@@ -841,6 +842,17 @@ async def nesting_preview_endpoint(
                 flex=request.flex,
                 mark_lines=request.mark_lines,
             )
+
+        # Chequeo automático de ensamble: huecos/solapes/piezas sin apoyo (world coords),
+        # para avisar ANTES de mandar a cortar. Vacío = ensamble verificado.
+        with timer.step("assembly_check"):
+            try:
+                assembly_warnings = compute_assembly_warnings(
+                    work.groups, work.faces, panel_id_by_group
+                )
+            except Exception:
+                logger.exception("[nesting-preview] assembly_check falló")
+                assembly_warnings = []
 
         timer.report()
         return JSONResponse(content={
@@ -853,6 +865,8 @@ async def nesting_preview_endpoint(
             },
             # Encastres 3D (world coords) para superponer ranuras en el instructivo.
             "plate_joints": serialize_plate_joints(plate_joints),
+            # Chequeo de ensamble: [] = verificado; si no, gap/overlap/unsupported.
+            "assembly_warnings": assembly_warnings,
         })
 
     except HTTPException:
