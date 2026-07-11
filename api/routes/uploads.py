@@ -199,6 +199,8 @@ def serialize_plate_joints(plate_joints) -> List[Dict]:
             "a": {"x": pj.a.x, "y": pj.a.y, "z": pj.a.z},
             "b": {"x": pj.b.x, "y": pj.b.y, "z": pj.b.z},
             "width": pj.width,
+            # "slot" = encastre físico (se corta) | "surface" = apoyo pegado (se graba rojo)
+            "kind": getattr(pj, "kind", "slot"),
         })
     return out
 
@@ -415,6 +417,7 @@ class GenerateRequest(BaseModel):
     user_cuts: Optional[List] = None  # reservado: corte manual futuro
     flex: Optional[List[dict]] = None  # patrón de flexión por grupo (kerf / auxético)
     mark_lines: Optional[List[dict]] = None  # polilíneas rojas a grabar (score) por grupo
+    ribs: Optional[List[dict]] = None  # refuerzos: nervios/cartelas
 
 
 class RecomputeRequest(BaseModel):
@@ -441,6 +444,7 @@ class NestingPreviewRequest(BaseModel):
     user_cuts: Optional[List[dict]] = None
     flex: Optional[List[dict]] = None  # patrón de flexión por grupo (kerf / auxético)
     mark_lines: Optional[List[dict]] = None  # polilíneas rojas a grabar (score) por grupo
+    ribs: Optional[List[dict]] = None  # refuerzos: nervios/cartelas
     sheet_config: Optional[SheetConfigModel] = None
     scale_denom: float = 50.0
     paper: str = "A4"
@@ -704,6 +708,7 @@ async def generate_pdf_endpoint(
                 user_cuts=request.user_cuts,
                 flex=request.flex,
                 mark_lines=request.mark_lines,
+                ribs=request.ribs,
             )
 
         if not files:
@@ -841,6 +846,7 @@ async def nesting_preview_endpoint(
                 user_cuts=request.user_cuts,
                 flex=request.flex,
                 mark_lines=request.mark_lines,
+                ribs=request.ribs,
             )
 
         # Chequeo automático de ensamble: huecos/solapes/piezas sin apoyo (world coords),
