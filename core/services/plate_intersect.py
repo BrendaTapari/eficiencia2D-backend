@@ -125,10 +125,11 @@ def face_plane_crossings(verts: List[Vec3], n: Vec3, d: float, eps: float = EPS)
 class PlateJoint:
     """Junta transversal entre dos placas (la futura línea de encastre)."""
     cutter_id: int          # placa que queda intacta
-    cut_id: int             # placa que cede (recibe la ranura)
+    cut_id: int             # placa que cede (recibe la ranura) / cuya cara recibe el apoyo
     a: Vec3                 # extremos del segmento de encastre en 3D
     b: Vec3
     width: float            # ancho de la ranura = grosor de la placa cortante
+    kind: str = "slot"      # "slot" = encastre físico (se corta) | "surface" = apoyo (se graba)
 
 
 def _segment_from_points(pts: List[Vec3]) -> Optional[Tuple[Vec3, Vec3]]:
@@ -261,6 +262,76 @@ def resolve_plate_joints(
             if seg is None:
                 continue
             joints.append(
-                PlateJoint(cutter_id=cutter.id, cut_id=cut.id, a=seg[0], b=seg[1], width=width)
+                PlateJoint(cutter_id=cutter.id, cut_id=cut.id, a=seg[0], b=seg[1],
+                           width=width, kind="slot")
             )
+
+    # Apoyos pegados (kind="surface"): una placa que se APOYA contra la cara de otra
+    # (butt, no la atraviesa) → no se corta, se graba en rojo el footprint de contacto.
+    joints.extend(resolve_support_joints(groups, faces, eps))
     return joints
+
+
+def resolve_support_joints(
+    groups: List[GeometryGroup], faces: List[Face3D], eps: float = EPS
+) -> List[PlateJoint]:
+    """Apoyos placa↔placa: una placa (piso/estante) se APOYA contra la cara de una pared
+    (contacto butt, perpendicular, sin atravesarla) → PlateJoint kind="surface". El
+    footprint se graba en rojo sobre la cara de la pared receptora (cut_id).
+    """
+    considered = [g for g in groups if getattr(g, "category", None) in ("wall", "floor")]
+    boxes = {g.id: _aabb(g, faces) for g in considered}
+    contact_eps = 0.012  # ~12 mm: tolerancia de contacto cara-arista
+    out: List[PlateJoint] = []
+
+    for i in range(len(considered)):
+        for j in range(i + 1, len(considered)):
+            A, B = considered[i], considered[j]
+            nA = normalize(A.representative_normal)
+            nB = normalize(B.representative_normal)
+            if abs(dot(nA, nB)) > 0.5:
+                continue  # no perpendiculares
+            if not _aabb_overlap(boxes[A.id], boxes[B.id]):
+                continue
+
+            # receptor (cut) = la PARED (normal horizontal); el que se apoya (cutter) = el otro.
+            A_wall = abs(nA.y) < 0.5
+            B_wall = abs(nB.y) < 0.5
+            if A_wall == B_wall:
+                if not A_wall:
+                    continue  # dos horizontales: no es apoyo pared-piso
+                receiver, rester = A, B  # dos paredes ⊥: la cara de A recibe a B
+            else:
+                receiver, rester = (A, B) if A_wall else (B, A)
+
+            n, d = group_plane(receiver, faces)
+            # el que se apoya NO debe atravesar (eso sería slot); debe TOCAR la cara.
+            spans = any(
+                classify_polygon(faces[fi].vertices, n, d, eps) == "spanning"
+                for fi in rester.face_indices if 0 <= fi < len(faces)
+            )
+            if spans:
+                continue
+            onplane = [
+                v for fi in rester.face_indices if 0 <= fi < len(faces)
+                for v in faces[fi].vertices if abs(signed_dist(v, n, d)) < contact_eps
+            ]
+            if len(onplane) < 2:
+                continue
+
+            # recortar la arista de contacto al footprint de la pared receptora
+            rb = boxes[receiver.id]
+            tol = 0.05
+            inside = [
+                p for p in onplane
+                if rb[0] - tol <= p.x <= rb[1] + tol
+                and rb[2] - tol <= p.y <= rb[3] + tol
+                and rb[4] - tol <= p.z <= rb[5] + tol
+            ]
+            seg = _segment_from_points(inside if len(inside) >= 2 else onplane)
+            if seg is None:
+                continue
+            width = rester.thickness or 0.006  # grosor del que se apoya (default visible)
+            out.append(PlateJoint(cutter_id=rester.id, cut_id=receiver.id,
+                                  a=seg[0], b=seg[1], width=width, kind="surface"))
+    return out
