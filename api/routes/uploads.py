@@ -418,6 +418,7 @@ class GenerateRequest(BaseModel):
     flex: Optional[List[dict]] = None  # patrón de flexión por grupo (kerf / auxético)
     mark_lines: Optional[List[dict]] = None  # polilíneas rojas a grabar (score) por grupo
     ribs: Optional[List[dict]] = None  # refuerzos: nervios/cartelas
+    columns: Optional[List[dict]] = None  # refuerzos: columnas
 
 
 class RecomputeRequest(BaseModel):
@@ -445,6 +446,7 @@ class NestingPreviewRequest(BaseModel):
     flex: Optional[List[dict]] = None  # patrón de flexión por grupo (kerf / auxético)
     mark_lines: Optional[List[dict]] = None  # polilíneas rojas a grabar (score) por grupo
     ribs: Optional[List[dict]] = None  # refuerzos: nervios/cartelas
+    columns: Optional[List[dict]] = None  # refuerzos: columnas
     sheet_config: Optional[SheetConfigModel] = None
     scale_denom: float = 50.0
     paper: str = "A4"
@@ -709,6 +711,7 @@ async def generate_pdf_endpoint(
                 flex=request.flex,
                 mark_lines=request.mark_lines,
                 ribs=request.ribs,
+                columns=request.columns,
             )
 
         if not files:
@@ -847,6 +850,7 @@ async def nesting_preview_endpoint(
                 flex=request.flex,
                 mark_lines=request.mark_lines,
                 ribs=request.ribs,
+                columns=request.columns,
             )
 
         # Chequeo automático de ensamble: huecos/solapes/piezas sin apoyo (world coords),
