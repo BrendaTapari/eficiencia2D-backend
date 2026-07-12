@@ -31,7 +31,7 @@ from core.services.flex_bending import (
     build_flex_by_group,
     parse_flex,
 )
-from core.services.reinforcements import build_ribs, parse_ribs
+from core.services.reinforcements import build_reinforcements
 from core.services.facade_extractor import extract_facades
 from core.services.floor_plan_extractor import extract_floor_plans
 from core.services.joint_detector import detect_joints
@@ -197,13 +197,15 @@ def decompose_panels_from_groups(
     flex: Optional[List[dict]] = None,
     mark_lines: Optional[List[dict]] = None,
     ribs: Optional[List[dict]] = None,
+    columns: Optional[List[dict]] = None,
 ) -> Tuple[List[Panel], List[Panel]]:
     overrides = overrides or {}
     marks_set = set(marks or [])  # ids de grupos cuyas aberturas se graban (no se cortan)
     min_area = opts.min_area_m2 if opts.min_area_m2 is not None else 0.01
 
-    # Refuerzos: NERVIOS (cartelas). Geometría 3D de cada nervio (pieza + muescas).
-    rib_geoms = build_ribs(parse_ribs(ribs), phase1.groups, phase1.faces)
+    # Refuerzos (nervios + columnas): PIEZAS NUEVAS independientes. NO tocan las placas
+    # existentes (sin muescas); sólo se agregan al nesting. El usuario las pega a mano.
+    reinforcement_pieces = build_reinforcements(ribs, columns)
 
     # Cortes manuales por grupo (user_cuts): group_id -> [cut, ...] en el marco del panel.
     cuts_by_group: Dict[int, list] = {}
@@ -242,14 +244,6 @@ def decompose_panels_from_groups(
         joints_by_cut.setdefault(pj.cut_id, []).append(
             (pj.a, pj.b, pj.width, getattr(pj, "kind", "slot"))
         )
-    # Muescas de los nervios en las placas receptoras (se cortan como encastre 'slot').
-    for geo in rib_geoms:
-        if geo.notch_a is not None:
-            pa, pb, wdt = geo.notch_a
-            joints_by_cut.setdefault(geo.group_a, []).append((pa, pb, wdt, "slot"))
-        if geo.notch_b is not None:
-            pa, pb, wdt = geo.notch_b
-            joints_by_cut.setdefault(geo.group_b, []).append((pa, pb, wdt, "slot"))
 
     effective_decisions: Dict[int, int] = {}
     for ww in phase1.wall_wall_joints:
@@ -467,21 +461,29 @@ def decompose_panels_from_groups(
                 )
             )
 
-    # Cartelas (nervios) como piezas propias → entran al nesting y al precio.
-    for gi, geo in enumerate(rib_geoms, start=1):
-        if geo.width_m * geo.height_m < 1e-6:
+    # Refuerzos (nervios R#, columnas C#) como piezas propias → entran al nesting y al
+    # precio. NO modifican ninguna placa existente.
+    rib_n = col_n = 0
+    for piece in reinforcement_pieces:
+        if piece.width_m * piece.height_m < 1e-6:
             continue
+        if piece.kind == "column":
+            col_n += 1
+            pid = f"C{col_n}"
+        else:
+            rib_n += 1
+            pid = f"R{rib_n}"
         wall_count += 1
         wall_panels.append(
             Panel(
-                id=f"R{gi}",
-                group_name=f"rib_{gi}",
+                id=pid,
+                group_name=f"{piece.kind}_{pid}",
                 category="wall",
                 floor_index=0,
-                width_m=geo.width_m,
-                height_m=geo.height_m,
-                edges=geo.edges,
-                source_group_id=geo.group_a,
+                width_m=piece.width_m,
+                height_m=piece.height_m,
+                edges=piece.edges,
+                source_group_id=-1,
                 is_mark=False,
             )
         )
@@ -527,6 +529,7 @@ def _decompose(
     flex: Optional[List[dict]] = None,
     mark_lines: Optional[List[dict]] = None,
     ribs: Optional[List[dict]] = None,
+    columns: Optional[List[dict]] = None,
 ) -> Tuple[Phase1Result, List[Panel], List[Panel], List]:
     """Aplica merges, resuelve encastres 3D y descompone a paneles 2D."""
     work = apply_merges(phase1, merges or [])
@@ -535,7 +538,7 @@ def _decompose(
     plate_joints = resolve_plate_joints(work.groups, work.faces)
     wall_panels, floor_panels = decompose_panels_from_groups(
         work, opts, overrides, wall_wall_decisions, marks, plate_joints,
-        user_cuts, flex, mark_lines, ribs,
+        user_cuts, flex, mark_lines, ribs, columns,
     )
     return work, wall_panels, floor_panels, plate_joints
 
@@ -602,11 +605,12 @@ def compute_nesting(
     flex: Optional[List[dict]] = None,
     mark_lines: Optional[List[dict]] = None,
     ribs: Optional[List[dict]] = None,
+    columns: Optional[List[dict]] = None,
 ) -> Tuple[Phase1Result, NestingResult, NestingResult, SheetConfig, Dict[int, str], List]:
     """Descompone y anida paneles. Compartido por /generate y /nesting-preview."""
     work, wall_panels, floor_panels, plate_joints = _decompose(
         phase1, opts, overrides, wall_wall_decisions, merges, marks,
-        user_cuts, flex, mark_lines, ribs,
+        user_cuts, flex, mark_lines, ribs, columns,
     )
 
     sc = opts.sheet_config
@@ -659,10 +663,11 @@ def generate_from_review(
     flex: Optional[List[dict]] = None,
     mark_lines: Optional[List[dict]] = None,
     ribs: Optional[List[dict]] = None,
+    columns: Optional[List[dict]] = None,
 ) -> List[OutputFile]:
     work, wall_nesting, floor_nesting, sheet_cfg, _, _ = compute_nesting(
         phase1, opts, overrides, wall_wall_decisions, merges, marks,
-        user_cuts, flex, mark_lines, ribs,
+        user_cuts, flex, mark_lines, ribs, columns,
     )
     scale = opts.scale_denom
     stem = work.stem
