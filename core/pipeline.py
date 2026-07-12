@@ -186,6 +186,7 @@ def generate_pipeline(
     flex: Optional[List[dict]] = None,
     mark_lines: Optional[List[dict]] = None,
     ribs: Optional[List[dict]] = None,
+    columns: Optional[List[dict]] = None,
 ) -> List[OutputFile]:
     from core.review_generate import generate_from_review
 
@@ -200,6 +201,7 @@ def generate_pipeline(
         flex=flex,
         mark_lines=mark_lines,
         ribs=ribs,
+        columns=columns,
     )
 
 
