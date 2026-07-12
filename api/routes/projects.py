@@ -8,11 +8,12 @@ from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from api.deps import get_current_user
+from api.schemas.rol import is_admin_user
 from api.routes.uploads import (
     SheetConfigModel,
     SplitModel,
@@ -28,6 +29,7 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 STATE_FILENAME = "estado.json"
+NOTE_TEXT_MAX_LENGTH = 2000
 
 
 class ProyectoResponse(BaseModel):
@@ -46,6 +48,34 @@ class ProyectoListResponse(BaseModel):
     total: int
 
 
+class GroupNoteModel(BaseModel):
+    """Nota de usuario asociada a un componente de topología (group_id ≥ 0)."""
+
+    id: str = Field(min_length=1, max_length=128)
+    group_id: int = Field(ge=0, description="ID de topología del backend; nunca negativo")
+    text: str = Field(min_length=1, max_length=NOTE_TEXT_MAX_LENGTH)
+    created_at: str | None = None
+    updated_at: str | None = None
+
+    @field_validator("text")
+    @classmethod
+    def text_must_be_non_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("text no puede estar vacío")
+        if len(stripped) > NOTE_TEXT_MAX_LENGTH:
+            raise ValueError(f"text no puede superar {NOTE_TEXT_MAX_LENGTH} caracteres")
+        return stripped
+
+    @field_validator("id")
+    @classmethod
+    def id_must_be_non_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("id de nota no puede estar vacío")
+        return stripped
+
+
 class ProyectoPartialSaveRequest(BaseModel):
     """Campos editables del proyecto; solo se actualizan los enviados en el body."""
     nombre: str | None = Field(default=None, min_length=1, max_length=200)
@@ -57,6 +87,7 @@ class ProyectoPartialSaveRequest(BaseModel):
     wall_wall_decisions: dict[int, int] | None = None
     marks: list[int] | None = None
     user_cuts: list[Any] | None = None
+    notes: list[GroupNoteModel] | None = None
     sheet_config: SheetConfigModel | None = None
     scale_denom: float | None = None
     paper: str | None = None
@@ -88,10 +119,31 @@ def _load_estado_proyecto(proyecto: Proyecto) -> dict[str, Any]:
     return dict(estado) if isinstance(estado, dict) else {}
 
 
+def _serialize_notes(notes: list[GroupNoteModel] | None) -> list[dict[str, Any]]:
+    """Serializa notes para estado.json (array completo enviado por el front)."""
+    if not notes:
+        return []
+    return [
+        {
+            "id": note.id,
+            "group_id": note.group_id,
+            "text": note.text,
+            "created_at": note.created_at,
+            "updated_at": note.updated_at,
+        }
+        for note in notes
+    ]
+
+
 def _merge_partial_estado(existing: dict[str, Any], patch: ProyectoPartialSaveRequest) -> dict[str, Any]:
     merged = dict(existing)
     for key, value in patch.model_dump(exclude_unset=True, exclude={"nombre"}).items():
-        merged[key] = value
+        if key == "notes":
+            # Reemplazo completo del array (mismo patrón que marks / user_cuts).
+            # No se valida existencia de group_id en topología: notas huérfanas se conservan.
+            merged["notes"] = _serialize_notes(patch.notes)
+        else:
+            merged[key] = value
     return merged
 
 
@@ -151,8 +203,11 @@ def _proyecto_to_response(proyecto: Proyecto, *, include_download_url: bool = Fa
 
 
 def _get_user_proyecto(db: Session, user: Usuario, proyecto_id: UUID) -> Proyecto:
+    """Devuelve el proyecto si el usuario es dueño o admin."""
     proyecto = db.get(Proyecto, proyecto_id)
-    if proyecto is None or proyecto.usuario_id != user.id:
+    if proyecto is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Proyecto no encontrado")
+    if proyecto.usuario_id != user.id and not is_admin_user(user):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Proyecto no encontrado")
     return proyecto
 
