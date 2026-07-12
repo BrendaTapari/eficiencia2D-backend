@@ -462,7 +462,11 @@ def decompose_panels_from_groups(
             )
 
     # Refuerzos (nervios R#, columnas C#) como piezas propias → entran al nesting y al
-    # precio. NO modifican ninguna placa existente.
+    # precio. NO modifican ninguna placa existente. size_m/height_m vienen en metros de
+    # MAQUETA (el material físico a cortar); los paneles del edificio están en metros de
+    # edificio y el nesting los reduce por 1/scale_denom, así que la pieza se escala por
+    # scale_denom para que en la plancha quede a su tamaño físico pedido.
+    rscale = opts.scale_denom or 1.0
     rib_n = col_n = 0
     for piece in reinforcement_pieces:
         if piece.width_m * piece.height_m < 1e-6:
@@ -474,15 +478,21 @@ def decompose_panels_from_groups(
             rib_n += 1
             pid = f"R{rib_n}"
         wall_count += 1
+        scaled_edges = [
+            Edge2D(a=Vec2(e.a.x * rscale, e.a.y * rscale),
+                   b=Vec2(e.b.x * rscale, e.b.y * rscale),
+                   score=getattr(e, "score", False))
+            for e in piece.edges
+        ]
         wall_panels.append(
             Panel(
                 id=pid,
                 group_name=f"{piece.kind}_{pid}",
                 category="wall",
                 floor_index=0,
-                width_m=piece.width_m,
-                height_m=piece.height_m,
-                edges=piece.edges,
+                width_m=piece.width_m * rscale,
+                height_m=piece.height_m * rscale,
+                edges=scaled_edges,
                 source_group_id=-1,
                 is_mark=False,
             )
