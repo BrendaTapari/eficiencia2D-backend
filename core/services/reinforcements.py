@@ -20,11 +20,14 @@ from typing import List, Optional
 from core.services.cutting_sheet import Edge2D
 from core.services.types import Vec2
 
-MIN_SIZE_M = 0.03
-MAX_SIZE_M = 1.0
-MIN_HEIGHT_M = 0.03
-MAX_HEIGHT_M = 5.0
-GLUE_TAB_M = 0.01  # pestaña de pegado de la columna
+# Tamaños FÍSICOS de la pieza en la MAQUETA (metros sobre la plancha de corte). Un
+# refuerzo es una pieza chica que se corta y se pega: debe entrar en la plancha y ser
+# usable (apoyar un piso), no gigante. Se clampea a un rango físico razonable.
+MIN_SIZE_M = 0.01          # 1 cm
+MAX_SIZE_M = 0.06          # 6 cm (cateto del nervio / lado de sección de columna)
+MIN_HEIGHT_M = 0.02        # 2 cm
+MAX_HEIGHT_M = 0.18        # 18 cm (entra en el alto de una A4 de maqueta)
+GLUE_TAB_M = 0.006         # pestaña de pegado de la columna (6 mm)
 
 
 @dataclass
