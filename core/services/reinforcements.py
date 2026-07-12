@@ -23,11 +23,12 @@ from core.services.types import Vec2
 # Tamaños FÍSICOS de la pieza en la MAQUETA (metros sobre la plancha de corte). Un
 # refuerzo es una pieza chica que se corta y se pega: debe entrar en la plancha y ser
 # usable (apoyar un piso), no gigante. Se clampea a un rango físico razonable.
-MIN_SIZE_M = 0.01          # 1 cm
-MAX_SIZE_M = 0.06          # 6 cm (cateto del nervio / lado de sección de columna)
-MIN_HEIGHT_M = 0.02        # 2 cm
-MAX_HEIGHT_M = 0.18        # 18 cm (entra en el alto de una A4 de maqueta)
-GLUE_TAB_M = 0.006         # pestaña de pegado de la columna (6 mm)
+MIN_SIZE_M = 0.006          # 6 mm
+RIB_MAX_M = 0.016           # nervio: cateto ≤ ~1.6 cm (triángulo chico para apoyar)
+COLUMN_SIZE_MAX_M = 0.03    # columna: lado de sección ≤ 3 cm
+MIN_HEIGHT_M = 0.02         # 2 cm
+MAX_HEIGHT_M = 0.18         # 18 cm (entra en el alto de una A4 de maqueta)
+GLUE_TAB_M = 0.005          # pestaña de pegado de la columna (5 mm)
 
 
 @dataclass
@@ -54,7 +55,7 @@ def parse_ribs(raw: Optional[List[dict]]) -> List[dict]:
             size = float(item.get("size_m"))
         except (TypeError, ValueError):
             continue
-        size = min(max(size, MIN_SIZE_M), MAX_SIZE_M)
+        size = min(max(size, MIN_SIZE_M), RIB_MAX_M)
         out.append({"id": str(item.get("id") or ""), "size_m": size})
     return out
 
@@ -83,7 +84,7 @@ def parse_columns(raw: Optional[List[dict]]) -> List[dict]:
             height = float(item.get("height_m"))
         except (TypeError, ValueError):
             continue
-        size = min(max(size, MIN_SIZE_M), MAX_SIZE_M)
+        size = min(max(size, MIN_SIZE_M), COLUMN_SIZE_MAX_M)
         height = min(max(height, MIN_HEIGHT_M), MAX_HEIGHT_M)
         out.append({"id": str(item.get("id") or ""), "size_m": size, "height_m": height})
     return out
