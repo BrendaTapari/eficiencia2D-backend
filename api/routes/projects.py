@@ -87,6 +87,7 @@ class ProyectoPartialSaveRequest(BaseModel):
     wall_wall_decisions: dict[int, int] | None = None
     marks: list[int] | None = None
     user_cuts: list[Any] | None = None
+    mark_lines: list[Any] | None = None
     notes: list[GroupNoteModel] | None = None
     sheet_config: SheetConfigModel | None = None
     scale_denom: float | None = None
