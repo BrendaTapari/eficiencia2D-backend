@@ -137,22 +137,33 @@ def serialize_topology(result: Phase1Result, panel_id_by_group: Optional[Dict] =
 
 
 def _serialize_nesting_panel(p) -> Dict:
-    return {
-        "id": p.id,
-        "category": p.category,
-        "width_m": p.width_m,
-        "height_m": p.height_m,
-        "edges": [
-            {
+    # Separar CORTE (edges) de GRABADO (mark_segments). Las aristas score=True
+    # (mark_lines + cortes tipo "line") son grabado rojo y viajan aparte para que el
+    # front las dibuje en rojo sin duplicarlas como corte (B2). En el mismo marco local
+    # del panel → el front les aplica el mismo offset/rotación que a edges.
+    edges = []
+    mark_segments = []
+    for e in p.edges:
+        if getattr(e, "score", False):
+            mark_segments.append({
+                "a": {"x": e.a.x, "y": e.a.y},
+                "b": {"x": e.b.x, "y": e.b.y},
+            })
+        else:
+            edges.append({
                 "a": {"x": e.a.x, "y": e.a.y},
                 "b": {"x": e.b.x, "y": e.b.y},
                 "hole": e.hole,
                 "joint": getattr(e, "joint", False),
                 "flex": getattr(e, "flex", False),
-                "score": getattr(e, "score", False),
-            }
-            for e in p.edges
-        ],
+            })
+    return {
+        "id": p.id,
+        "category": p.category,
+        "width_m": p.width_m,
+        "height_m": p.height_m,
+        "edges": edges,
+        "mark_segments": mark_segments,
         "is_mark": p.is_mark,
     }
 
