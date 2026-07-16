@@ -144,6 +144,8 @@ def _serialize_nesting_panel(p) -> Dict:
     edges = []
     mark_segments = []
     for e in p.edges:
+        if getattr(e, "joint", False):
+            continue  # encastres no van en la lámina de corte (van en plate_joints)
         if getattr(e, "score", False):
             mark_segments.append({
                 "a": {"x": e.a.x, "y": e.a.y},
@@ -154,7 +156,6 @@ def _serialize_nesting_panel(p) -> Dict:
                 "a": {"x": e.a.x, "y": e.a.y},
                 "b": {"x": e.b.x, "y": e.b.y},
                 "hole": e.hole,
-                "joint": getattr(e, "joint", False),
                 "flex": getattr(e, "flex", False),
             })
     return {
