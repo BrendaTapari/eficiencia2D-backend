@@ -1214,10 +1214,11 @@ def emit_panel_entities(
     is_mark: bool = False,
 ):
     for edge in edges:
-        # Prioridad de capa por arista:
-        #  - joint  -> línea de encastre (junta transversal 3D) en CUT_INTERIOR (ACI 3)
-        #  - hole en panel marcado -> abertura a grabar en MARK_VECTOR (ACI 1, rojo)
-        #  - resto  -> contorno a cortar en CUT_EXTERIOR (ACI 7)
+        # Los encastres (joint) NO se dibujan en la lámina de corte: son geometría de
+        # ensamble (van en el array plate_joints para el visor 3D), no en el corte del
+        # taller. Evita el "verde" espurio en la plancha.
+        if getattr(edge, "joint", False):
+            continue
         if getattr(edge, "flex", False):
             # Patrón de flexión (kerf/auxético): SE CORTA. Capa propia FLEX_CUT en negro
             # (color de corte) para que el láser lo corte y el material pueda plegarse.
