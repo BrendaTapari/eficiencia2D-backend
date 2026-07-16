@@ -867,30 +867,48 @@ def apply_user_cuts(
     if panel is None:
         return [edges], score_lines
 
+    from shapely.ops import unary_union
+
     geom = panel
+    cut_polys = []
     for cut in subtractive:
         cp = _cut_polygon(cut, width_m, height_m)
         if cp is None or not cp.is_valid:
             continue
+        cut_polys.append(cp)
         try:
             geom = geom.difference(cp)
         except Exception:
             continue
-        if geom.is_empty:
-            return [], score_lines
 
-    polys = (
-        list(geom.geoms)
-        if isinstance(geom, MultiPolygon)
-        else ([geom] if geom.geom_type == "Polygon" and not geom.is_empty else [])
-    )
+    def _polys_of(g):
+        if g is None or g.is_empty:
+            return []
+        return list(g.geoms) if isinstance(g, MultiPolygon) else (
+            [g] if g.geom_type == "Polygon" else [])
+
     pieces: List[List[Edge2D]] = []
-    for p in polys:
+    # RESTO: el panel con el/los hueco(s) o partido en varias piezas.
+    for p in _polys_of(geom):
         if p.area < 1e-4:
             continue
         pe = _polygon_to_edges(p)
         if len(pe) >= 3:
             pieces.append(pe)
+
+    # RECORTE (B1): el material removido (panel ∩ cortes) como pieza(s) independiente(s).
+    if cut_polys:
+        try:
+            recorte = panel.intersection(unary_union(cut_polys))
+        except Exception:
+            recorte = None
+        for p in _polys_of(recorte):
+            if p.area < 1e-4:
+                continue
+            pe = _polygon_to_edges(p)
+            if len(pe) >= 3:
+                pieces.append(pe)
+
     if not pieces:
         return [], score_lines
     return pieces, score_lines
@@ -1208,7 +1226,8 @@ def emit_panel_entities(
             # Corte manual tipo "line" -> marca de pliegue/score (no corta): MARK_VECTOR.
             layer, aci = "MARK_VECTOR", "1"
         elif getattr(edge, "joint", False):
-            layer, aci = "CUT_INTERIOR", "3"
+            # Encastre = CORTE (negro), no una capa verde aparte (B4).
+            layer, aci = "CUT_EXTERIOR", "7"
         elif is_mark and getattr(edge, "hole", False):
             layer, aci = "MARK_VECTOR", "1"
         else:
