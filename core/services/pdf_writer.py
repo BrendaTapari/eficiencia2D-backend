@@ -421,7 +421,7 @@ def _render_sheets_page(
                 elif getattr(edge, "score", False):
                     color = "1 0 0 RG"            # rojo: pliegue/score (corte manual línea)
                 elif getattr(edge, "joint", False):
-                    color = "0 0.6 0 RG"          # verde: línea de encastre (junta)
+                    color = "0 0 0 RG"            # negro: encastre = CORTE (sin verde, B4)
                 elif is_mark and getattr(edge, "hole", False):
                     color = "1 0 0 RG"            # rojo: abertura a grabar
                 else:
