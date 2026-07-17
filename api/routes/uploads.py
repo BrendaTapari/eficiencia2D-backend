@@ -144,18 +144,21 @@ def _serialize_nesting_panel(p) -> Dict:
     edges = []
     mark_segments = []
     for e in p.edges:
-        if getattr(e, "joint", False):
-            continue  # encastres no van en la lámina de corte (van en plate_joints)
         if getattr(e, "score", False):
             mark_segments.append({
                 "a": {"x": e.a.x, "y": e.a.y},
                 "b": {"x": e.b.x, "y": e.b.y},
             })
         else:
+            # Se conserva el flag `joint` (encastre/intersección) para que el front pueda
+            # mostrar la funcionalidad de intersecciones entre paredes. En la LÁMINA de
+            # corte (DXF/PDF) no se dibuja (ver emit_panel_entities/pdf_writer); acá viaja
+            # como dato para la UI de intersecciones/instructivo.
             edges.append({
                 "a": {"x": e.a.x, "y": e.a.y},
                 "b": {"x": e.b.x, "y": e.b.y},
                 "hole": e.hole,
+                "joint": getattr(e, "joint", False),
                 "flex": getattr(e, "flex", False),
             })
     return {
@@ -211,8 +214,6 @@ def serialize_plate_joints(plate_joints) -> List[Dict]:
             "a": {"x": pj.a.x, "y": pj.a.y, "z": pj.a.z},
             "b": {"x": pj.b.x, "y": pj.b.y, "z": pj.b.z},
             "width": pj.width,
-            # "slot" = encastre físico (se corta) | "surface" = apoyo pegado (se graba rojo)
-            "kind": getattr(pj, "kind", "slot"),
         })
     return out
 
