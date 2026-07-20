@@ -23,9 +23,11 @@ Base = declarative_base()
 def _prefer_ipv4_database_url(url: str) -> str:
     """
     En VPS sin ruteo IPv6, Supabase puede resolverse a IPv6 y fallar con 'No route to host'.
-    Reemplaza el hostname por su dirección IPv4 cuando sea posible.
+
+    Usa el parámetro libpq `hostaddr` para conectar por IPv4 manteniendo el hostname
+    original (necesario para verificación SSL con Supabase).
     """
-    if "supabase.co" not in url:
+    if "supabase.co" not in url or "hostaddr=" in url:
         return url
 
     dialect_prefix = ""
@@ -42,26 +44,27 @@ def _prefer_ipv4_database_url(url: str) -> str:
         return url
 
     try:
-        infos = socket.getaddrinfo(host, parsed.port or 5432, socket.AF_INET, socket.SOCK_STREAM)
-        ipv4 = infos[0][4][0]
+        # gethostbyname solo devuelve IPv4; evita que psycopg2 elija IPv6 del DNS.
+        ipv4 = socket.gethostbyname(host)
     except OSError:
-        logger.warning("No se pudo resolver IPv4 para %s; se usa el hostname original", host)
+        logger.warning(
+            "No se pudo resolver IPv4 para %s; la conexión puede fallar en VPS sin IPv6",
+            host,
+        )
         return url
 
-    port = parsed.port or 5432
-    userinfo = ""
-    if parsed.username:
-        userinfo = parsed.username
-        if parsed.password:
-            userinfo += f":{parsed.password}"
-        userinfo += "@"
+    separator = "&" if parsed.query else "?"
+    query = parsed.query
+    if query:
+        rebuilt_query = f"{query}&hostaddr={ipv4}"
+    else:
+        rebuilt_query = f"hostaddr={ipv4}"
 
-    rebuilt = urlunparse(parsed._replace(netloc=f"{userinfo}{ipv4}:{port}"))
+    rebuilt = urlunparse(parsed._replace(query=rebuilt_query))
     if dialect_prefix == "postgresql+psycopg2://":
         rebuilt = rebuilt.replace("postgresql://", dialect_prefix, 1)
 
-    if ipv4 != host:
-        logger.info("Conexión Supabase forzada a IPv4: %s -> %s", host, ipv4)
+    logger.info("Conexión Supabase forzada a IPv4: %s -> hostaddr=%s", host, ipv4)
     return rebuilt
 
 
