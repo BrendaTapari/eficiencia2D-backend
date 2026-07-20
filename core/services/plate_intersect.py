@@ -266,9 +266,10 @@ def resolve_plate_joints(
                            width=width, kind="slot")
             )
 
-    # Apoyos pegados (kind="surface"): una placa que se APOYA contra la cara de otra
-    # (butt, no la atraviesa) → no se corta, se graba en rojo el footprint de contacto.
-    joints.extend(resolve_support_joints(groups, faces, eps))
+    # NOTA: las "marcas de apoyo" (surface) se detectan en resolve_support_joints, pero NO
+    # se agregan acá: inundaban la lámina de corte con rectángulos/diagonales rojos y
+    # ensuciaban plate_joints (que el visor 3D usa para las intersecciones). Si se quieren
+    # exponer, van en un array/entregable propio, no mezcladas en plate_joints.
     return joints
 
 

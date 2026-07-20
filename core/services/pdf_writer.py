@@ -416,12 +416,14 @@ def _render_sheets_page(
             cs.append("0.3 w")
             cur_color = None
             for edge in edges:
+                # Los encastres (joint) NO se dibujan en la lámina de corte (van al visor
+                # 3D vía plate_joints). Evita el verde/negro espurio en la plancha.
+                if getattr(edge, "joint", False):
+                    continue
                 if getattr(edge, "flex", False):
                     color = "0 0 0 RG"            # negro: patrón de flexión (kerf/auxético) — corte
                 elif getattr(edge, "score", False):
                     color = "1 0 0 RG"            # rojo: pliegue/score (corte manual línea)
-                elif getattr(edge, "joint", False):
-                    color = "0 0.6 0 RG"          # verde: línea de encastre (junta)
                 elif is_mark and getattr(edge, "hole", False):
                     color = "1 0 0 RG"            # rojo: abertura a grabar
                 else:
