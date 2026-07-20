@@ -104,6 +104,24 @@ class ProyectoStateSaveResponse(BaseModel):
     message: str
 
 
+class ProyectoRenameRequest(BaseModel):
+    nombre: str = Field(min_length=1, max_length=200)
+
+    @field_validator("nombre")
+    @classmethod
+    def normalize_nombre(cls, value: str) -> str:
+        nombre = value.strip()
+        if not nombre:
+            raise ValueError("El nombre del proyecto no puede estar vacío")
+        return nombre
+
+
+class ProyectoRenameResponse(ProyectoResponse):
+    """Nombre actualizado en BD; si había estado guardado, también en estado.json (R2)."""
+    estado_sincronizado: bool = False
+    estado_actualizado_at: str | None = None
+
+
 def _load_estado_proyecto(proyecto: Proyecto) -> dict[str, Any]:
     meta = proyecto.metadata_impresion or {}
     estado_r2 = meta.get("estado_r2")
@@ -118,6 +136,63 @@ def _load_estado_proyecto(proyecto: Proyecto) -> dict[str, Any]:
 
     estado = meta.get("estado")
     return dict(estado) if isinstance(estado, dict) else {}
+
+
+def _proyecto_tiene_estado_guardado(proyecto: Proyecto, estado: dict[str, Any]) -> bool:
+    """True si el proyecto ya tiene estado.json en R2 o un estado legacy en metadata."""
+    meta = proyecto.metadata_impresion or {}
+    estado_r2 = meta.get("estado_r2")
+    if isinstance(estado_r2, str) and estado_r2.strip():
+        return True
+    return bool(estado)
+
+
+def _commit_proyecto_nombre(db: Session, proyecto: Proyecto, nombre: str) -> None:
+    proyecto.nombre = nombre
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.exception("Error al renombrar proyecto %s en BD", proyecto.id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo guardar el nombre del proyecto",
+        ) from exc
+    db.refresh(proyecto)
+
+
+def _set_proyecto_nombre(
+    db: Session,
+    proyecto: Proyecto,
+    nombre: str,
+) -> tuple[bool, str | None]:
+    """
+    Actualiza el nombre visible del proyecto en PostgreSQL y, si existe estado
+    guardado, también la clave `nombre` de estado.json en R2.
+
+    No modifica `metadata_impresion.archivo_original` ni renombra objetos en R2
+    (las rutas son {usuario_id}/{proyecto_id}/…).
+    """
+    estado = _load_estado_proyecto(proyecto)
+    tiene_estado = _proyecto_tiene_estado_guardado(proyecto, estado)
+
+    if tiene_estado:
+        estado["nombre"] = nombre
+        proyecto.nombre = nombre
+        estado_actualizado_at = _persist_estado_proyecto(db, proyecto, estado)
+        return True, estado_actualizado_at
+
+    _commit_proyecto_nombre(db, proyecto, nombre)
+    return False, None
+
+
+def _rename_response(proyecto: Proyecto, *, estado_sincronizado: bool, estado_actualizado_at: str | None) -> ProyectoRenameResponse:
+    base = _proyecto_to_response(proyecto)
+    return ProyectoRenameResponse(
+        **base.model_dump(),
+        estado_sincronizado=estado_sincronizado,
+        estado_actualizado_at=estado_actualizado_at,
+    )
 
 
 def _serialize_notes(notes: list[GroupNoteModel] | None) -> list[dict[str, Any]]:
@@ -336,6 +411,37 @@ def obtener_proyecto(
     return _proyecto_to_response(proyecto, include_download_url=True)
 
 
+@router.patch("/projects/{proyecto_id}", response_model=ProyectoRenameResponse)
+def renombrar_proyecto(
+    proyecto_id: UUID,
+    body: ProyectoRenameRequest,
+    current_user: Usuario = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Renombra el proyecto en la base de datos y sincroniza `nombre` en estado.json (R2)
+    si el proyecto ya tiene estado guardado. No altera el archivo 3D ni `archivo_original`.
+    """
+    proyecto = _get_user_proyecto(db, current_user, proyecto_id)
+
+    if proyecto.nombre == body.nombre:
+        return _rename_response(proyecto, estado_sincronizado=False, estado_actualizado_at=None)
+
+    estado_sincronizado, estado_actualizado_at = _set_proyecto_nombre(db, proyecto, body.nombre)
+    logger.info(
+        "Proyecto renombrado: %s → %r (usuario %s, estado_sync=%s)",
+        proyecto.id,
+        body.nombre,
+        current_user.id,
+        estado_sincronizado,
+    )
+    return _rename_response(
+        proyecto,
+        estado_sincronizado=estado_sincronizado,
+        estado_actualizado_at=estado_actualizado_at,
+    )
+
+
 @router.post("/projects/{proyecto_id}/open")
 def abrir_proyecto(
     proyecto_id: UUID,
@@ -416,6 +522,7 @@ def guardar_estado_parcial_proyecto(
                 detail="El nombre del proyecto no puede estar vacío",
             )
         proyecto.nombre = nombre
+        merged_estado["nombre"] = nombre
 
     estado_actualizado_at = _persist_estado_proyecto(db, proyecto, merged_estado)
     meta = proyecto.metadata_impresion or {}
