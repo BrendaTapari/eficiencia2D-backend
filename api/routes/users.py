@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
@@ -47,6 +48,11 @@ class ChangePasswordResponse(BaseModel):
     message: str
 
 
+class AceptarTerminosResponse(BaseModel):
+    message: str
+    acepto_terminos_at: str
+
+
 def _user_profile(db: Session, user: Usuario) -> UserProfileResponse:
     total_proyectos = db.query(Proyecto).filter(Proyecto.usuario_id == user.id).count()
     rol_id, rol_name = user_rol_fields(user)
@@ -84,6 +90,30 @@ def get_my_profile(
 ):
     user = _load_user_with_rol(db, current_user.id)
     return _user_profile(db, user)
+
+
+@router.post("/users/me/aceptar-terminos", response_model=AceptarTerminosResponse)
+def aceptar_terminos(
+    current_user: Usuario = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Registra la aceptación de términos y condiciones (pago / re-aceptación)."""
+    now = datetime.now(timezone.utc)
+    current_user.acepto_terminos_at = now
+    try:
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Error al guardar aceptación de términos para %s", current_user.id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo guardar la aceptación de términos",
+        ) from None
+    db.refresh(current_user)
+    return AceptarTerminosResponse(
+        message="Términos y condiciones aceptados",
+        acepto_terminos_at=now.isoformat(),
+    )
 
 
 @router.patch("/users/me", response_model=UserProfileResponse)

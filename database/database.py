@@ -176,6 +176,7 @@ def init_db() -> None:
     _migrate_usuario_email_verification_schema()
     _migrate_usuario_password_reset_schema()
     _migrate_usuario_rol_schema()
+    _migrate_usuario_terminos_schema()
     _migrate_cupones_schema()
     _migrate_planes_contract_schema()
     _migrate_precios_plan_schema()
@@ -378,6 +379,20 @@ def _migrate_usuario_rol_schema() -> None:
             conn.execute(text(sql))
 
     logger.info("Esquema de roles (tabla rol + usuarios.rol_id) verificado")
+
+
+def _migrate_usuario_terminos_schema() -> None:
+    """Agrega acepto_terminos_at a usuarios si falta."""
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                ALTER TABLE usuarios
+                ADD COLUMN IF NOT EXISTS acepto_terminos_at TIMESTAMPTZ
+                """
+            )
+        )
+    logger.info("Esquema de términos (usuarios.acepto_terminos_at) verificado")
 
 
 def _migrate_cupones_schema() -> None:
@@ -671,6 +686,7 @@ class Usuario(Base):
     email_verified_at = Column(DateTime(timezone=True), nullable=True)
     password_reset_token = Column(String(64), nullable=True, unique=True)
     password_reset_expires_at = Column(DateTime(timezone=True), nullable=True)
+    acepto_terminos_at = Column(DateTime(timezone=True), nullable=True)
     rol_id = Column(
         Integer,
         ForeignKey('rol.id', ondelete='RESTRICT'),

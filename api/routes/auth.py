@@ -34,6 +34,7 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=6, max_length=128)
     nombre: str | None = Field(default=None, max_length=120)
+    acepto_terminos: bool = False
 
 
 class LoginRequest(BaseModel):
@@ -153,6 +154,12 @@ async def register(
     db: Session = Depends(get_db),
 ):
     email = body.email.lower()
+    if not body.acepto_terminos:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Debés aceptar los términos y condiciones para registrarte",
+        )
+
     existing = db.query(Usuario).filter(Usuario.email == email).first()
     if existing:
         raise HTTPException(
@@ -161,6 +168,7 @@ async def register(
         )
 
     verification_token = _create_verification_token()
+    now = datetime.now(timezone.utc)
     user = Usuario(
         email=email,
         password_hash=hash_password(body.password),
@@ -168,6 +176,7 @@ async def register(
         estado=ESTADO_PENDIENTE,
         email_verification_token=verification_token,
         rol_id=DEFAULT_ROL_ID,
+        acepto_terminos_at=now,
     )
     config = ConfiguracionUsuario(usuario=user)
 
