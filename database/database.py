@@ -439,23 +439,49 @@ def _migrate_planes_contract_schema() -> None:
 
 
 def _migrate_precios_plan_schema() -> None:
-    """Tabla precios_plan y migración desde columnas legacy en planes."""
+    """Tabla precio_plan (FK planes_id) y migración desde legacy / precios_plan."""
     with engine.begin() as conn:
         conn.execute(
             text(
                 """
-                CREATE TABLE IF NOT EXISTS precios_plan (
+                CREATE TABLE IF NOT EXISTS precio_plan (
                     id SERIAL PRIMARY KEY,
                     precio NUMERIC(10, 2) NOT NULL,
                     moneda VARCHAR DEFAULT 'ARS',
                     periodo VARCHAR DEFAULT 'mes',
                     planes_id INTEGER NOT NULL,
-                    CONSTRAINT fk_precios_plan_planes
+                    CONSTRAINT fk_precio_plan_planes
                         FOREIGN KEY (planes_id) REFERENCES planes (id)
                 )
                 """
             )
         )
+
+        # Si quedó una tabla mal nombrada (precios_plan) con datos, copiarlos.
+        has_legacy_table = conn.execute(
+            text(
+                """
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = 'precios_plan'
+                """
+            )
+        ).first()
+        if has_legacy_table:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO precio_plan (precio, moneda, periodo, planes_id)
+                    SELECT pp.precio, pp.moneda, pp.periodo, pp.planes_id
+                    FROM precios_plan pp
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM precio_plan p
+                        WHERE p.planes_id = pp.planes_id
+                          AND p.moneda IS NOT DISTINCT FROM pp.moneda
+                          AND p.periodo IS NOT DISTINCT FROM pp.periodo
+                    )
+                    """
+                )
+            )
 
         legacy_cols = {
             row[0]
@@ -472,35 +498,33 @@ def _migrate_precios_plan_schema() -> None:
             ).fetchall()
         }
 
-        if not legacy_cols:
-            return
+        if legacy_cols:
+            if "precio_mensual" in legacy_cols and "precio" in legacy_cols:
+                precio_expr = "COALESCE(p.precio_mensual, p.precio, 0)"
+            elif "precio_mensual" in legacy_cols:
+                precio_expr = "COALESCE(p.precio_mensual, 0)"
+            elif "precio" in legacy_cols:
+                precio_expr = "COALESCE(p.precio, 0)"
+            else:
+                precio_expr = "0"
 
-        if "precio_mensual" in legacy_cols and "precio" in legacy_cols:
-            precio_expr = "COALESCE(p.precio_mensual, p.precio, 0)"
-        elif "precio_mensual" in legacy_cols:
-            precio_expr = "COALESCE(p.precio_mensual, 0)"
-        elif "precio" in legacy_cols:
-            precio_expr = "COALESCE(p.precio, 0)"
-        else:
-            precio_expr = "0"
+            moneda_expr = "COALESCE(p.moneda, 'ARS')" if "moneda" in legacy_cols else "'ARS'"
+            periodo_expr = "COALESCE(p.periodo, 'mes')" if "periodo" in legacy_cols else "'mes'"
 
-        moneda_expr = "COALESCE(p.moneda, 'ARS')" if "moneda" in legacy_cols else "'ARS'"
-        periodo_expr = "COALESCE(p.periodo, 'mes')" if "periodo" in legacy_cols else "'mes'"
-
-        conn.execute(
-            text(
-                f"""
-                INSERT INTO precios_plan (precio, moneda, periodo, planes_id)
-                SELECT {precio_expr}, {moneda_expr}, {periodo_expr}, p.id
-                FROM planes p
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM precios_plan pp WHERE pp.planes_id = p.id
+            conn.execute(
+                text(
+                    f"""
+                    INSERT INTO precio_plan (precio, moneda, periodo, planes_id)
+                    SELECT {precio_expr}, {moneda_expr}, {periodo_expr}, p.id
+                    FROM planes p
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM precio_plan pp WHERE pp.planes_id = p.id
+                    )
+                    """
                 )
-                """
             )
-        )
 
-    logger.info("Esquema de precios_plan verificado")
+    logger.info("Esquema de precio_plan verificado")
 
 
 def _migrate_suscripciones_contract_schema() -> None:
@@ -522,6 +546,7 @@ def _seed_planes() -> None:
             text("SELECT COUNT(*) FROM planes WHERE slug IS NOT NULL")
         ).scalar()
         if existing and existing > 0:
+            _backfill_precios_faltantes(session)
             return
 
         seeds = [
@@ -566,7 +591,7 @@ def _seed_planes() -> None:
             session.execute(
                 text(
                     """
-                    INSERT INTO precios_plan (precio, moneda, periodo, planes_id)
+                    INSERT INTO precio_plan (precio, moneda, periodo, planes_id)
                     VALUES (:precio, :moneda, :periodo, :planes_id)
                     """
                 ),
@@ -579,6 +604,45 @@ def _seed_planes() -> None:
             )
         session.commit()
         logger.info("Seed: %d planes insertados", len(seeds))
+
+
+def _backfill_precios_faltantes(session) -> None:
+    """Si hay planes sin fila en precio_plan, inserta el precio default por slug."""
+    defaults = {
+        "gratis": 0,
+        "pro": 8000,
+        "estudio": 20000,
+    }
+    inserted = 0
+    for slug, precio in defaults.items():
+        row = session.execute(
+            text(
+                """
+                SELECT p.id
+                FROM planes p
+                WHERE p.slug = :slug
+                  AND NOT EXISTS (
+                      SELECT 1 FROM precio_plan pp WHERE pp.planes_id = p.id
+                  )
+                """
+            ),
+            {"slug": slug},
+        ).fetchone()
+        if not row:
+            continue
+        session.execute(
+            text(
+                """
+                INSERT INTO precio_plan (precio, moneda, periodo, planes_id)
+                VALUES (:precio, 'ARS', 'mes', :planes_id)
+                """
+            ),
+            {"precio": precio, "planes_id": row[0]},
+        )
+        inserted += 1
+    if inserted:
+        session.commit()
+        logger.info("Backfill: %d precios insertados en precio_plan", inserted)
 
 
 def _backfill_configuraciones_usuario() -> None:
@@ -643,19 +707,24 @@ class Plan(Base):
     # Relaciones
     suscripciones = relationship("Suscripcion", back_populates="plan")
     cupones = relationship("Cupon", back_populates="plan")
-    precios = relationship("PrecioPlan", back_populates="plan", cascade="all, delete-orphan")
+    precios = relationship(
+        "PrecioPlan",
+        back_populates="plan",
+        cascade="all, delete-orphan",
+        foreign_keys="PrecioPlan.planes_id",
+    )
 
 
 class PrecioPlan(Base):
-    __tablename__ = 'precios_plan'
+    __tablename__ = "precio_plan"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     precio = Column(Numeric(10, 2), nullable=False)
     moneda = Column(String, default="ARS")
     periodo = Column(String, default="mes")
-    planes_id = Column(Integer, ForeignKey('planes.id', ondelete='RESTRICT'), nullable=False)
+    planes_id = Column(Integer, ForeignKey("planes.id", ondelete="RESTRICT"), nullable=False)
 
-    plan = relationship("Plan", back_populates="precios")
+    plan = relationship("Plan", back_populates="precios", foreign_keys=[planes_id])
 
 
 class Suscripcion(Base):
