@@ -28,8 +28,14 @@ async def lifespan(app: FastAPI):
 
     try:
         init_db()
-    except Exception:
+    except Exception as exc:
         logger.exception("No se pudieron crear las tablas en PostgreSQL")
+        msg = str(exc).lower()
+        if "supabase" in msg or "ipv6" in msg or "pooler" in msg:
+            logger.error(
+                "Pista: si DATABASE_URL apunta a db.*.supabase.co, cambiá al "
+                "Connection pooler (Session, puerto 5432) en el dashboard de Supabase."
+            )
         raise
 
     mail_issues = validate_mail_config()

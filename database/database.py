@@ -22,10 +22,11 @@ Base = declarative_base()
 
 def _prefer_ipv4_database_url(url: str) -> str:
     """
-    En VPS sin ruteo IPv6, Supabase puede resolverse a IPv6 y fallar con 'No route to host'.
+    En VPS sin ruteo IPv6, Supabase direct (`db.*.supabase.co`) suele ser solo IPv6
+    y falla con 'Connection refused' / 'No route to host'.
 
-    Usa el parámetro libpq `hostaddr` para conectar por IPv4 manteniendo el hostname
-    original (necesario para verificación SSL con Supabase).
+    1) Si hay A-record IPv4, fuerza `hostaddr=` (SSL sigue validando el hostname).
+    2) Si el host directo no tiene IPv4, lanza error claro pidiendo el pooler.
     """
     if "supabase.co" not in url or "hostaddr=" in url:
         return url
@@ -43,28 +44,40 @@ def _prefer_ipv4_database_url(url: str) -> str:
     if not host or host.replace(".", "").isdigit():
         return url
 
+    is_direct_db = host.startswith("db.") and host.endswith(".supabase.co")
+    is_pooler = "pooler.supabase.com" in host
+
     try:
-        # gethostbyname solo devuelve IPv4; evita que psycopg2 elija IPv6 del DNS.
+        # gethostbyname solo devuelve IPv4; si no hay A-record, falla.
         ipv4 = socket.gethostbyname(host)
     except OSError:
+        if is_direct_db:
+            raise RuntimeError(
+                "DATABASE_URL usa la conexión directa de Supabase (db.*.supabase.co), "
+                "que es solo IPv6. Este VPS no puede conectar. "
+                "En Supabase → Project Settings → Database → Connection string, "
+                "copiá la URL del pooler (Session mode, puerto 5432, host "
+                "*.pooler.supabase.com) y ponela en DATABASE_URL del .env del server."
+            )
         logger.warning(
             "No se pudo resolver IPv4 para %s; la conexión puede fallar en VPS sin IPv6",
             host,
         )
         return url
 
-    separator = "&" if parsed.query else "?"
+    # Pooler ya es IPv4; igual fijamos hostaddr por consistencia.
     query = parsed.query
-    if query:
-        rebuilt_query = f"{query}&hostaddr={ipv4}"
-    else:
-        rebuilt_query = f"hostaddr={ipv4}"
-
+    rebuilt_query = f"{query}&hostaddr={ipv4}" if query else f"hostaddr={ipv4}"
     rebuilt = urlunparse(parsed._replace(query=rebuilt_query))
     if dialect_prefix == "postgresql+psycopg2://":
         rebuilt = rebuilt.replace("postgresql://", dialect_prefix, 1)
 
-    logger.info("Conexión Supabase forzada a IPv4: %s -> hostaddr=%s", host, ipv4)
+    logger.info(
+        "Conexión Supabase forzada a IPv4 (%s): %s -> hostaddr=%s",
+        "pooler" if is_pooler else "direct",
+        host,
+        ipv4,
+    )
     return rebuilt
 
 
