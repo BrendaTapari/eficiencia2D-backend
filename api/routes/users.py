@@ -9,6 +9,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
 
 from api.deps import get_current_user
+from api.datetime_utils import dt_to_iso
 from api.routes.projects import (
     ProyectoListResponse,
     abrir_proyecto,
@@ -75,13 +76,9 @@ def _user_profile(db: Session, user: Usuario) -> UserProfileResponse:
         estado=user.estado,
         rol_id=rol_id,
         rol=RolResponse(id=rol_id, rol=rol_name),
-        fecha_creacion=user.fecha_creacion.isoformat(),
-        email_verified_at=(
-            user.email_verified_at.isoformat() if user.email_verified_at else None
-        ),
-        acepto_terminos_at=(
-            user.acepto_terminos_at.isoformat() if user.acepto_terminos_at else None
-        ),
+        fecha_creacion=dt_to_iso(user.fecha_creacion) or "",
+        email_verified_at=dt_to_iso(user.email_verified_at),
+        acepto_terminos_at=dt_to_iso(user.acepto_terminos_at),
         total_proyectos=total_proyectos,
     )
 
@@ -115,7 +112,7 @@ def get_terminos_status(
     accepted_at = current_user.acepto_terminos_at
     return TerminosStatusResponse(
         acepto_terminos=accepted_at is not None,
-        acepto_terminos_at=accepted_at.isoformat() if accepted_at else None,
+        acepto_terminos_at=dt_to_iso(accepted_at),
     )
 
 

@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from api.deps import get_current_user
+from api.datetime_utils import dt_to_iso
 from api.schemas.rol import DEFAULT_ROL_ID, RolResponse, user_rol_fields
 from core.security import create_access_token, hash_password, verify_password
 from database import ConfiguracionUsuario, Usuario, get_db
@@ -106,9 +107,7 @@ def _user_to_response(user: Usuario) -> UserResponse:
         estado=user.estado,
         rol_id=rol_id,
         rol=RolResponse(id=rol_id, rol=rol_name),
-        acepto_terminos_at=(
-            user.acepto_terminos_at.isoformat() if user.acepto_terminos_at else None
-        ),
+        acepto_terminos_at=dt_to_iso(user.acepto_terminos_at),
     )
 
 
