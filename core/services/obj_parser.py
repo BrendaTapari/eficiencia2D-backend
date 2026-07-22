@@ -66,12 +66,12 @@ def parse_obj(source: Union[str, Iterable[str]]) -> Dict[str, Any]:
         rest = line[sp + 1:]
 
         if prefix == 'v':
-            # Fast split de coordenadas (solo 3 floats)
-            # Usar partition en vez de split para evitar lista
-            p1, _, r1 = rest.partition(' ')
-            p2, _, p3 = r1.partition(' ')
+            # split() tolera espacios múltiples/iniciales (p. ej. 3ds Max exporta
+            # "v  -1788.8 ..." con doble espacio → partition dejaba el 1er token vacío
+            # y se descartaban TODOS los vértices → "no contiene caras válidas").
+            parts = rest.split()
             try:
-                vertices.append(Vec3(float(p1), float(p2), float(p3.split()[0] if ' ' in p3 else p3)))
+                vertices.append(Vec3(float(parts[0]), float(parts[1]), float(parts[2])))
             except (ValueError, IndexError):
                 skip_count += 1
 
@@ -169,10 +169,9 @@ def parse_obj(source: Union[str, Iterable[str]]) -> Dict[str, Any]:
             )
 
         elif prefix == 'vn':
-            p1, _, r1 = rest.partition(' ')
-            p2, _, p3 = r1.partition(' ')
+            parts = rest.split()  # robusto ante espacios múltiples/iniciales
             try:
-                normals.append(Vec3(float(p1), float(p2), float(p3.split()[0] if ' ' in p3 else p3)))
+                normals.append(Vec3(float(parts[0]), float(parts[1]), float(parts[2])))
             except (ValueError, IndexError):
                 skip_count += 1
 
@@ -188,4 +187,50 @@ def parse_obj(source: Union[str, Iterable[str]]) -> Dict[str, Any]:
     if skip_count > 0:
         warnings.append(f"Se omitieron {skip_count} caras/vertices con datos invalidos.")
 
+    # Heurística de unidades → metros (igual que parse_stl._guess_unit_scale y el
+    # guessUnitScale del front). El OBJ no guarda unidades; si viene en mm/cm el modelo
+    # queda diminuto y la clasificación descarta TODO (umbrales como min_real_area=1 m²),
+    # dando "no contiene caras válidas". Escalar acá lo evita, consistente con STL/front.
+    scale = _guess_unit_scale(vertices)
+    if scale != 1.0 and faces:
+        faces = [
+            IndexedFace3D(
+                vertices=[Vec3(v.x * scale, v.y * scale, v.z * scale) for v in f.vertices],
+                normal=f.normal,
+                inner_loops=[],
+                vertex_indices=f.vertex_indices,
+                material=getattr(f, "material", None),
+                source_object=getattr(f, "source_object", None),
+            )
+            for f in faces
+        ]
+        warnings.append(f"OBJ escalado x{scale:g} (heurística de unidades a metros).")
+
     return {"faces": faces, "warnings": warnings}
+
+
+def _guess_unit_scale(vertices) -> float:
+    """Unidades → metros por el span del bounding box (igual que parse_stl y el front).
+    span≤100 = metros (x1); ≤1000 = cm (x0.01); ≤50000 = mm (x0.001); mayor = normaliza
+    a ~20 m. Los modelos de edificio caen <100 m en metros, así que no se re-escalan."""
+    if not vertices:
+        return 1.0
+    minx = miny = minz = float("inf")
+    maxx = maxy = maxz = float("-inf")
+    for v in vertices:
+        if v.x < minx: minx = v.x
+        if v.x > maxx: maxx = v.x
+        if v.y < miny: miny = v.y
+        if v.y > maxy: maxy = v.y
+        if v.z < minz: minz = v.z
+        if v.z > maxz: maxz = v.z
+    span = max(maxx - minx, maxy - miny, maxz - minz)
+    if span <= 0:
+        return 1.0
+    if span <= 100:
+        return 1.0
+    if span <= 1000:
+        return 0.01
+    if span <= 50000:
+        return 0.001
+    return 20.0 / span
