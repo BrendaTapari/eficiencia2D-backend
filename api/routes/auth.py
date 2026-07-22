@@ -53,6 +53,7 @@ class UserResponse(BaseModel):
     estado: str
     rol_id: int
     rol: RolResponse
+    acepto_terminos_at: str | None = None
 
 
 class AuthResponse(BaseModel):
@@ -105,6 +106,9 @@ def _user_to_response(user: Usuario) -> UserResponse:
         estado=user.estado,
         rol_id=rol_id,
         rol=RolResponse(id=rol_id, rol=rol_name),
+        acepto_terminos_at=(
+            user.acepto_terminos_at.isoformat() if user.acepto_terminos_at else None
+        ),
     )
 
 

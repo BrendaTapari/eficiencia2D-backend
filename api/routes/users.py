@@ -32,6 +32,7 @@ class UserProfileResponse(BaseModel):
     rol: RolResponse
     fecha_creacion: str
     email_verified_at: str | None
+    acepto_terminos_at: str | None
     total_proyectos: int
 
 
@@ -48,9 +49,20 @@ class ChangePasswordResponse(BaseModel):
     message: str
 
 
+class AceptarTerminosRequest(BaseModel):
+    """El cliente debe enviar acepto=true explícitamente."""
+    acepto: bool = False
+
+
 class AceptarTerminosResponse(BaseModel):
     message: str
     acepto_terminos_at: str
+    ya_habia_aceptado: bool = False
+
+
+class TerminosStatusResponse(BaseModel):
+    acepto_terminos: bool
+    acepto_terminos_at: str | None
 
 
 def _user_profile(db: Session, user: Usuario) -> UserProfileResponse:
@@ -66,6 +78,9 @@ def _user_profile(db: Session, user: Usuario) -> UserProfileResponse:
         fecha_creacion=user.fecha_creacion.isoformat(),
         email_verified_at=(
             user.email_verified_at.isoformat() if user.email_verified_at else None
+        ),
+        acepto_terminos_at=(
+            user.acepto_terminos_at.isoformat() if user.acepto_terminos_at else None
         ),
         total_proyectos=total_proyectos,
     )
@@ -92,12 +107,36 @@ def get_my_profile(
     return _user_profile(db, user)
 
 
+@router.get("/users/me/terminos", response_model=TerminosStatusResponse)
+def get_terminos_status(
+    current_user: Usuario = Depends(get_current_user),
+):
+    """Estado de aceptación de términos del usuario autenticado."""
+    accepted_at = current_user.acepto_terminos_at
+    return TerminosStatusResponse(
+        acepto_terminos=accepted_at is not None,
+        acepto_terminos_at=accepted_at.isoformat() if accepted_at else None,
+    )
+
+
 @router.post("/users/me/aceptar-terminos", response_model=AceptarTerminosResponse)
 def aceptar_terminos(
+    body: AceptarTerminosRequest,
     current_user: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Registra la aceptación de términos y condiciones (pago / re-aceptación)."""
+    """
+    Registra la aceptación de términos y condiciones (registro ya lo hace;
+    en pago se vuelve a confirmar / actualizar timestamp).
+    Body: `{ "acepto": true }`.
+    """
+    if not body.acepto:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Debés aceptar los términos y condiciones para continuar",
+        )
+
+    ya_habia = current_user.acepto_terminos_at is not None
     now = datetime.now(timezone.utc)
     current_user.acepto_terminos_at = now
     try:
@@ -113,6 +152,7 @@ def aceptar_terminos(
     return AceptarTerminosResponse(
         message="Términos y condiciones aceptados",
         acepto_terminos_at=now.isoformat(),
+        ya_habia_aceptado=ya_habia,
     )
 
 
