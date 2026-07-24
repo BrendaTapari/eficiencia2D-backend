@@ -14,6 +14,11 @@ from core.services.joint_topology_classifier import (
     wall_run_length,
 )
 
+# Espesor por defecto cuando el modelo no lo trae (mallas de una sola cara). Al cortar
+# en MDF el grosor existe: es el estándar de 3 mm. Permite resolver los encastres
+# muro-muro (quién corta a quién) aunque la malla no tenga espesor.
+DEFAULT_MDF_THICKNESS_M = 0.003
+
 # ============================================================================
 # Assembly Adjuster
 #
@@ -133,6 +138,11 @@ def compute_adjustments(
             # Unión Muro–Muro
             t_a = g_a.thickness or 0.0
             t_b = g_b.thickness or 0.0
+            # Si el modelo no trae espesor (mallas de una sola cara), igual habrá grosor
+            # al cortar: el MDF estándar (3 mm). Se usa ese fallback para poder SUGERIR y
+            # APLICAR quién corta a quién, en vez de "no se detectó espesor".
+            eff_t_a = t_a if t_a > 0.001 else DEFAULT_MDF_THICKNESS_M
+            eff_t_b = t_b if t_b > 0.001 else DEFAULT_MDF_THICKNESS_M
 
             topo_info = (
                 classify_joint_topology(joint, g_a, g_b, faces) if faces else None
@@ -140,9 +150,9 @@ def compute_adjustments(
             topology = topo_info.topology if topo_info else "unknown"
 
             suggested_yield_group_id = choose_wall_wall_yielder(
-                g_a, g_b, t_a, t_b, topo_info, faces
+                g_a, g_b, eff_t_a, eff_t_b, topo_info, faces
             )
-            critical = is_critical_joint(topology, t_a, t_b)
+            critical = is_critical_joint(topology, eff_t_a, eff_t_b)
 
             new_ww_joint = WallWallJoint(
                 joint_index=ji,
@@ -162,8 +172,10 @@ def compute_adjustments(
                 other_group = group_by_id.get(other_group_id)
 
                 if yield_group and other_group:
-                    # Preferir el grosor del muro que no cede; sino el del que cede
-                    trim_thickness = 0.0
+                    # Preferir el grosor del muro que no cede; sino el del que cede; si
+                    # ninguno trae espesor (malla de una cara), usar el MDF estándar (3 mm)
+                    # → el usuario igual puede elegir quién corta a quién.
+                    trim_thickness = DEFAULT_MDF_THICKNESS_M
                     if other_group.thickness and other_group.thickness > 0.001:
                         trim_thickness = other_group.thickness
                     elif yield_group.thickness and yield_group.thickness > 0.001:
