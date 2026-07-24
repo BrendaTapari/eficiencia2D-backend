@@ -31,6 +31,7 @@ from core.services.cutting_sheet import build_placements
 from core.services.curvature import build_curvature_map
 from core.services.assembly_check import compute_assembly_warnings
 from core.group_classifier import compute_assembly_steps
+from core.services.assembly_adjuster import DEFAULT_MDF_THICKNESS_M
 from core.services.types import PipelineOptions, SheetConfig
 
 router = APIRouter()
@@ -108,9 +109,25 @@ def encode_faces_compact(faces: List) -> Dict:
 # /nesting-preview. Mantiene una sola fuente de verdad del formato de respuesta.
 # ---------------------------------------------------------------------------
 
+def _serialize_group(g) -> Dict:
+    """Serializa un grupo. Si es un muro sin espesor detectado (mallas de una sola
+    cara), reporta el espesor MDF estándar (3 mm) como `thickness` y marca
+    `thickness_assumed=True`. Así el front deja de mostrar "no se detectó espesor en
+    ninguna de las dos" y habilita la UI para elegir quién corta a quién: al cortar en
+    MDF ese grosor existe igual. El trim real ya usa el mismo fallback en
+    compute_adjustments; acá sólo se expone el dato para la UI (no toca la geometría)."""
+    d = dataclasses.asdict(g)
+    if g.category == "wall" and (g.thickness is None or g.thickness <= 0.001):
+        d["thickness"] = DEFAULT_MDF_THICKNESS_M
+        d["thickness_assumed"] = True
+    else:
+        d["thickness_assumed"] = False
+    return d
+
+
 def serialize_topology(result: Phase1Result, panel_id_by_group: Optional[Dict] = None) -> Dict:
     topo = {
-        "groups": [dataclasses.asdict(g) for g in result.groups],
+        "groups": [_serialize_group(g) for g in result.groups],
         "joints": [dataclasses.asdict(j) for j in result.joints],
         "adjustments": [dataclasses.asdict(a) for a in result.adjustments],
         "wall_wall_joints": [dataclasses.asdict(wj) for wj in result.wall_wall_joints],
