@@ -109,6 +109,9 @@ class PipelineOptions:
     sheet_config: Optional[SheetConfig] = None
     min_area_m2: Optional[float] = None
     page_mode: Optional[str] = None  # "one_per_sheet" | "single_page" (PDF de planchas)
+    # True → paredes y pisos se anidan JUNTOS en las mismas planchas (modelos chicos:
+    # evita desperdiciar una plancha por tipo). False/None → planchas separadas.
+    combine_sheets: Optional[bool] = None
 
 @dataclass
 class OutputFile:
