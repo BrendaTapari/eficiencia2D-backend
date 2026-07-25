@@ -373,7 +373,15 @@ def decompose_panels_from_groups(
         for w_adj in width_adjs.get(group.id, []):
             if w_adj.delta >= 0 or is_floor:
                 continue
-            strip = min(-w_adj.delta, width_m - 0.01)
+            # Espesor físico de MDF (3mm asumido): el delta está en mm de PLANCHA, no en
+            # cotas del edificio. Se escala por scale_denom para que tras el 1/scale_denom
+            # del nesting quede como 3mm reales en la plancha (si no, el recorte cae a
+            # ~0.03mm y el encastre elegido en el visor 3D no se ve en la plancha). Los
+            # espesores reales medidos (physical=False) son cotas del edificio → sin escalar.
+            raw = -w_adj.delta
+            if getattr(w_adj, "physical", False):
+                raw *= (opts.scale_denom or 1.0)
+            strip = min(raw, width_m - 0.01)
             if strip <= 0.001:
                 continue
             joint = phase1.joints[w_adj.joint_index]
