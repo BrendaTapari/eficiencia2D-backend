@@ -37,6 +37,11 @@ class DimensionAdjustment:
     axis: Literal["height", "height_top", "width"]
     reason: str
     joint_index: int
+    # `physical=True` → el `delta` es un grosor FÍSICO de la plancha (MDF 3mm asumido),
+    # no una cota del edificio. Al descomponer se multiplica por scale_denom para que en
+    # la plancha quede a su tamaño físico real (el nesting luego divide por scale_denom).
+    # Los espesores reales medidos (cotas del edificio) van con physical=False.
+    physical: bool = False
 
 
 @dataclass
@@ -176,20 +181,27 @@ def compute_adjustments(
                     # ninguno trae espesor (malla de una cara), usar el MDF estándar (3 mm)
                     # → el usuario igual puede elegir quién corta a quién.
                     trim_thickness = DEFAULT_MDF_THICKNESS_M
+                    physical = True  # ningún muro trae espesor → grosor físico de MDF
                     if other_group.thickness and other_group.thickness > 0.001:
                         trim_thickness = other_group.thickness
+                        physical = False
                     elif yield_group.thickness and yield_group.thickness > 0.001:
                         trim_thickness = yield_group.thickness
+                        physical = False
 
                     if trim_thickness > 0.001:
                         new_ww_joint.yield_group_id = decision
+                        grosor_label = (
+                            "MDF 3mm" if physical else f"grosor {trim_thickness * 100:.1f}cm"
+                        )
                         adjustments.append(
                             DimensionAdjustment(
                                 group_id=decision,
                                 delta=-trim_thickness,
                                 axis="width",
-                                reason=f"Junta con {other_group.label} (grosor {trim_thickness * 100:.1f}cm)",
+                                reason=f"Junta con {other_group.label} ({grosor_label})",
                                 joint_index=ji,
+                                physical=physical,
                             )
                         )
 
