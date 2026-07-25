@@ -436,6 +436,7 @@ class GenerateRequest(BaseModel):
     scale_denom: float = 50.0
     paper: str = "A4"
     page_mode: str = "one_per_sheet"  # "one_per_sheet" | "single_page" (PDF de planchas)
+    combine_sheets: bool = False  # paredes y pisos juntos en las mismas planchas
     min_area_m2: float = 1.0
     axis: Optional[str] = None  # "Y" | "Z" | None (usa el eje del upload)
     sheet_config: Optional[SheetConfigModel] = None
@@ -481,6 +482,7 @@ class NestingPreviewRequest(BaseModel):
     scale_denom: float = 50.0
     paper: str = "A4"
     page_mode: str = "one_per_sheet"  # cartón (deriva plancha del papel) | láser
+    combine_sheets: bool = False  # paredes y pisos juntos en las mismas planchas
 
 
 # ---------------------------------------------------------------------------
@@ -727,6 +729,7 @@ async def generate_pdf_endpoint(
             sheet_config=sheet_cfg,
             min_area_m2=request.min_area_m2,
             page_mode=request.page_mode,
+            combine_sheets=request.combine_sheets,
         )
 
         with timer.step("generate_pipeline"):
@@ -866,6 +869,7 @@ async def nesting_preview_endpoint(
             sheet_config=sheet_cfg,
             min_area_m2=request.min_area_m2,
             page_mode=request.page_mode,
+            combine_sheets=request.combine_sheets,
         )
 
         with timer.step("compute_nesting"):
