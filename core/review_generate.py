@@ -53,6 +53,10 @@ from core.services.types import OutputFile, PipelineOptions, Vec3, dot, normaliz
 MERGE_PARALLEL_DOT = 0.95   # |n_m·n_s| > esto => paralelas/antiparalelas (mismo plano)
 MERGE_PLANE_TOL = 0.30      # m: separación máxima de plano (tolera grosor/pieles)
 
+# Área mínima de un panel 2D en la plancha (m² de edificio). Sólo descarta astillas
+# degeneradas; es independiente del umbral de clasificación (opts.min_area_m2).
+MIN_PANEL_AREA_M2 = 0.01
+
 
 def _coplanar_for_merge(member: GeometryGroup, survivor: GeometryGroup) -> bool:
     ns = normalize(survivor.representative_normal)
@@ -63,19 +67,29 @@ def _coplanar_for_merge(member: GeometryGroup, survivor: GeometryGroup) -> bool:
     return abs(dot(ns, member.centroid) - dot(ns, survivor.centroid)) <= MERGE_PLANE_TOL
 
 
-def apply_merges(phase1: Phase1Result, merges: List[List[int]]) -> Phase1Result:
+def apply_merges(
+    phase1: Phase1Result,
+    merges: List[List[int]],
+    overrides: Optional[Dict[int, str]] = None,
+) -> Phase1Result:
     if not merges:
         return phase1
 
+    overrides = overrides or {}
     group_by_id: Dict[int, GeometryGroup] = {g.id: g for g in phase1.groups}
     merged_ids: set[int] = set()
     skipped = 0
 
     for merge_set in merges:
+        # Categoría EFECTIVA (con overrides del usuario): un grupo rescatado de
+        # "descartado" (p. ej. marco de ventana → Pared) debe poder fusionarse. Antes se
+        # filtraba por la categoría original y la fusión hecha en el visor se perdía en
+        # silencio → la plancha no reflejaba lo que mostraba el visor.
         members = [
             group_by_id[gid]
             for gid in merge_set
-            if gid in group_by_id and group_by_id[gid].category != "discard"
+            if gid in group_by_id
+            and _effective_category(group_by_id[gid], overrides) != "discard"
         ]
         if len(members) < 2:
             continue
@@ -286,7 +300,12 @@ def decompose_panels_from_groups(
             continue
 
         width_m, height_m, edges = result.width_m, result.height_m, result.edges
-        if width_m * height_m < min_area:
+        # Umbral por grupo: el filtro predeterminado sigue en min_area (1 m²), PERO si
+        # el usuario reclasificó EXPLÍCITAMENTE este grupo (override: p. ej. escalones o
+        # marcos rescatados de "descartado" → piso/pared), debe aparecer en la plancha
+        # aunque mida menos; para esos sólo se filtran astillas degeneradas (0.01 m²).
+        group_min_area = MIN_PANEL_AREA_M2 if group.id in overrides else min_area
+        if width_m * height_m < group_min_area:
             continue
 
         # Cortes manuales (user_cuts): se aplican en el marco de project_faces_to_2d
@@ -302,7 +321,7 @@ def decompose_panels_from_groups(
                 mxu = max(max(e.a.x, e.b.x) for e in piece_edges)
                 mxv = max(max(e.a.y, e.b.y) for e in piece_edges)
                 pw, ph = mxu - mnu, mxv - mnv
-                if pw * ph < min_area:
+                if pw * ph < group_min_area:
                     continue
                 norm = [
                     Edge2D(a=Vec2(e.a.x - mnu, e.a.y - mnv),
@@ -550,7 +569,7 @@ def _decompose(
     columns: Optional[List[dict]] = None,
 ) -> Tuple[Phase1Result, List[Panel], List[Panel], List]:
     """Aplica merges, resuelve encastres 3D y descompone a paneles 2D."""
-    work = apply_merges(phase1, merges or [])
+    work = apply_merges(phase1, merges or [], overrides)
     # Misión 1: resolver intersecciones placa-placa en 3D (encastres) sobre la
     # topología final (post-merges), antes de proyectar.
     plate_joints = resolve_plate_joints(work.groups, work.faces)
@@ -638,6 +657,13 @@ def compute_nesting(
     wall_np = _panels_to_nesting(wall_panels, scale)
     floor_np = _panels_to_nesting(floor_panels, scale)
 
+    # Plancha combinada: paredes y pisos juntos en las mismas planchas. Todo viaja por
+    # wall_nesting (los ids A#/B#/R#/C# ya distinguen el tipo) y floor_nesting queda
+    # vacío → el resto del flujo (serialización, DXF/PDF) no cambia.
+    if opts.combine_sheets:
+        wall_np = wall_np + floor_np
+        floor_np = []
+
     if page_mode == "single_page":
         # Modo láser: plancha = sheet_config físico (comportamiento actual).
         sheet_cfg = SheetConfig(
@@ -718,8 +744,12 @@ def generate_from_review(
         if cut_pdf:
             files.append(OutputFile(name=f"{stem}_{prefix}_corte.pdf", blob=cut_pdf))
 
-    add_nesting_outputs(wall_nesting, "Paredes", "Paredes")
-    add_nesting_outputs(floor_nesting, "Pisos", "Pisos")
+    if opts.combine_sheets:
+        # Plancha combinada: todas las piezas viajan en wall_nesting.
+        add_nesting_outputs(wall_nesting, "Piezas", "Piezas")
+    else:
+        add_nesting_outputs(wall_nesting, "Paredes", "Paredes")
+        add_nesting_outputs(floor_nesting, "Pisos", "Pisos")
 
     facades = extract_facades(work.faces, "Y")
     floor_plans = extract_floor_plans(work.faces, "Y")
