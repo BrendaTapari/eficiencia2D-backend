@@ -34,6 +34,7 @@ class UserProfileResponse(BaseModel):
     fecha_creacion: str
     email_verified_at: str | None
     acepto_terminos_at: str | None
+    first_time: bool
     total_proyectos: int
 
 
@@ -66,6 +67,16 @@ class TerminosStatusResponse(BaseModel):
     acepto_terminos_at: str | None
 
 
+class FirstTimeStatusResponse(BaseModel):
+    first_time: bool
+
+
+class CompletarFirstTimeResponse(BaseModel):
+    message: str
+    first_time: bool
+    ya_habia_completado: bool = False
+
+
 def _user_profile(db: Session, user: Usuario) -> UserProfileResponse:
     total_proyectos = db.query(Proyecto).filter(Proyecto.usuario_id == user.id).count()
     rol_id, rol_name = user_rol_fields(user)
@@ -79,6 +90,7 @@ def _user_profile(db: Session, user: Usuario) -> UserProfileResponse:
         fecha_creacion=dt_to_iso(user.fecha_creacion) or "",
         email_verified_at=dt_to_iso(user.email_verified_at),
         acepto_terminos_at=dt_to_iso(user.acepto_terminos_at),
+        first_time=bool(user.first_time),
         total_proyectos=total_proyectos,
     )
 
@@ -150,6 +162,43 @@ def aceptar_terminos(
         message="Términos y condiciones aceptados",
         acepto_terminos_at=now.isoformat(),
         ya_habia_aceptado=ya_habia,
+    )
+
+
+@router.get("/users/me/first-time", response_model=FirstTimeStatusResponse)
+def get_first_time_status(
+    current_user: Usuario = Depends(get_current_user),
+):
+    """Indica si el usuario autenticado aún no completó el recorrido de primera vez."""
+    return FirstTimeStatusResponse(first_time=bool(current_user.first_time))
+
+
+@router.post("/users/me/completar-first-time", response_model=CompletarFirstTimeResponse)
+def completar_first_time(
+    current_user: Usuario = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Marca el recorrido de onboarding como completado (`first_time = false`)."""
+    ya_habia = not bool(current_user.first_time)
+    if current_user.first_time:
+        current_user.first_time = False
+        try:
+            db.commit()
+        except SQLAlchemyError:
+            db.rollback()
+            logger.exception(
+                "Error al marcar first_time como completado para %s", current_user.id
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="No se pudo guardar el estado del recorrido",
+            ) from None
+        db.refresh(current_user)
+
+    return CompletarFirstTimeResponse(
+        message="Recorrido de primera vez completado",
+        first_time=False,
+        ya_habia_completado=ya_habia,
     )
 
 

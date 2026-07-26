@@ -55,6 +55,7 @@ class UserResponse(BaseModel):
     rol_id: int
     rol: RolResponse
     acepto_terminos_at: str | None = None
+    first_time: bool = True
 
 
 class AuthResponse(BaseModel):
@@ -108,6 +109,7 @@ def _user_to_response(user: Usuario) -> UserResponse:
         rol_id=rol_id,
         rol=RolResponse(id=rol_id, rol=rol_name),
         acepto_terminos_at=dt_to_iso(user.acepto_terminos_at),
+        first_time=bool(user.first_time),
     )
 
 

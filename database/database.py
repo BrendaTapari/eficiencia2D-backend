@@ -173,6 +173,7 @@ def init_db() -> None:
     _migrate_usuario_password_reset_schema()
     _migrate_usuario_rol_schema()
     _migrate_usuario_terminos_schema()
+    _migrate_usuario_first_time_schema()
     _migrate_cupones_schema()
     _migrate_planes_contract_schema()
     _migrate_precios_plan_schema()
@@ -389,6 +390,20 @@ def _migrate_usuario_terminos_schema() -> None:
             )
         )
     logger.info("Esquema de términos (usuarios.acepto_terminos_at) verificado")
+
+
+def _migrate_usuario_first_time_schema() -> None:
+    """Agrega first_time a usuarios si falta (no-op si ya existe en Supabase)."""
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                ALTER TABLE usuarios
+                ADD COLUMN IF NOT EXISTS first_time BOOLEAN NOT NULL DEFAULT TRUE
+                """
+            )
+        )
+    logger.info("Esquema de first_time (usuarios.first_time) verificado")
 
 
 def _migrate_cupones_schema() -> None:
@@ -683,6 +698,7 @@ class Usuario(Base):
     password_reset_token = Column(String(64), nullable=True, unique=True)
     password_reset_expires_at = Column(DateTime(timezone=True), nullable=True)
     acepto_terminos_at = Column(DateTime(timezone=True), nullable=True)
+    first_time = Column(Boolean, nullable=False, default=True, server_default='true')
     rol_id = Column(
         Integer,
         ForeignKey('rol.id', ondelete='RESTRICT'),
