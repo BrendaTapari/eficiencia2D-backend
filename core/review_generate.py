@@ -22,6 +22,7 @@ from core.services.cutting_sheet import (
     clip_panel_at_v,
     mirror_edges_horizontal,
     nested_sheets_to_dxf,
+    orient_group_normals_outward,
     project_faces_to_2d,
 )
 from core.services.plate_intersect import resolve_plate_joints
@@ -285,6 +286,10 @@ def decompose_panels_from_groups(
     floor_panels: List[Panel] = []
     wall_count = floor_count = 0
 
+    # Normal canónica hacia AFUERA por grupo: garantiza que el espejado deje el quemado
+    # del láser del lado interior aunque el archivo traiga normales invertidas.
+    oriented_normals = orient_group_normals_outward(phase1.groups)
+
     for group in phase1.groups:
         cat = _effective_category(group, overrides)
         if cat == "discard":
@@ -295,7 +300,9 @@ def decompose_panels_from_groups(
         if not faces:
             continue
 
-        result = project_faces_to_2d(faces, group.representative_normal, "Y")
+        result = project_faces_to_2d(
+            faces, oriented_normals.get(group.id, group.representative_normal), "Y"
+        )
         if not result:
             continue
 
