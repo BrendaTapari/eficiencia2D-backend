@@ -495,6 +495,40 @@ class ProjectedFace:
     origin_v: float
 
 
+def orient_group_normals_outward(groups) -> dict:
+    """Normal canónica hacia AFUERA del edificio por grupo: {group_id: Vec3}.
+
+    El espejado de la plancha (quemado del lado interior) y el instructivo asumen que
+    representative_normal apunta hacia afuera, pero el clasificador la toma tal cual
+    viene del archivo: un modelo con normales invertidas dejaría esa pieza espejada al
+    revés (quemado exterior). Regla determinística:
+      - techos/pisos (|n.y| ≥ 0.5)  → n.y > 0 (hacia el cielo; el espejo dibuja la cara
+        de abajo/interior, que es la que se quema)
+      - muros                        → alejándose del centroide horizontal del edificio
+        (tabiques interiores equidistantes: se deja como viene, cualquier cara es interior)
+    No muta los grupos; sólo devuelve la normal a usar al proyectar.
+    """
+    out: dict = {}
+    considered = [g for g in groups if getattr(g, "category", None) != "discard"]
+    if not considered:
+        considered = list(groups)
+
+    total = sum(g.total_area for g in considered) or 1.0
+    bx = sum(g.centroid.x * g.total_area for g in considered) / total
+    bz = sum(g.centroid.z * g.total_area for g in considered) / total
+
+    for g in groups:
+        n = g.representative_normal
+        if abs(n.y) >= 0.5:
+            out[g.id] = n if n.y > 0 else Vec3(-n.x, -n.y, -n.z)
+            continue
+        dx, dz = g.centroid.x - bx, g.centroid.z - bz
+        d = dx * n.x + dz * n.z
+        # d≈0: muro que pasa por el centro (tabique) → orientación indistinta, se respeta
+        out[g.id] = Vec3(-n.x, -n.y, -n.z) if d < -1e-9 else n
+    return out
+
+
 def project_faces_to_2d(
     faces: List[Face3D], group_normal: Vec3, up: UpAxis
 ) -> Optional[ProjectedFace]:
@@ -607,13 +641,18 @@ def compute_group_placement(
 def build_placements(groups, faces: List[Face3D], up: UpAxis = "Y") -> Dict[str, Dict]:
     """Marco de proyección 3D por grupo (no-discard). group_id (str) -> placement."""
     out: Dict[str, Dict] = {}
+    # Misma normal canónica (hacia afuera) que usa la plancha → el instructivo y el
+    # corte comparten marco aunque el archivo traiga normales invertidas.
+    oriented = orient_group_normals_outward(groups)
     for g in groups:
         if getattr(g, "category", None) == "discard":
             continue
         gfaces = [faces[fi] for fi in g.face_indices if 0 <= fi < len(faces)]
         if not gfaces:
             continue
-        pl = compute_group_placement(gfaces, g.representative_normal, up)
+        pl = compute_group_placement(
+            gfaces, oriented.get(g.id, g.representative_normal), up
+        )
         if pl:
             out[str(g.id)] = pl
     return out
