@@ -274,11 +274,22 @@ def decompose_panels_from_groups(
         phase1.faces,
     )
 
-    height_adj: Dict[int, float] = {}
+    # Los deltas con physical=True son grosor FÍSICO de la plancha (MDF 3 mm): se
+    # multiplican por scale_denom acá para que, tras el 1/scale_denom del nesting,
+    # queden como 3 mm reales en la plancha a cualquier escala.
+    def _delta_m(adj) -> float:
+        d = adj.delta
+        return d * (opts.scale_denom or 1.0) if getattr(adj, "physical", False) else d
+
+    height_adj: Dict[int, float] = {}       # recorta la BASE del muro
+    height_top_adj: Dict[int, float] = {}   # recorta la CIMA del muro (techo encima)
     width_adjs: Dict[int, list] = {}
     for adj in adj_result.adjustments:
         if adj.axis == "height":
-            height_adj[adj.group_id] = height_adj.get(adj.group_id, 0.0) + adj.delta
+            height_adj[adj.group_id] = height_adj.get(adj.group_id, 0.0) + _delta_m(adj)
+        elif adj.axis == "height_top":
+            # Antes caía en width_adjs y recortaba el ANCHO del panel en vez de su cima.
+            height_top_adj[adj.group_id] = height_top_adj.get(adj.group_id, 0.0) + _delta_m(adj)
         else:
             width_adjs.setdefault(adj.group_id, []).append(adj)
 
@@ -396,18 +407,28 @@ def decompose_panels_from_groups(
                         clipped["edges"],
                     )
 
+        # Techo/losa encima del muro → recortar la CIMA del panel (borde opuesto a la base).
+        top_delta = height_top_adj.get(group.id, 0.0)
+        if top_delta < 0 and not is_floor:
+            strip = min(-top_delta, height_m - 0.01)
+            if strip > 0.001:
+                base_at_min_v = result.v_up >= 0
+                clipped = (
+                    clip_panel_at_v(edges, height_m - strip, False)
+                    if base_at_min_v
+                    else clip_panel_at_v(edges, strip, True)
+                )
+                if clipped:
+                    width_m, height_m, edges = (
+                        clipped["width_m"],
+                        clipped["height_m"],
+                        clipped["edges"],
+                    )
+
         for w_adj in width_adjs.get(group.id, []):
             if w_adj.delta >= 0 or is_floor:
                 continue
-            # Espesor físico de MDF (3mm asumido): el delta está en mm de PLANCHA, no en
-            # cotas del edificio. Se escala por scale_denom para que tras el 1/scale_denom
-            # del nesting quede como 3mm reales en la plancha (si no, el recorte cae a
-            # ~0.03mm y el encastre elegido en el visor 3D no se ve en la plancha). Los
-            # espesores reales medidos (physical=False) son cotas del edificio → sin escalar.
-            raw = -w_adj.delta
-            if getattr(w_adj, "physical", False):
-                raw *= (opts.scale_denom or 1.0)
-            strip = min(raw, width_m - 0.01)
+            strip = min(-_delta_m(w_adj), width_m - 0.01)
             if strip <= 0.001:
                 continue
             joint = phase1.joints[w_adj.joint_index]
