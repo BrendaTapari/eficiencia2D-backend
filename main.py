@@ -66,9 +66,17 @@ app = FastAPI(
 # Desactivar con DISABLE_LOCALHOST_CORS=true en producción estricta.
 _LOCALHOST_ORIGINS = ("http://localhost:3000", "http://127.0.0.1:3000")
 
+# Dominios oficiales de producción: se permiten SIEMPRE (además de lo que venga por
+# variables de entorno), así el deploy en la VM de Google Cloud funciona aunque falten
+# las env vars de CORS. Incluye apex y www.
+_PRODUCTION_ORIGINS = (
+    "https://eficiencia2d.com.ar",
+    "https://www.eficiencia2d.com.ar",
+)
+
 
 def _resolve_cors_origins() -> list[str]:
-    parts: list[str] = []
+    parts: list[str] = list(_PRODUCTION_ORIGINS)
     for key in (
         "ALLOWED_ORIGINS",
         "FRONTEND_URL",
@@ -129,7 +137,17 @@ app.include_router(mp_webhooks_router, prefix="/api", tags=["Webhooks"])
 def read_root():
     return {"message": "Bienvenido a la API de Eficiencia2D Backend"}
 
-# Para correr localmente para pruebas sin la línea de comandos
+# Entrada directa (python main.py). Configurable por entorno para el deploy en la VM:
+#   HOST   — interfaz de escucha (default 0.0.0.0 → recibe tráfico externo de internet)
+#   PORT   — puerto (default 80 para producción; en local usar PORT=8081)
+#   RELOAD — "true" para autorecarga en desarrollo (default off en producción)
+# Nota: escuchar en el puerto 80 requiere privilegios (systemd como root, o
+#   `setcap 'cap_net_bind_service=+ep'` sobre el binario de python). En producción se
+#   recomienda uvicorn/gunicorn detrás de nginx (ver comandos de despliegue).
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8081, reload=True)
+
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "80"))
+    reload = os.environ.get("RELOAD", "").lower() in ("1", "true", "yes")
+    uvicorn.run("main:app", host=host, port=port, reload=reload)
