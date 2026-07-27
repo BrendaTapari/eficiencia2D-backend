@@ -1,5 +1,6 @@
 import logging
 from datetime import datetime, timezone
+from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
@@ -34,7 +35,6 @@ class UserProfileResponse(BaseModel):
     fecha_creacion: str
     email_verified_at: str | None
     acepto_terminos_at: str | None
-    first_time: bool
     total_proyectos: int
 
 
@@ -52,8 +52,10 @@ class ChangePasswordResponse(BaseModel):
 
 
 class AceptarTerminosRequest(BaseModel):
-    """El cliente debe enviar acepto=true explícitamente."""
-    acepto: bool = False
+    """Confirmación explícita. `acepto` sólo se usa para permitir un rechazo
+    explícito (`{"acepto": false}` → 400); si no se envía body, llamar al endpoint
+    ya es la aceptación (el front habilita el botón recién con el checkbox tildado)."""
+    acepto: bool = True
 
 
 class AceptarTerminosResponse(BaseModel):
@@ -65,16 +67,6 @@ class AceptarTerminosResponse(BaseModel):
 class TerminosStatusResponse(BaseModel):
     acepto_terminos: bool
     acepto_terminos_at: str | None
-
-
-class FirstTimeStatusResponse(BaseModel):
-    first_time: bool
-
-
-class CompletarFirstTimeResponse(BaseModel):
-    message: str
-    first_time: bool
-    ya_habia_completado: bool = False
 
 
 def _user_profile(db: Session, user: Usuario) -> UserProfileResponse:
@@ -90,7 +82,6 @@ def _user_profile(db: Session, user: Usuario) -> UserProfileResponse:
         fecha_creacion=dt_to_iso(user.fecha_creacion) or "",
         email_verified_at=dt_to_iso(user.email_verified_at),
         acepto_terminos_at=dt_to_iso(user.acepto_terminos_at),
-        first_time=bool(user.first_time),
         total_proyectos=total_proyectos,
     )
 
@@ -130,16 +121,20 @@ def get_terminos_status(
 
 @router.post("/users/me/aceptar-terminos", response_model=AceptarTerminosResponse)
 def aceptar_terminos(
-    body: AceptarTerminosRequest,
+    body: Optional[AceptarTerminosRequest] = None,
     current_user: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
     Registra la aceptación de términos y condiciones (registro ya lo hace;
     en pago se vuelve a confirmar / actualizar timestamp).
-    Body: `{ "acepto": true }`.
+
+    Body OPCIONAL: `{ "acepto": true }`. Un POST sin body cuenta como aceptación
+    (el endpoint se llama sólo al tildar el checkbox). Antes el body era obligatorio
+    y el POST sin body devolvía 422 "Field required", bloqueando el paso de pago.
+    Sólo un `{"acepto": false}` explícito se rechaza con 400.
     """
-    if not body.acepto:
+    if body is not None and not body.acepto:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Debés aceptar los términos y condiciones para continuar",
@@ -162,43 +157,6 @@ def aceptar_terminos(
         message="Términos y condiciones aceptados",
         acepto_terminos_at=now.isoformat(),
         ya_habia_aceptado=ya_habia,
-    )
-
-
-@router.get("/users/me/first-time", response_model=FirstTimeStatusResponse)
-def get_first_time_status(
-    current_user: Usuario = Depends(get_current_user),
-):
-    """Indica si el usuario autenticado aún no completó el recorrido de primera vez."""
-    return FirstTimeStatusResponse(first_time=bool(current_user.first_time))
-
-
-@router.post("/users/me/completar-first-time", response_model=CompletarFirstTimeResponse)
-def completar_first_time(
-    current_user: Usuario = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Marca el recorrido de onboarding como completado (`first_time = false`)."""
-    ya_habia = not bool(current_user.first_time)
-    if current_user.first_time:
-        current_user.first_time = False
-        try:
-            db.commit()
-        except SQLAlchemyError:
-            db.rollback()
-            logger.exception(
-                "Error al marcar first_time como completado para %s", current_user.id
-            )
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="No se pudo guardar el estado del recorrido",
-            ) from None
-        db.refresh(current_user)
-
-    return CompletarFirstTimeResponse(
-        message="Recorrido de primera vez completado",
-        first_time=False,
-        ya_habia_completado=ya_habia,
     )
 
 
