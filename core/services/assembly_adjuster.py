@@ -106,13 +106,12 @@ def compute_adjustments(
             floor = g_a if a_is_floor else g_b
             wall = g_b if a_is_floor else g_a
 
-            # Grosor: usar floor.thickness si está disponible; si no, estimarlo
-            # del rango Y (útil para techos modelados como superficie sin sólido).
-            thickness = floor.thickness or 0.0
-            if thickness < 0.001 and floor.min_y is not None and floor.max_y is not None:
-                thickness = floor.max_y - floor.min_y
-            if thickness < 0.001:
-                continue
+            # El muro se acorta el grosor del MATERIAL REAL que se va a cortar (MDF de
+            # 3 mm), no el espesor de la losa que trae el archivo 3D: esa es una cota del
+            # edificio (p. ej. 25 cm) y al reducirla por la escala daba un recorte
+            # distinto en cada escala (5 mm a 1:50, 2.5 mm a 1:100) en vez de los 3 mm
+            # físicos que mide la placa. Mismo criterio que las juntas muro-muro.
+            thickness = DEFAULT_MDF_THICKNESS_M
 
             label = floor.label if floor.label else f"Grupo {floor.id}"
 
@@ -123,8 +122,9 @@ def compute_adjustments(
                         group_id=wall.id,
                         delta=-thickness,
                         axis="height",
-                        reason=f"Junta con {label} (grosor {thickness * 100:.1f}cm)",
+                        reason=f"Junta con {label} (MDF 3mm)",
                         joint_index=ji,
+                        physical=True,
                     )
                 )
             elif is_roof_above_wall(floor, wall, joint):
@@ -134,8 +134,9 @@ def compute_adjustments(
                         group_id=wall.id,
                         delta=-thickness,
                         axis="height_top",
-                        reason=f"Techo sobre muro: {label} (grosor {thickness * 100:.1f}cm)",
+                        reason=f"Techo sobre muro: {label} (MDF 3mm)",
                         joint_index=ji,
+                        physical=True,
                     )
                 )
 
@@ -177,33 +178,26 @@ def compute_adjustments(
                 other_group = group_by_id.get(other_group_id)
 
                 if yield_group and other_group:
-                    # Preferir el grosor del muro que no cede; sino el del que cede; si
-                    # ninguno trae espesor (malla de una cara), usar el MDF estándar (3 mm)
-                    # → el usuario igual puede elegir quién corta a quién.
+                    # El muro que cede SIEMPRE se acorta el grosor del material real que
+                    # se va a cortar: MDF estándar de 3 mm, sin importar el espesor que
+                    # traiga el archivo 3D. Ese espesor del modelo es una cota del
+                    # EDIFICIO (p. ej. 20 cm) y al reducirlo por la escala daba un
+                    # recorte distinto en cada escala (4 mm a 1:50, 2 mm a 1:100) en vez
+                    # de los 3 mm físicos que mide la placa. physical=True → se escala
+                    # por scale_denom al descomponer para quedar en 3 mm reales.
                     trim_thickness = DEFAULT_MDF_THICKNESS_M
-                    physical = True  # ningún muro trae espesor → grosor físico de MDF
-                    if other_group.thickness and other_group.thickness > 0.001:
-                        trim_thickness = other_group.thickness
-                        physical = False
-                    elif yield_group.thickness and yield_group.thickness > 0.001:
-                        trim_thickness = yield_group.thickness
-                        physical = False
 
-                    if trim_thickness > 0.001:
-                        new_ww_joint.yield_group_id = decision
-                        grosor_label = (
-                            "MDF 3mm" if physical else f"grosor {trim_thickness * 100:.1f}cm"
+                    new_ww_joint.yield_group_id = decision
+                    adjustments.append(
+                        DimensionAdjustment(
+                            group_id=decision,
+                            delta=-trim_thickness,
+                            axis="width",
+                            reason=f"Junta con {other_group.label} (MDF 3mm)",
+                            joint_index=ji,
+                            physical=True,
                         )
-                        adjustments.append(
-                            DimensionAdjustment(
-                                group_id=decision,
-                                delta=-trim_thickness,
-                                axis="width",
-                                reason=f"Junta con {other_group.label} ({grosor_label})",
-                                joint_index=ji,
-                                physical=physical,
-                            )
-                        )
+                    )
 
     # Deduplicar ajustes de altura: mantener el delta más negativo por grupo y eje.
     # Los ajustes de ancho (muro-muro) pasan directos.
