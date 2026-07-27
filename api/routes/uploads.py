@@ -37,8 +37,14 @@ from core.services.types import PipelineOptions, SheetConfig
 router = APIRouter()
 logger = logging.getLogger("eficiencia2d.pipeline")
 
-UPLOAD_DIR = "temp/uploads"
-CACHE_DIR = "temp/cache"
+# Directorios de trabajo (uploads OBJ/STL y caché de Phase1, DXF/PDF temporales).
+# Se anclan a una raíz ABSOLUTA para no depender del CWD (un servicio systemd puede
+# arrancar desde cualquier directorio). Base configurable con DATA_DIR; por defecto la
+# carpeta `temp/` del proyecto. os.path.join → separador correcto en Linux/Windows.
+_PROJECT_DIR = Path(__file__).resolve().parents[2]
+_DATA_DIR = os.environ.get("DATA_DIR") or os.path.join(_PROJECT_DIR, "temp")
+UPLOAD_DIR = os.path.join(_DATA_DIR, "uploads")
+CACHE_DIR = os.path.join(_DATA_DIR, "cache")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR, exist_ok=True)
 
