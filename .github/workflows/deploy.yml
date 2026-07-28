@@ -26,9 +26,9 @@ jobs:
           host: ${{ secrets.GCP_HOST }}
           username: ${{ secrets.GCP_USERNAME }}
           key: ${{ secrets.GCP_SSH_KEY }}
-          # Aborta si algún comando falla, en vez de reiniciar con código a medias.
-          script_stops: true
           command_timeout: 15m
+          # El corte ante un fallo lo da el `set -e` del script (script_stops no
+          # existe en esta versión de la action y sólo genera un warning).
           script: |
             set -e
             cd /opt/eficiencia2D-backend
