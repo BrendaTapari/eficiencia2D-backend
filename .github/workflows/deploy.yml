@@ -33,5 +33,8 @@ jobs:
             set -e
             cd /opt/eficiencia2D-backend
             git pull origin main
-            chmod +x restart_server.sh
-            ./restart_server.sh
+            # Se invoca con `bash` en vez de `./`: así no hace falta el bit de
+            # ejecución. Un `chmod +x` acá modificaba el archivo (git versiona los
+            # permisos) y dejaba el working tree sucio, con lo cual el `git pull` de
+            # la corrida siguiente abortaba por "local changes would be overwritten".
+            bash restart_server.sh
