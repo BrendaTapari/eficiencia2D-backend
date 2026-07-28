@@ -91,9 +91,27 @@ MIN_HOLE_AREA = 0.0025
 
 
 def ring_2d_area(ring: List[Tuple[float, float]]) -> float:
+    """Área con signo (shoelace) de un anillo, ABIERTO o CERRADO.
+
+    Antes se sumaba sólo hasta len(ring)-1, omitiendo el término que cierra el
+    polígono. Con los anillos de shapely no se notaba (traen el primer vértice
+    repetido al final), pero los triángulos crudos del OBJ vienen abiertos y su área
+    salía mal: en algunos casos los términos se cancelaban y daba exactamente 0, así
+    que union_outline los descartaba por "degenerados" y esa porción de pared quedaba
+    como un hueco con forma de cuña en la plancha.
+    """
+    n = len(ring)
+    if n < 3:
+        return 0.0
+    # Si el anillo ya viene cerrado (shapely), ignorar el vértice duplicado final.
+    if abs(ring[0][0] - ring[-1][0]) < 1e-12 and abs(ring[0][1] - ring[-1][1]) < 1e-12:
+        n -= 1
+    if n < 3:
+        return 0.0
     a = 0.0
-    for i in range(len(ring) - 1):
-        a += ring[i][0] * ring[i + 1][1] - ring[i + 1][0] * ring[i][1]
+    for i in range(n):
+        j = (i + 1) % n
+        a += ring[i][0] * ring[j][1] - ring[j][0] * ring[i][1]
     return a / 2.0
 
 
