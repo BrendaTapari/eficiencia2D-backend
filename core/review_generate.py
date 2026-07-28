@@ -166,6 +166,74 @@ def _effective_category(
     return overrides.get(group.id, group.category)
 
 
+def _clip_segment_to_rect(
+    ax: float, ay: float, bx: float, by: float, w: float, h: float
+) -> Optional[Tuple[float, float, float, float]]:
+    """Recorta el segmento al rectángulo [0,w]x[0,h] (Liang–Barsky).
+
+    Devuelve None si queda totalmente fuera. Se usa para que las ranuras de encastre
+    nunca sobresalgan de la pieza: el nesting ubica los paneles por su width×height, así
+    que cualquier trazo fuera de ese rectángulo se dibuja encima del panel vecino.
+    """
+    # Tolerancia: permite que la ranura toque el borde sin perderse por redondeo.
+    eps = 1e-9
+    dx, dy = bx - ax, by - ay
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-dx, ax), (dx, w - ax), (-dy, ay), (dy, h - ay)):
+        if abs(p) < eps:
+            if q < -eps:
+                return None  # paralelo y fuera
+            continue
+        r = q / p
+        if p < 0:
+            if r > t1:
+                return None
+            if r > t0:
+                t0 = r
+        else:
+            if r < t0:
+                return None
+            if r < t1:
+                t1 = r
+    if t1 - t0 < eps:
+        return None
+    return (ax + t0 * dx, ay + t0 * dy, ax + t1 * dx, ay + t1 * dy)
+
+
+def _fit_panel_bbox(
+    edges: List[Edge2D], width_m: float, height_m: float
+) -> Tuple[List[Edge2D], float, float]:
+    """Red de seguridad: garantiza que width×height contenga TODA la geometría dibujada.
+
+    El nesting separa las piezas por su bounding box declarado; si alguna arista
+    quedara fuera, la pieza invadiría a su vecina en la plancha pese a la brecha.
+    Si algo se sale, se re-encuadra (traslada y agranda) en vez de recortar geometría.
+    """
+    if not edges:
+        return edges, width_m, height_m
+    xs = [c for e in edges for c in (e.a.x, e.b.x)]
+    ys = [c for e in edges for c in (e.a.y, e.b.y)]
+    min_x, max_x = min(xs), min(max(xs), float("inf"))
+    max_x = max(xs)
+    min_y, max_y = min(ys), max(ys)
+    tol = 1e-9
+    if min_x >= -tol and min_y >= -tol and max_x <= width_m + tol and max_y <= height_m + tol:
+        return edges, width_m, height_m
+    ox, oy = min(min_x, 0.0), min(min_y, 0.0)
+    shifted = [
+        Edge2D(
+            a=Vec2(e.a.x - ox, e.a.y - oy),
+            b=Vec2(e.b.x - ox, e.b.y - oy),
+            hole=e.hole,
+            joint=getattr(e, "joint", False),
+            score=getattr(e, "score", False),
+            flex=getattr(e, "flex", False),
+        )
+        for e in edges
+    ]
+    return shifted, max(width_m, max_x - ox), max(height_m, max_y - oy)
+
+
 def _slot_edges(
     ax: float, ay: float, bx: float, by: float, width: float, mark: bool = False
 ) -> List[Edge2D]:
@@ -318,6 +386,11 @@ def decompose_panels_from_groups(
             continue
 
         width_m, height_m, edges = result.width_m, result.height_m, result.edges
+        # Desplazamiento acumulado por los recortes de ensamble: cada clip re-normaliza
+        # el panel a un origen nuevo, así que lo que se proyecte después en el marco
+        # ORIGINAL (las ranuras de encastre) debe restarlo o se dibuja fuera de la pieza.
+        clip_off_u = 0.0
+        clip_off_v = 0.0
         # Umbral por grupo: el filtro predeterminado sigue en min_area (1 m²), PERO si
         # el usuario reclasificó EXPLÍCITAMENTE este grupo (override: p. ej. escalones o
         # marcos rescatados de "descartado" → piso/pared), debe aparecer en la plancha
@@ -406,6 +479,8 @@ def decompose_panels_from_groups(
                         clipped["height_m"],
                         clipped["edges"],
                     )
+                    clip_off_u += clipped.get("offset_u", 0.0)
+                    clip_off_v += clipped.get("offset_v", 0.0)
 
         # Techo/losa encima del muro → recortar la CIMA del panel (borde opuesto a la base).
         top_delta = height_top_adj.get(group.id, 0.0)
@@ -424,6 +499,8 @@ def decompose_panels_from_groups(
                         clipped["height_m"],
                         clipped["edges"],
                     )
+                    clip_off_u += clipped.get("offset_u", 0.0)
+                    clip_off_v += clipped.get("offset_v", 0.0)
 
         for w_adj in width_adjs.get(group.id, []):
             if w_adj.delta >= 0 or is_floor:
@@ -445,6 +522,8 @@ def decompose_panels_from_groups(
                     clipped["height_m"],
                     clipped["edges"],
                 )
+                clip_off_u += clipped.get("offset_u", 0.0)
+                clip_off_v += clipped.get("offset_v", 0.0)
 
         edges = mirror_edges_horizontal(edges, width_m)
 
@@ -452,15 +531,21 @@ def decompose_panels_from_groups(
         # RANURA de encastre (kind="slot", joint → CUT_INTERIOR, se corta) o el FOOTPRINT
         # de apoyo (kind="surface", score → MARK_VECTOR rojo, se graba, no se corta). El
         # segmento 3D se proyecta al marco del panel y se espeja igual que el contorno.
+        # Se resta clip_off_u/v (desplazamiento de los recortes) y se descartan las
+        # ranuras que caen fuera de la pieza ya recortada: si no, se dibujaban en el
+        # marco viejo y quedaban fuera del bounding box del panel, invadiendo al vecino
+        # en la plancha (el nesting sólo conoce width_m × height_m).
         for (pa, pb, slot_w, kind) in joints_by_cut.get(group.id, []):
-            ua = dot(pa, result.u_axis) - result.origin_u
-            va = dot(pa, result.v_axis) - result.origin_v
-            ub = dot(pb, result.u_axis) - result.origin_u
-            vb = dot(pb, result.v_axis) - result.origin_v
-            edges.extend(
-                _slot_edges(width_m - ua, va, width_m - ub, vb, slot_w,
-                            mark=(kind == "surface"))
+            ua = dot(pa, result.u_axis) - result.origin_u - clip_off_u
+            va = dot(pa, result.v_axis) - result.origin_v - clip_off_v
+            ub = dot(pb, result.u_axis) - result.origin_u - clip_off_u
+            vb = dot(pb, result.v_axis) - result.origin_v - clip_off_v
+            seg = _clip_segment_to_rect(
+                width_m - ua, va, width_m - ub, vb, width_m, height_m
             )
+            if seg is None:
+                continue
+            edges.extend(_slot_edges(*seg, slot_w, mark=(kind == "surface")))
 
         # Patrón de flexión (flex): se corta DENTRO del panel YA proyectado, trimado y
         # espejado — es decir, sobre EXACTAMENTE la misma silueta/orientación que sin
@@ -484,6 +569,10 @@ def decompose_panels_from_groups(
         mlines = mark_lines_by_group.get(group.id)
         if mlines:
             edges = list(edges) + apply_mark_lines_to_panel(width_m, height_m, edges, mlines)
+
+        # El bounding box declarado debe contener TODO lo dibujado: el nesting separa
+        # las piezas por width×height, así que cualquier trazo fuera invadiría al vecino.
+        edges, width_m, height_m = _fit_panel_bbox(edges, width_m, height_m)
 
         if is_floor:
             floor_count += 1
