@@ -174,6 +174,7 @@ def init_db() -> None:
     _migrate_usuario_rol_schema()
     _migrate_usuario_terminos_schema()
     _migrate_usuario_first_time_schema()
+    _migrate_usuario_google_schema()
     _migrate_cupones_schema()
     _migrate_planes_contract_schema()
     _migrate_precios_plan_schema()
@@ -404,6 +405,29 @@ def _migrate_usuario_first_time_schema() -> None:
             )
         )
     logger.info("Esquema de first_time (usuarios.first_time) verificado")
+
+
+def _migrate_usuario_google_schema() -> None:
+    """Agrega columnas de login con Google si faltan."""
+    statements = (
+        """
+        ALTER TABLE usuarios
+        ADD COLUMN IF NOT EXISTS google_sub VARCHAR
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS ix_usuarios_google_sub
+        ON usuarios (google_sub)
+        WHERE google_sub IS NOT NULL
+        """,
+        """
+        ALTER TABLE usuarios
+        ADD COLUMN IF NOT EXISTS avatar_url VARCHAR
+        """,
+    )
+    with engine.begin() as conn:
+        for sql in statements:
+            conn.execute(text(sql))
+    logger.info("Esquema de Google OAuth (usuarios.google_sub/avatar_url) verificado")
 
 
 def _migrate_cupones_schema() -> None:
@@ -699,6 +723,8 @@ class Usuario(Base):
     password_reset_expires_at = Column(DateTime(timezone=True), nullable=True)
     acepto_terminos_at = Column(DateTime(timezone=True), nullable=True)
     first_time = Column(Boolean, nullable=False, default=True, server_default='true')
+    google_sub = Column(String, nullable=True, unique=True)
+    avatar_url = Column(String, nullable=True)
     rol_id = Column(
         Integer,
         ForeignKey('rol.id', ondelete='RESTRICT'),

@@ -1,9 +1,12 @@
 import logging
 import os
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token as google_id_token
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -29,6 +32,8 @@ logger = logging.getLogger(__name__)
 ESTADO_ACTIVO = "activo"
 ESTADO_PENDIENTE = "pendiente_verificacion"
 PASSWORD_RESET_EXPIRE_MINUTES = int(os.environ.get("PASSWORD_RESET_EXPIRE_MINUTES", "60"))
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
 
 
 class RegisterRequest(BaseModel):
@@ -41,6 +46,11 @@ class RegisterRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=1, max_length=128)
+
+
+class GoogleLoginRequest(BaseModel):
+    """JWT (credential) emitido por Google Identity Services / @react-oauth/google."""
+    credential: str = Field(min_length=20, max_length=4096)
 
 
 class VerifyEmailRequest(BaseModel):
@@ -56,6 +66,7 @@ class UserResponse(BaseModel):
     rol: RolResponse
     acepto_terminos_at: str | None = None
     first_time: bool = True
+    avatar_url: str | None = None
 
 
 class AuthResponse(BaseModel):
@@ -110,6 +121,7 @@ def _user_to_response(user: Usuario) -> UserResponse:
         rol=RolResponse(id=rol_id, rol=rol_name),
         acepto_terminos_at=dt_to_iso(user.acepto_terminos_at),
         first_time=bool(user.first_time),
+        avatar_url=user.avatar_url,
     )
 
 
@@ -120,6 +132,154 @@ def _build_auth_response(user: Usuario) -> AuthResponse:
 
 def _create_verification_token() -> str:
     return str(uuid.uuid4())
+
+
+def _verify_google_credential(credential: str) -> dict:
+    """Valida el JWT de Google y devuelve el payload (email, name, picture, sub, …)."""
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Login con Google no está configurado en el servidor",
+        )
+
+    try:
+        payload = google_id_token.verify_oauth2_token(
+            credential,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID,
+            clock_skew_in_seconds=10,
+        )
+    except ValueError as exc:
+        logger.warning("Token de Google inválido: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token de Google inválido o expirado",
+        ) from None
+    except Exception:
+        logger.exception("Error al verificar token de Google")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="No se pudo verificar el token de Google",
+        ) from None
+
+    if payload.get("aud") != GOOGLE_CLIENT_ID:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="El clientId del token no coincide con la aplicación",
+        )
+
+    iss = payload.get("iss")
+    if iss not in ("accounts.google.com", "https://accounts.google.com"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Emisor del token de Google no reconocido",
+        )
+
+    if not payload.get("email"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="El token de Google no incluye un email",
+        )
+
+    if payload.get("email_verified") is False:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="El email de Google no está verificado",
+        )
+
+    return payload
+
+
+def _get_or_create_google_user(db: Session, google_payload: dict) -> Usuario:
+    email = str(google_payload["email"]).lower().strip()
+    google_sub = str(google_payload.get("sub") or "").strip() or None
+    nombre = (google_payload.get("name") or google_payload.get("given_name") or "").strip() or None
+    avatar_url = (google_payload.get("picture") or "").strip() or None
+    now = datetime.now(timezone.utc)
+
+    user = db.query(Usuario).filter(Usuario.email == email).first()
+    if user is None and google_sub:
+        user = db.query(Usuario).filter(Usuario.google_sub == google_sub).first()
+
+    if user is None:
+        user = Usuario(
+            email=email,
+            # Cuenta OAuth: hash aleatorio (no se usa para login con contraseña)
+            password_hash=hash_password(secrets.token_urlsafe(32)),
+            nombre=nombre,
+            estado=ESTADO_ACTIVO,
+            email_verification_token=None,
+            email_verified_at=now,
+            rol_id=DEFAULT_ROL_ID,
+            first_time=True,
+            google_sub=google_sub,
+            avatar_url=avatar_url,
+        )
+        config = ConfiguracionUsuario(usuario=user)
+        db.add(user)
+        db.add(config)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            # Carrera: otro request creó el mismo email
+            user = db.query(Usuario).filter(Usuario.email == email).first()
+            if user is None:
+                logger.exception("Error de integridad al crear usuario Google")
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="No se pudo crear la cuenta con Google",
+                ) from None
+        except SQLAlchemyError:
+            db.rollback()
+            logger.exception("Error de base de datos al crear usuario Google")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="No se pudo conectar con la base de datos. Intentá de nuevo en unos segundos.",
+            ) from None
+        else:
+            db.refresh(user)
+            logger.info("Usuario creado vía Google: %s", user.email)
+            return user
+
+    # Usuario existente: vincular Google / actualizar perfil básico
+    if user.estado not in (ESTADO_ACTIVO, ESTADO_PENDIENTE):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cuenta inactiva",
+        )
+
+    dirty = False
+    if google_sub and user.google_sub != google_sub:
+        user.google_sub = google_sub
+        dirty = True
+    if avatar_url and user.avatar_url != avatar_url:
+        user.avatar_url = avatar_url
+        dirty = True
+    if nombre and not user.nombre:
+        user.nombre = nombre
+        dirty = True
+    if user.estado == ESTADO_PENDIENTE:
+        user.estado = ESTADO_ACTIVO
+        user.email_verification_token = None
+        dirty = True
+    if user.email_verified_at is None:
+        user.email_verified_at = now
+        dirty = True
+
+    if dirty:
+        try:
+            db.commit()
+        except SQLAlchemyError:
+            db.rollback()
+            logger.exception("Error al actualizar usuario Google %s", user.id)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="No se pudo actualizar el usuario",
+            ) from None
+        db.refresh(user)
+
+    return user
 
 
 async def _send_verification_email_task(
@@ -239,7 +399,7 @@ async def register(
 @router.get("/auth/mail-status")
 def mail_status():
     """
-    Muestra qué configuración SMTP lee el proceso (sin exponer la contraseña).
+    Muestra qué configuración SMTP lee el servidor (sin exponer la contraseña).
     Compará password_length con 16 y env_file con la ruta del servidor.
     """
     return get_mail_config_status()
@@ -350,6 +510,28 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
             detail="Cuenta inactiva",
         )
 
+    return _build_auth_response(user)
+
+
+@router.post("/auth/google", response_model=AuthResponse)
+def login_with_google(body: GoogleLoginRequest, db: Session = Depends(get_db)):
+    """
+    Valida el JWT de Google (`credential`), crea o recupera el usuario,
+    y emite el JWT propio de la app (mismo formato que /auth/login).
+    """
+    # GOOGLE_CLIENT_SECRET se lee del entorno (flujo code exchange futuro);
+    # la verificación de ID token solo requiere GOOGLE_CLIENT_ID.
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Falta GOOGLE_CLIENT_ID en la configuración del servidor",
+        )
+    if not GOOGLE_CLIENT_SECRET:
+        logger.warning("GOOGLE_CLIENT_SECRET no está definido (no requerido para ID token)")
+
+    google_payload = _verify_google_credential(body.credential.strip())
+    user = _get_or_create_google_user(db, google_payload)
+    logger.info("Login Google OK: %s", user.email)
     return _build_auth_response(user)
 
 

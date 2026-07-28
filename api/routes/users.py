@@ -35,6 +35,8 @@ class UserProfileResponse(BaseModel):
     fecha_creacion: str
     email_verified_at: str | None
     acepto_terminos_at: str | None
+    first_time: bool = True
+    avatar_url: str | None = None
     total_proyectos: int
 
 
@@ -82,6 +84,8 @@ def _user_profile(db: Session, user: Usuario) -> UserProfileResponse:
         fecha_creacion=dt_to_iso(user.fecha_creacion) or "",
         email_verified_at=dt_to_iso(user.email_verified_at),
         acepto_terminos_at=dt_to_iso(user.acepto_terminos_at),
+        first_time=bool(user.first_time),
+        avatar_url=user.avatar_url,
         total_proyectos=total_proyectos,
     )
 

@@ -13,6 +13,8 @@ CREATE TABLE usuarios (
     email_verified_at TIMESTAMPTZ,
     rol_id INTEGER NOT NULL DEFAULT 1,
     first_time BOOLEAN NOT NULL DEFAULT TRUE,
+    google_sub VARCHAR UNIQUE,
+    avatar_url VARCHAR,
     CONSTRAINT fk_usuarios_rol FOREIGN KEY (rol_id) REFERENCES Rol (id)
 );
 
