@@ -135,7 +135,7 @@ app.include_router(mp_webhooks_router, prefix="/api", tags=["Webhooks"])
 
 @app.get("/")
 def read_root():
-    return {"message": "Bienvenido a la API de Eficiencia2D Backend"}
+    return {"message": "Bienvenido a la API de Eficiencia2D Backend", "version": "deploy-test-1"}
 
 # Entrada directa (python main.py). Configurable por entorno para el deploy en la VM:
 #   HOST   — interfaz de escucha (default 0.0.0.0 → recibe tráfico externo de internet)
