@@ -32,9 +32,13 @@ jobs:
           script: |
             set -e
             cd /opt/eficiencia2D-backend
-            git pull origin main
+            # reset --hard en vez de pull: deja la VM IDÉNTICA a main. Un `git pull`
+            # aborta si algún archivo versionado quedó modificado en el servidor
+            # ("local changes would be overwritten by merge") y frena el despliegue.
+            # El servidor es una copia desechable del repo: no se editan archivos ahí.
+            # No borra lo ignorado por git (venv/, .env, temp/): esos quedan intactos.
+            git fetch origin main
+            git reset --hard origin/main
             # Se invoca con `bash` en vez de `./`: así no hace falta el bit de
-            # ejecución. Un `chmod +x` acá modificaba el archivo (git versiona los
-            # permisos) y dejaba el working tree sucio, con lo cual el `git pull` de
-            # la corrida siguiente abortaba por "local changes would be overwritten".
+            # ejecución (git versiona los permisos y un chmod ensuciaría el repo).
             bash restart_server.sh
