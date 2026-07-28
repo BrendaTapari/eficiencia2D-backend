@@ -1,0 +1,37 @@
+name: Deploy a GCP
+
+# Despliegue continuo: cada push a main entra por SSH a la VM de GCP, trae el
+# código nuevo y reinicia el servicio.
+on:
+  push:
+    branches: [main]
+  # Permite lanzarlo a mano desde la pestaña Actions (útil para redeploys).
+  workflow_dispatch:
+
+# Evita que dos despliegues se pisen: si llega un push mientras corre otro, el
+# nuevo espera en vez de dejar el servidor a medio actualizar.
+concurrency:
+  group: deploy-produccion
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Actualizar VM por SSH
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Conectar por SSH y desplegar
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.GCP_HOST }}
+          username: ${{ secrets.GCP_USERNAME }}
+          key: ${{ secrets.GCP_SSH_KEY }}
+          # Aborta si algún comando falla, en vez de reiniciar con código a medias.
+          script_stops: true
+          command_timeout: 15m
+          script: |
+            set -e
+            cd /opt/eficiencia2D-backend
+            git pull origin main
+            chmod +x restart_server.sh
+            ./restart_server.sh
