@@ -89,12 +89,19 @@ class SheetState:
 
 EPS = 0.0005
 
+# Tolerancia puramente numérica (nanómetros en metros). La holgura de EPS (0.5 mm) NO
+# puede usarse para decidir si una pieza entra: aceptaba paneles hasta 0.5 mm MÁS
+# grandes que el hueco libre, y ese sobrante invadía a la pieza vecina en la plancha
+# (se veían vectores cruzando componentes contiguos). Si no entra, va a la plancha
+# siguiente.
+FIT_EPS = 1e-9
+
 
 def find_best_rect(free_rects: List[FreeRect], pw: float, ph: float) -> Optional[dict]:
     """Best Short Side Fit — minimiza la dimensión sobrante más corta."""
     best = None
     for rect in free_rects:
-        if pw <= rect.w + EPS and ph <= rect.h + EPS:
+        if pw <= rect.w + FIT_EPS and ph <= rect.h + FIT_EPS:
             left_h = rect.w - pw
             left_v = rect.h - ph
             short_side = min(left_h, left_v)
@@ -150,6 +157,11 @@ def commit_placement(
         )
     )
 
+    # Región reservada = panel + brecha en los CUATRO lados. Antes sólo se reservaba a
+    # la derecha y arriba, así que una pieza colocada después a la izquierda o abajo
+    # quedaba pegada (0 mm) en vez de respetar los 3 mm de separación estándar.
+    bx1 = px - gap
+    by1 = py - gap
     bx2 = px + pw + gap
     by2 = py + ph + gap
     next_rects: List[FreeRect] = []
@@ -159,17 +171,17 @@ def commit_placement(
         ry2 = rect.y + rect.h
 
         # Si el rectángulo libre no se intersecta con el panel colocado, se conserva intacto
-        if bx2 <= rect.x or px >= rx2 or by2 <= rect.y or py >= ry2:
+        if bx2 <= rect.x or bx1 >= rx2 or by2 <= rect.y or by1 >= ry2:
             next_rects.append(rect)
             continue
 
         # Si hay intersección, el rectángulo libre se divide en hasta 4 sub-rectángulos nuevos
-        if px > rect.x:
-            next_rects.append(FreeRect(x=rect.x, y=rect.y, w=px - rect.x, h=rect.h))
+        if bx1 > rect.x:
+            next_rects.append(FreeRect(x=rect.x, y=rect.y, w=bx1 - rect.x, h=rect.h))
         if bx2 < rx2:
             next_rects.append(FreeRect(x=bx2, y=rect.y, w=rx2 - bx2, h=rect.h))
-        if py > rect.y:
-            next_rects.append(FreeRect(x=rect.x, y=rect.y, w=rect.w, h=py - rect.y))
+        if by1 > rect.y:
+            next_rects.append(FreeRect(x=rect.x, y=rect.y, w=rect.w, h=by1 - rect.y))
         if by2 < ry2:
             next_rects.append(FreeRect(x=rect.x, y=by2, w=rect.w, h=ry2 - by2))
 
