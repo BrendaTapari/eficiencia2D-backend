@@ -717,7 +717,16 @@ def clip_panel_at_v(
         )
         for e in out
     ]
-    return {"width_m": w, "height_m": h, "edges": normalized}
+    # offset_u/offset_v: el recorte re-normaliza el panel a un origen NUEVO. Quien
+    # proyecte algo más tarde en el marco original (p. ej. las ranuras de encastre)
+    # debe restar este desplazamiento acumulado, o dibujará fuera de la pieza.
+    return {
+        "width_m": w,
+        "height_m": h,
+        "edges": normalized,
+        "offset_u": min_u,
+        "offset_v": min_v,
+    }
 
 
 def clip_panel_at_u(
@@ -774,7 +783,16 @@ def clip_panel_at_u(
         )
         for e in out
     ]
-    return {"width_m": w, "height_m": h, "edges": normalized}
+    # offset_u/offset_v: el recorte re-normaliza el panel a un origen NUEVO. Quien
+    # proyecte algo más tarde en el marco original (p. ej. las ranuras de encastre)
+    # debe restar este desplazamiento acumulado, o dibujará fuera de la pieza.
+    return {
+        "width_m": w,
+        "height_m": h,
+        "edges": normalized,
+        "offset_u": min_u,
+        "offset_v": min_v,
+    }
 
 
 def mirror_edges_horizontal(edges: List[Edge2D], width_m: float) -> List[Edge2D]:
