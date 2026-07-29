@@ -427,6 +427,12 @@ def merge_thin_segments(
 MIN_SPLIT_AREA = 0.01  # m^2 — fragmentos muy diminutos
 
 
+# Penetración mínima de una losa dentro del plano de un muro para considerar que lo
+# ATRAVIESA (y por tanto partirlo). Por debajo, la losa sólo apoya contra su cara y el
+# muro se deja como pieza continua, que es lo que el modelo expresa.
+SLAB_PENETRATION_TOL = 0.005  # 5 mm
+
+
 @dataclass
 class SlabPlane:
     elevation: float
@@ -548,6 +554,23 @@ def split_wall_groups_at_floors(
 
         tol = max(group.thickness or 0.0, FOOTPRINT_TOL)
 
+        # Banda que ocupa el muro a lo largo de SU PROPIA normal en planta. Sirve para
+        # distinguir si la losa lo ATRAVIESA o sólo apoya contra su cara.
+        n = group.representative_normal
+        n_a = getattr(n, ax_a)
+        n_b = getattr(n, ax_b)
+        n_len = math.hypot(n_a, n_b)
+        if n_len > 1e-6:
+            n_a, n_b = n_a / n_len, n_b / n_len
+            w_offs = [
+                getattr(v, ax_a) * n_a + getattr(v, ax_b) * n_b
+                for f in group_faces
+                for v in f.vertices
+            ]
+            w_off_min, w_off_max = min(w_offs), max(w_offs)
+        else:
+            n_a = n_b = None  # normal casi vertical: no aplica
+
         # Retener solo losas cuyo footprint se solape con este muro
         candidate_elevs: List[float] = []
         for sp in slab_planes:
@@ -555,6 +578,22 @@ def split_wall_groups_at_floors(
             overlap_b = min(w_max_b, sp.max_b) - max(w_min_b, sp.min_b)
             if overlap_a < -tol or overlap_b < -tol:
                 continue
+
+            # El muro se parte sólo si la losa PENETRA su plano. Si la losa termina
+            # contra la cara interior (penetración ~0), el autor la modeló apoyada y el
+            # muro es una pieza continua: partirlo obliga a un encastre que el modelo no
+            # pide, y al armar la maqueta el entrepiso queda apoyado por encima.
+            # Antes bastaba la cercanía de las cajas (±10cm), que no distingue ambos casos.
+            if n_a is not None:
+                corners = (
+                    (sp.min_a, sp.min_b), (sp.max_a, sp.min_b),
+                    (sp.min_a, sp.max_b), (sp.max_a, sp.max_b),
+                )
+                projs = [ca * n_a + cb * n_b for ca, cb in corners]
+                penetration = min(w_off_max, max(projs)) - max(w_off_min, min(projs))
+                if penetration <= SLAB_PENETRATION_TOL:
+                    continue
+
             candidate_elevs.append(sp.elevation)
 
         candidate_elevs.sort()
