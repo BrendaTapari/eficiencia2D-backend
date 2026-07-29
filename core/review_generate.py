@@ -328,17 +328,12 @@ def decompose_panels_from_groups(
             (pj.a, pj.b, pj.width, getattr(pj, "kind", "slot"))
         )
 
-    effective_decisions: Dict[int, int] = {}
-    for ww in phase1.wall_wall_joints:
-        if ww.suggested_yield_group_id is not None:
-            effective_decisions[ww.joint_index] = ww.suggested_yield_group_id
-    if wall_wall_decisions:
-        effective_decisions.update(wall_wall_decisions)
-
+    # No hace falta sembrar las sugerencias: compute_adjustments ya resuelve por su
+    # cuenta toda junta sin decisión del usuario (una sola fuente de verdad).
     adj_result = compute_adjustments(
         phase1.joints,
         phase1.groups,
-        effective_decisions,
+        wall_wall_decisions,
         phase1.faces,
     )
 
