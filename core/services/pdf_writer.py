@@ -27,6 +27,12 @@ PAPERS = {
 }
 MM_TO_PT = 72.0 / 25.4
 
+# Maquetado de la lámina de corte. Se exportan porque el tamaño de la plancha en modo
+# cartón se deriva del papel MENOS este espacio: si no coinciden, el dibujo no entra y
+# saldría escalado (las piezas se cortarían con medidas equivocadas).
+PAGE_MARGIN_PT = 40.0        # margen de página, por lado
+SHEET_LABEL_SPACE_M = 0.04   # alto reservado por fila para el rótulo "Plancha N"
+
 
 def m_to_pts(m: float, scale_denom: float) -> float:
     return (m / scale_denom) * 1000.0 * MM_TO_PT
@@ -320,6 +326,24 @@ def pdf_escape(s: str) -> str:
     return s.encode("ascii", "ignore").decode("ascii")
 
 
+def _page_size_for_sheets(sheets: List[NestingSheet], config) -> Tuple[float, float]:
+    """Tamaño de página (pt) necesario para dibujar estas planchas a tamaño real."""
+    SHEET_SPACING_M = 0.10
+    cols = min(len(sheets), 3) if sheets else 1
+    rows = math.ceil(len(sheets) / cols) if sheets else 1
+    total_w = cols * config.width_m + (cols - 1) * SHEET_SPACING_M
+    total_h = (
+        rows * config.height_m
+        + (rows - 1) * SHEET_SPACING_M
+        + rows * SHEET_LABEL_SPACE_M
+    )
+    m_to_pt = 1000.0 * MM_TO_PT
+    return (
+        total_w * m_to_pt + 2 * PAGE_MARGIN_PT,
+        total_h * m_to_pt + 2 * PAGE_MARGIN_PT,
+    )
+
+
 def _render_sheets_page(
     sheets: List[NestingSheet],
     config,
@@ -336,25 +360,19 @@ def _render_sheets_page(
 
     total_w = cols * config.width_m + (cols - 1) * SHEET_SPACING_M
     total_h = rows * config.height_m + (rows - 1) * SHEET_SPACING_M
-    sheet_label_space_m = 0.04
+    sheet_label_space_m = SHEET_LABEL_SPACE_M
     total_h_with_labels = total_h + rows * sheet_label_space_m
 
-    margin = 40.0
+    margin = PAGE_MARGIN_PT
 
     avail_w = page_w - 2 * margin
     avail_h = page_h - 2 * margin
 
-    m_to_pt = 1000.0 * MM_TO_PT
-    raw_w = total_w * m_to_pt
-    raw_h = total_h_with_labels * m_to_pt
-
-    fit_scale = 1.0
-    if raw_w > avail_w and raw_w > 0:
-        fit_scale = min(fit_scale, avail_w / raw_w)
-    if raw_h > avail_h and raw_h > 0:
-        fit_scale = min(fit_scale, avail_h / raw_h)
-
-    scale = m_to_pt * fit_scale
+    # ESCALA 1:1 SIEMPRE. Antes se aplicaba un "ajustar a la página" cuando el dibujo
+    # no entraba, y las piezas salían impresas hasta un 15% más chicas: inservibles
+    # para cortar. El tamaño de página se calcula en generate_nesting_pdf para que el
+    # contenido entre a tamaño real (ver _page_size_for_sheets).
+    scale = 1000.0 * MM_TO_PT
 
     drawn_w = total_w * scale
     drawn_h = total_h_with_labels * scale
@@ -500,6 +518,15 @@ def generate_nesting_pdf(
     else:
         page_w = p_long * MM_TO_PT  # landscape
         page_h = p_short * MM_TO_PT
+
+    # La página se agranda si el contenido a TAMAÑO REAL no entra en el papel elegido.
+    # Pasa en modo láser, donde la plancha es una hoja física (p. ej. 1000x600mm) que
+    # no tiene relación con el papel. Preferimos una página no estándar antes que
+    # encoger el dibujo: una lámina de corte a escala no sirve para cortar.
+    n_pages_sheets = sheets if page_mode == "single_page" else [sheets[0]]
+    need_w, need_h = _page_size_for_sheets(n_pages_sheets, config)
+    page_w = max(page_w, need_w)
+    page_h = max(page_h, need_h)
 
     if page_mode == "single_page":
         pages = [
