@@ -272,76 +272,16 @@ def detect_joints(faces: List[Face3D], groups: List[GeometryGroup]) -> List[Join
 # Detección geométrica de contactos muro-muro (complemento del método topológico)
 # ---------------------------------------------------------------------------
 
-# Tolerancia de contacto en planta: cuánto puede "no llegar" un muro al cruce y aun
-# así considerarse que se tocan. Cubre la holgura de modelado (huecos de fracciones de
-# mm, muros que terminan a ras) sin inventar uniones entre muros claramente separados.
-CONTACT_TOL_M = 0.05
-# Solape vertical mínimo para que la unión sea relevante al cortar.
+# Separación máxima entre superficies para considerar que dos muros se tocan. Cubre la
+# holgura de MODELADO (huecos de fracciones de mm, muros que terminan a ras), no huecos
+# de diseño: a 5 cm los muros están de verdad separados y recortarlos abriría una luz
+# visible en la maqueta en vez de cerrarla.
+CONTACT_TOL_M = 0.02
+# Altura mínima del contacto para que la unión sea relevante al cortar.
 MIN_VERTICAL_OVERLAP_M = 0.30
-# |sin(ángulo)| mínimo entre muros en planta: por debajo son paralelos (no se cruzan).
-MIN_PLAN_SIN = 0.259  # ~15°
-
-
-@dataclass(slots=True)
-class _WallPlan:
-    """Resumen de un muro en planta: recta soporte, extensión y rango vertical."""
-    pn: Tuple[float, float]   # normal en planta (unitaria)
-    pu: Tuple[float, float]   # dirección a lo largo del muro (unitaria)
-    off: float                # posición de la recta soporte (pn · punto)
-    t0: float                 # extensión mínima a lo largo de pu
-    t1: float                 # extensión máxima
-    y0: float
-    y1: float
-
-
-def _build_wall_plans(
-    faces: List[Face3D], groups: List[GeometryGroup]
-) -> Dict[int, _WallPlan]:
-    """Precalcula el resumen en planta de cada muro vertical. O(vértices) una sola vez."""
-    out: Dict[int, _WallPlan] = {}
-    for g in groups:
-        if g.category != "wall":
-            continue
-        n = g.representative_normal
-        plan_len = math.hypot(n.x, n.z)
-        if plan_len < 0.5:
-            continue  # normal casi vertical: es losa/techo, no un muro
-        pnx, pnz = n.x / plan_len, n.z / plan_len
-        pux, puz = -pnz, pnx
-
-        t_min = float("inf")
-        t_max = float("-inf")
-        y_min = float("inf")
-        y_max = float("-inf")
-        o_sum = 0.0
-        count = 0
-        for fi in g.face_indices:
-            if fi < 0 or fi >= len(faces):
-                continue
-            for v in faces[fi].vertices:
-                t = v.x * pux + v.z * puz
-                if t < t_min:
-                    t_min = t
-                if t > t_max:
-                    t_max = t
-                if v.y < y_min:
-                    y_min = v.y
-                if v.y > y_max:
-                    y_max = v.y
-                o_sum += v.x * pnx + v.z * pnz
-                count += 1
-        if count == 0 or t_min > t_max:
-            continue
-        out[g.id] = _WallPlan(
-            pn=(pnx, pnz),
-            pu=(pux, puz),
-            off=o_sum / count,   # plano medio: robusto ante las dos pieles de un muro
-            t0=t_min,
-            t1=t_max,
-            y0=y_min,
-            y1=y_max,
-        )
-    return out
+# Ángulo mínimo entre dos muros para tratarlos como unión real. Por debajo son casi
+# coplanares: se solapan, no se cruzan, y no hay nada que encastrar.
+MIN_JOINT_ANGLE_DEG = 20.0
 
 
 def detect_contact_joints(
@@ -356,64 +296,130 @@ def detect_contact_joints(
     exportador dejó vértices duplicados en la esquina. Geométricamente hay contacto y
     al cortar las piezas se superponen, pero el sistema no lo veía.
 
-    Método (independiente de la topología de la malla): cada muro vertical es un
-    segmento en planta. Dos muros no paralelos se tocan si el cruce de sus rectas
-    soporte cae dentro de ambos segmentos (con CONTACT_TOL_M de holgura) y además se
-    solapan en altura. Devuelve sólo los pares que no fueron detectados ya.
+    Se mide sobre la GEOMETRÍA REAL (distancia punto-contra-cara), no sobre un plano
+    medio: los muros no planos o de doble piel hacían fallar cualquier aproximación
+    por plano. Dos muros forman unión si sus superficies se acercan a menos de
+    CONTACT_TOL_M, no son casi coplanares y el contacto abarca altura suficiente.
+    Devuelve sólo los pares que no fueron detectados ya.
     """
-    plans = _build_wall_plans(faces, groups)
-    if len(plans) < 2:
-        return []
+    import numpy as np
 
     known = {pair_key(j.group_a, j.group_b) for j in existing}
-    ids = sorted(plans)
+    walls = [
+        g for g in groups
+        if g.category == "wall" and math.hypot(
+            g.representative_normal.x, g.representative_normal.z
+        ) >= 0.5
+    ]
+    if len(walls) < 2:
+        return []
+
+    tris: Dict[int, "np.ndarray"] = {}
+    verts: Dict[int, "np.ndarray"] = {}
+    bbox: Dict[int, Tuple[float, float, float, float, float, float]] = {}
+    for g in walls:
+        tt: List = []
+        vv: List = []
+        for fi in g.face_indices:
+            if fi < 0 or fi >= len(faces):
+                continue
+            v = faces[fi].vertices
+            if len(v) < 3:
+                continue
+            vv.extend((p.x, p.y, p.z) for p in v)
+            for k in range(1, len(v) - 1):
+                tt.append(
+                    ((v[0].x, v[0].y, v[0].z),
+                     (v[k].x, v[k].y, v[k].z),
+                     (v[k + 1].x, v[k + 1].y, v[k + 1].z))
+                )
+        if not tt or not vv:
+            continue
+        A = np.asarray(vv, dtype=float)
+        tris[g.id] = np.asarray(tt, dtype=float)
+        verts[g.id] = A
+        bbox[g.id] = (
+            float(A[:, 0].min()), float(A[:, 0].max()),
+            float(A[:, 1].min()), float(A[:, 1].max()),
+            float(A[:, 2].min()), float(A[:, 2].max()),
+        )
+
+    tol = CONTACT_TOL_M
+
+    def touching_ys(P: "np.ndarray", T: "np.ndarray") -> List[float]:
+        """Alturas de los puntos de P que están a <= tol de la superficie T."""
+        A, B, C = T[:, 0], T[:, 1], T[:, 2]
+        AB = B - A
+        AC = C - A
+        n = np.cross(AB, AC)
+        nn = (n * n).sum(1)
+        nn[nn < 1e-18] = 1e-18
+        out: List[float] = []
+        for p in P:
+            AP = p - A
+            # Coordenadas baricéntricas de la proyección, recortadas al triángulo.
+            u = np.clip((np.cross(AP, AC) * n).sum(1) / nn, 0.0, 1.0)
+            v = np.clip((np.cross(AB, AP) * n).sum(1) / nn, 0.0, 1.0)
+            s = u + v
+            f = s > 1.0
+            if f.any():
+                u[f] /= s[f]
+                v[f] /= s[f]
+            Q = A + u[:, None] * AB + v[:, None] * AC
+            if float(((p - Q) ** 2).sum(1).min()) <= tol * tol:
+                out.append(float(p[1]))
+        return out
+
+    ids = sorted(tris)
     out: List[Joint] = []
+    group_by_id: Dict[int, GeometryGroup] = {g.id: g for g in walls}
 
     for i in range(len(ids)):
         a = ids[i]
-        pa = plans[a]
+        ga = group_by_id[a]
+        ax0, ax1, ay0, ay1, az0, az1 = bbox[a]
         for j in range(i + 1, len(ids)):
             b = ids[j]
             if pair_key(a, b) in known:
                 continue
-            pb = plans[b]
+            gb = group_by_id[b]
 
-            # Determinante = seno del ángulo entre los muros en planta.
-            den = pa.pn[0] * pb.pn[1] - pa.pn[1] * pb.pn[0]
-            if abs(den) < MIN_PLAN_SIN:
-                continue  # paralelos o casi: no forman un cruce en T/L
-
-            # Deben convivir en altura (dos muros de pisos distintos no se tocan).
-            y_overlap = min(pa.y1, pb.y1) - max(pa.y0, pb.y0)
-            if y_overlap < MIN_VERTICAL_OVERLAP_M:
+            # Casi coplanares: se solapan, no se cruzan. Nada que encastrar.
+            cos_ang = abs(dot(ga.representative_normal, gb.representative_normal))
+            dihedral = math.degrees(math.acos(min(1.0, cos_ang)))
+            if dihedral < MIN_JOINT_ANGLE_DEG:
                 continue
 
-            # Cruce de las dos rectas soporte en planta.
-            px = (pa.off * pb.pn[1] - pb.off * pa.pn[1]) / den
-            pz = (pa.pn[0] * pb.off - pb.pn[0] * pa.off) / den
-
-            # ¿El cruce cae dentro de la extensión de AMBOS muros?
-            ta = px * pa.pu[0] + pz * pa.pu[1]
-            tb = px * pb.pu[0] + pz * pb.pu[1]
-            over_a = max(pa.t0 - ta, ta - pa.t1, 0.0)
-            over_b = max(pb.t0 - tb, tb - pb.t1, 0.0)
-            if over_a > CONTACT_TOL_M or over_b > CONTACT_TOL_M:
+            bx0, bx1, by0, by1, bz0, bz1 = bbox[b]
+            # Descarte barato: cajas envolventes que ni se rozan.
+            if (ax0 - tol > bx1 or bx0 - tol > ax1
+                    or ay0 - tol > by1 or by0 - tol > ay1
+                    or az0 - tol > bz1 or bz0 - tol > az1):
                 continue
 
-            y_lo = max(pa.y0, pb.y0)
-            n_a = next((g.representative_normal for g in groups if g.id == a), None)
-            n_b = next((g.representative_normal for g in groups if g.id == b), None)
-            dihedral = 90.0
-            if n_a and n_b:
-                dihedral = math.degrees(math.acos(min(1.0, abs(dot(n_a, n_b)))))
+            # Contacto real: puntos de un muro que tocan la superficie del otro.
+            ys = touching_ys(verts[b], tris[a])
+            ys += touching_ys(verts[a], tris[b])
+            if not ys:
+                continue
+            y_lo, y_hi = min(ys), max(ys)
+            if y_hi - y_lo < MIN_VERTICAL_OVERLAP_M:
+                continue
+
+            # Punto medio del contacto, para ubicar la junta en el panel.
+            pts = [p for p in verts[b] if y_lo <= p[1] <= y_hi]
+            cx = cz = 0.0
+            if pts:
+                near = np.asarray(pts)
+                cx, cz = float(near[:, 0].mean()), float(near[:, 2].mean())
 
             out.append(
                 Joint(
                     group_a=a,
                     group_b=b,
-                    total_length=y_overlap,
+                    total_length=y_hi - y_lo,
                     dihedral_angle=dihedral,
-                    edge_mid=Vec3(px, y_lo + y_overlap * 0.5, pz),
+                    edge_mid=Vec3(cx, (y_lo + y_hi) * 0.5, cz),
                     # La arista de contacto de dos muros verticales es vertical.
                     edge_dir=Vec3(0.0, 1.0, 0.0),
                     horizontal_frac=0.0,
