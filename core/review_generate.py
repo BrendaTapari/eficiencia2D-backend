@@ -705,16 +705,23 @@ def panel_ids_by_group(
 
 
 def compute_panel_id_by_group(
-    phase1: Phase1Result, opts: Optional[PipelineOptions] = None
+    phase1: Phase1Result,
+    opts: Optional[PipelineOptions] = None,
+    overrides: Optional[Dict[int, str]] = None,
 ) -> Dict[int, str]:
-    """Etiquetas de panel por grupo (best-effort) para /upload y /recompute."""
+    """Etiquetas de panel por grupo (best-effort) para /upload y /recompute.
+
+    Recibe los overrides para que las etiquetas coincidan con las piezas que
+    realmente se van a cortar: sin ellos, un componente descartado por el usuario
+    seguía recibiendo etiqueta y uno rescatado se quedaba sin ninguna.
+    """
     if opts is None:
         opts = PipelineOptions(
             scale_denom=50.0, paper="A4", min_area_m2=None, sheet_config=None
         )
     try:
         _, wall_panels, floor_panels, _ = _decompose(
-            phase1, opts, None, None, None, None
+            phase1, opts, overrides, None, None, None
         )
         return panel_ids_by_group(wall_panels, floor_panels)
     except Exception:
