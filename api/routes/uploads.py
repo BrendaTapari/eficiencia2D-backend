@@ -131,7 +131,38 @@ def _serialize_group(g) -> Dict:
     return d
 
 
-def serialize_topology(result: Phase1Result, panel_id_by_group: Optional[Dict] = None) -> Dict:
+VALID_CATEGORIES = ("wall", "floor", "discard")
+
+
+def apply_overrides_to_groups(groups, overrides: Optional[Dict[int, str]]):
+    """Devuelve los grupos con la categoría EFECTIVA (la del usuario si la cambió).
+
+    El instructivo se arma con placements/assembly_steps, que filtran por
+    `category != "discard"`. Si se les pasan los grupos crudos, ignoran lo que el
+    usuario descartó o rescató en el visor 3D: los descartados siguen apareciendo en
+    el instructivo y los rescatados no aparecen. No muta los grupos originales.
+    """
+    if not overrides:
+        return groups
+    out = []
+    for g in groups:
+        cat = overrides.get(g.id)
+        if cat in VALID_CATEGORIES and cat != g.category:
+            out.append(dataclasses.replace(g, category=cat))
+        else:
+            out.append(g)
+    return out
+
+
+def serialize_topology(
+    result: Phase1Result,
+    panel_id_by_group: Optional[Dict] = None,
+    overrides: Optional[Dict[int, str]] = None,
+) -> Dict:
+    # `groups` viaja con la categoría original (el front lleva su propio estado de
+    # overrides para la lista de componentes); placements y assembly_steps, en cambio,
+    # deben respetarlos, porque de ahí sale el instructivo de armado.
+    groups_eff = apply_overrides_to_groups(result.groups, overrides)
     topo = {
         "groups": [_serialize_group(g) for g in result.groups],
         "joints": [dataclasses.asdict(j) for j in result.joints],
@@ -148,8 +179,8 @@ def serialize_topology(result: Phase1Result, panel_id_by_group: Optional[Dict] =
         # Marco de proyección 3D por pieza (instructivo de armado): group_id -> {origin,
         # u_axis, v_axis, normal, width_m, height_m, mirrored}. world = origin + u·u_axis
         # + v·v_axis. Caras en el mismo espacio que faces_packed (eje Y).
-        "placements": build_placements(result.groups, result.faces, "Y"),
-        "assembly_steps": compute_assembly_steps(result.groups),
+        "placements": build_placements(groups_eff, result.faces, "Y"),
+        "assembly_steps": compute_assembly_steps(groups_eff),
         # Curvatura por grupo (contrato §2.1): el front marca componentes curvos y
         # sugiere método kerf (simple) / auxético (doble) + spacing inicial.
         "curvature": build_curvature_map(result.groups, result.faces),
@@ -466,6 +497,9 @@ class RecomputeRequest(BaseModel):
     min_area_m2: float = 1.0
     merges: Optional[List[List[int]]] = None
     splits: Optional[List[SplitModel]] = None
+    # Recategorizaciones del usuario (id de grupo -> "wall"/"floor"/"discard"). Sin
+    # esto, el instructivo seguía mostrando los componentes descartados en el visor.
+    overrides: Optional[Dict[int, str]] = None
 
 
 class NestingPreviewRequest(BaseModel):
@@ -813,13 +847,23 @@ async def recompute_endpoint(
             )
 
         with timer.step("apply_merges"):
-            merged = apply_merges(rebuilt, request.merges or [])
+            # Los overrides también entran acá: una fusión puede involucrar grupos
+            # rescatados de "descartado" (ver apply_merges).
+            merged = apply_merges(rebuilt, request.merges or [], request.overrides)
 
         with timer.step("panel_id_by_group"):
-            pid_by_group = compute_panel_id_by_group(merged)
+            pid_by_group = compute_panel_id_by_group(
+                merged, overrides=request.overrides
+            )
 
         timer.report()
-        return JSONResponse(content={"topology": serialize_topology(merged, pid_by_group)})
+        return JSONResponse(
+            content={
+                "topology": serialize_topology(
+                    merged, pid_by_group, request.overrides
+                )
+            }
+        )
 
     except HTTPException:
         raise
