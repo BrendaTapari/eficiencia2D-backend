@@ -176,9 +176,28 @@ def compute_adjustments(
             )
             topology = topo_info.topology if topo_info else "unknown"
 
-            suggested_yield_group_id = choose_wall_wall_yielder(
-                g_a, g_b, eff_t_a, eff_t_b, topo_info, faces
-            )
+            # QUIÉN PUEDE CEDER lo decide la posición del cruce, no el grosor: acortar
+            # una pieza le quita material de un EXTREMO. Si el cruce cae en el medio de
+            # un muro, acortarlo no toca ese choque y encima lo deja corto donde sí
+            # tenía que llegar (era la causa de piezas que no alcanzaban a la vecina).
+            fa = joint_position_frac(g_a, joint, faces)
+            fb = joint_position_frac(g_b, joint, faces)
+            a_at_end = fa is None or fa <= END_ZONE_FRAC or fa >= 1.0 - END_ZONE_FRAC
+            b_at_end = fb is None or fb <= END_ZONE_FRAC or fb >= 1.0 - END_ZONE_FRAC
+
+            if a_at_end and not b_at_end:
+                suggested_yield_group_id = g_a.id   # sólo A puede acortarse
+            elif b_at_end and not a_at_end:
+                suggested_yield_group_id = g_b.id
+            elif not a_at_end and not b_at_end:
+                # Cruce en el medio de AMBOS (dos muros que se atraviesan): acortar no
+                # resuelve nada. El encastre acá es una ranura, que resuelve
+                # resolve_plate_joints; no se propone recorte.
+                suggested_yield_group_id = None
+            else:
+                suggested_yield_group_id = choose_wall_wall_yielder(
+                    g_a, g_b, eff_t_a, eff_t_b, topo_info, faces
+                )
             critical = is_critical_joint(topology, eff_t_a, eff_t_b)
 
             new_ww_joint = WallWallJoint(
@@ -198,11 +217,14 @@ def compute_adjustments(
             decision = wall_wall_decisions_map.get(ji)
             if decision is None:
                 decision = suggested_yield_group_id
-            if decision is None:
-                # Red de seguridad: ninguna regla decidió (no debería ocurrir con el
-                # espesor MDF por defecto). Se elige de forma determinística por id,
-                # para que el resultado sea estable entre ejecuciones.
-                decision = min(g_a.id, g_b.id)
+            if decision is None and (a_at_end or b_at_end):
+                # Red de seguridad: ninguna regla decidió pese a haber un extremo
+                # disponible. Se elige de forma determinística, priorizando siempre un
+                # muro que PUEDA acortarse.
+                if a_at_end and b_at_end:
+                    decision = min(g_a.id, g_b.id)
+                else:
+                    decision = g_a.id if a_at_end else g_b.id
             if decision is not None:
                 yield_group = group_by_id.get(decision)
                 other_group_id = g_b.id if decision == g_a.id else g_a.id
@@ -267,6 +289,41 @@ def compute_adjustments(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def joint_position_frac(
+    group: GeometryGroup, joint: Joint, faces: Optional[List[Face3D]]
+) -> Optional[float]:
+    """Posición del cruce a lo largo del muro, de 0 (un extremo) a 1 (el otro).
+
+    Sirve para distinguir un encuentro en el EXTREMO —que se resuelve acortando la
+    pieza— de uno en el MEDIO, donde acortar no toca el choque y además deja la pieza
+    corta justo donde tenía que llegar.
+    """
+    if not faces:
+        return None
+    n = group.representative_normal
+    plan = math.hypot(n.x, n.z)
+    if plan < 1e-6:
+        return None
+    ux, uz = -n.z / plan, n.x / plan  # dirección horizontal a lo largo del muro
+    ts = [
+        v.x * ux + v.z * uz
+        for fi in group.face_indices
+        if 0 <= fi < len(faces)
+        for v in faces[fi].vertices
+    ]
+    if not ts:
+        return None
+    t0, t1 = min(ts), max(ts)
+    if t1 - t0 < 1e-6:
+        return None
+    t = joint.edge_mid.x * ux + joint.edge_mid.z * uz
+    return (t - t0) / (t1 - t0)
+
+
+# Un cruce se considera "en el extremo" si cae dentro de este margen de una punta.
+END_ZONE_FRAC = 0.15
 
 
 def choose_wall_wall_yielder(
