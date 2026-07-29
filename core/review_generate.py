@@ -728,17 +728,30 @@ def compute_panel_id_by_group(
         return {}
 
 
-CARDBOARD_MARGIN_M = 0.010  # margen de impresión por lado en modo cartón (10 mm)
+def _paper_sheet_candidates_m(paper_name: str):
+    """Planchas candidatas (ancho, alto) en metros que entran A TAMAÑO REAL en el papel.
 
+    Se descuenta exactamente lo que el PDF reserva: margen de página a los cuatro lados
+    y el alto del rótulo "Plancha N". Antes se descontaban 10 mm fijos, que no alcanzaban,
+    y el generador terminaba aplicando un "ajustar a la página" que encogía el dibujo
+    ~15%: las piezas se habrían cortado más chicas de lo debido.
 
-def _paper_sheet_dims_m(paper_name: str, margin_m: float = CARDBOARD_MARGIN_M):
-    """Dimensiones útiles (short, long) en metros de un papel ISO menos el margen."""
-    from core.services.pdf_writer import PAPERS
+    Devuelve las dos orientaciones (apaisada y vertical) para que el nesting elija.
+    """
+    from core.services.pdf_writer import PAPERS, MM_TO_PT, PAGE_MARGIN_PT, SHEET_LABEL_SPACE_M
 
     p = PAPERS.get(paper_name, PAPERS["A4"])
-    short = min(p["w"], p["h"]) / 1000.0 - 2 * margin_m
-    long = max(p["w"], p["h"]) / 1000.0 - 2 * margin_m
-    return max(short, 0.05), max(long, 0.05)
+    short = min(p["w"], p["h"]) / 1000.0
+    long = max(p["w"], p["h"]) / 1000.0
+    margin_m = PAGE_MARGIN_PT / MM_TO_PT / 1000.0  # pt -> mm -> m
+
+    out = []
+    for page_w, page_h in ((long, short), (short, long)):
+        w = page_w - 2 * margin_m
+        h = page_h - 2 * margin_m - SHEET_LABEL_SPACE_M
+        if w > 0.05 and h > 0.05:
+            out.append((w, h))
+    return out or [(0.05, 0.05)]
 
 
 def _nest_both(wall_np, floor_np, sheet_cfg: SheetConfig, scale: float):
@@ -795,9 +808,8 @@ def compute_nesting(
     else:
         # Modo cartón: plancha = papel − margen, auto-orientada (la que minimiza
         # piezas sin ubicar; desempate por mayor aprovechamiento).
-        short, long = _paper_sheet_dims_m(opts.paper or "A4")
         best = None  # (unplaced, -util, cfg, wn, fn)
-        for (w, h) in ((long, short), (short, long)):  # landscape, portrait
+        for (w, h) in _paper_sheet_candidates_m(opts.paper or "A4"):
             cfg = SheetConfig(width_m=w, height_m=h, gap_m=gap)
             wn, fn, unplaced, util = _nest_both(wall_np, floor_np, cfg, scale)
             key = (unplaced, -util)
