@@ -30,6 +30,7 @@ from core.pipeline import parse_pipeline, generate_pipeline, Phase1Result
 from core.services.cutting_sheet import build_placements
 from core.services.curvature import build_curvature_map
 from core.services.assembly_check import compute_assembly_warnings
+from core.services.assembly_fit import check_piece_collisions
 from core.group_classifier import compute_assembly_steps
 from core.services.assembly_adjuster import DEFAULT_MDF_THICKNESS_M
 from core.services.types import PipelineOptions, SheetConfig
@@ -923,7 +924,7 @@ async def nesting_preview_endpoint(
         )
 
         with timer.step("compute_nesting"):
-            work, wall_nesting, floor_nesting, cfg, panel_id_by_group, plate_joints = compute_nesting(
+            work, wall_nesting, floor_nesting, cfg, panel_id_by_group, plate_joints, final_panels = compute_nesting(
                 rebuilt,
                 opts,
                 overrides=request.overrides,
@@ -943,6 +944,12 @@ async def nesting_preview_endpoint(
             try:
                 assembly_warnings = compute_assembly_warnings(
                     work.groups, work.faces, panel_id_by_group
+                )
+                # Además, "armar la maqueta" con las piezas TAL COMO se van a cortar:
+                # detecta placas que se atraviesan, que es lo que hasta ahora sólo se
+                # descubría pegando el MDF. Va en la misma lista de avisos.
+                assembly_warnings = assembly_warnings + check_piece_collisions(
+                    final_panels
                 )
             except Exception:
                 logger.exception("[nesting-preview] assembly_check falló")
