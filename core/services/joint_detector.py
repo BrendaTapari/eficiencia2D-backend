@@ -346,15 +346,15 @@ def detect_contact_joints(
 
     tol = CONTACT_TOL_M
 
-    def touching_ys(P: "np.ndarray", T: "np.ndarray") -> List[float]:
-        """Alturas de los puntos de P que están a <= tol de la superficie T."""
+    def touching_points(P: "np.ndarray", T: "np.ndarray") -> List[Tuple[float, float, float]]:
+        """Puntos de P que están a <= tol de la superficie T (el contacto en sí)."""
         A, B, C = T[:, 0], T[:, 1], T[:, 2]
         AB = B - A
         AC = C - A
         n = np.cross(AB, AC)
         nn = (n * n).sum(1)
         nn[nn < 1e-18] = 1e-18
-        out: List[float] = []
+        out: List[Tuple[float, float, float]] = []
         for p in P:
             AP = p - A
             # Coordenadas baricéntricas de la proyección, recortadas al triángulo.
@@ -367,7 +367,7 @@ def detect_contact_joints(
                 v[f] /= s[f]
             Q = A + u[:, None] * AB + v[:, None] * AC
             if float(((p - Q) ** 2).sum(1).min()) <= tol * tol:
-                out.append(float(p[1]))
+                out.append((float(p[0]), float(p[1]), float(p[2])))
         return out
 
     ids = sorted(tris)
@@ -398,20 +398,20 @@ def detect_contact_joints(
                 continue
 
             # Contacto real: puntos de un muro que tocan la superficie del otro.
-            ys = touching_ys(verts[b], tris[a])
-            ys += touching_ys(verts[a], tris[b])
-            if not ys:
+            contact = touching_points(verts[b], tris[a])
+            contact += touching_points(verts[a], tris[b])
+            if not contact:
                 continue
+            ys = [p[1] for p in contact]
             y_lo, y_hi = min(ys), max(ys)
             if y_hi - y_lo < MIN_VERTICAL_OVERLAP_M:
                 continue
 
-            # Punto medio del contacto, para ubicar la junta en el panel.
-            pts = [p for p in verts[b] if y_lo <= p[1] <= y_hi]
-            cx = cz = 0.0
-            if pts:
-                near = np.asarray(pts)
-                cx, cz = float(near[:, 0].mean()), float(near[:, 2].mean())
+            # edge_mid DEBE ser el punto de contacto: decompose lo proyecta sobre el eje
+            # del panel para decidir QUÉ EXTREMO del muro recortar. Con el centroide del
+            # muro el recorte caía en el extremo equivocado y la unión seguía solapada.
+            cx = sum(p[0] for p in contact) / len(contact)
+            cz = sum(p[2] for p in contact) / len(contact)
 
             out.append(
                 Joint(
