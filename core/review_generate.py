@@ -673,6 +673,37 @@ def decompose_panels_from_groups(
         # las piezas por width×height, así que cualquier trazo fuera invadiría al vecino.
         edges, width_m, height_m = _fit_panel_bbox(edges, width_m, height_m)
 
+        # Marco 3D de la pieza YA RECORTADA, para poder verificar el ensamble antes de
+        # cortar. Hay que rehacerlo acá y no reusar `placements`, que describe la
+        # proyección SIN recortar: los clips desplazaron el origen (clip_off_u/v) y el
+        # contorno viene espejado, así que u avanza en sentido contrario a u_axis.
+        n_eff = oriented_normals.get(group.id, group.representative_normal)
+        n_unit = normalize(n_eff)
+        d_plane = 0.0
+        n_pts = 0
+        for f_ in faces:
+            for v_ in f_.vertices:
+                d_plane += n_unit.x * v_.x + n_unit.y * v_.y + n_unit.z * v_.z
+                n_pts += 1
+        if n_pts:
+            d_plane /= n_pts
+        # Punto 3D que corresponde a (u=0, v=0) del panel final.
+        u0 = result.origin_u + width_m + clip_off_u
+        v0 = result.origin_v + clip_off_v
+        origin3d = Vec3(
+            u0 * result.u_axis.x + v0 * result.v_axis.x + d_plane * n_unit.x,
+            u0 * result.u_axis.y + v0 * result.v_axis.y + d_plane * n_unit.y,
+            u0 * result.u_axis.z + v0 * result.v_axis.z + d_plane * n_unit.z,
+        )
+        panel_frame = {
+            "origin": origin3d,
+            # Espejado: al avanzar u, el punto 3D retrocede sobre u_axis.
+            "u_dir": Vec3(-result.u_axis.x, -result.u_axis.y, -result.u_axis.z),
+            "v_dir": result.v_axis,
+            "normal": n_unit,
+            "d": d_plane,
+        }
+
         if is_floor:
             floor_count += 1
             floor_panels.append(
@@ -686,6 +717,7 @@ def decompose_panels_from_groups(
                     edges=edges,
                     source_group_id=group.id,
                     is_mark=group.id in marks_set,
+                    frame=panel_frame,
                 )
             )
         else:
@@ -701,6 +733,7 @@ def decompose_panels_from_groups(
                     edges=edges,
                     source_group_id=group.id,
                     is_mark=group.id in marks_set,
+                    frame=panel_frame,
                 )
             )
 
@@ -879,8 +912,14 @@ def compute_nesting(
     mark_lines: Optional[List[dict]] = None,
     ribs: Optional[List[dict]] = None,
     columns: Optional[List[dict]] = None,
-) -> Tuple[Phase1Result, NestingResult, NestingResult, SheetConfig, Dict[int, str], List]:
-    """Descompone y anida paneles. Compartido por /generate y /nesting-preview."""
+) -> Tuple[
+    Phase1Result, NestingResult, NestingResult, SheetConfig, Dict[int, str], List, List
+]:
+    """Descompone y anida paneles. Compartido por /generate y /nesting-preview.
+
+    El último elemento son los paneles FINALES (con su marco 3D), para poder verificar
+    el ensamble antes de cortar sin volver a descomponer.
+    """
     work, wall_panels, floor_panels, plate_joints = _decompose(
         phase1, opts, overrides, wall_wall_decisions, merges, marks,
         user_cuts, flex, mark_lines, ribs, columns,
@@ -928,6 +967,7 @@ def compute_nesting(
         sheet_cfg,
         panel_ids_by_group(wall_panels, floor_panels),
         plate_joints,
+        list(wall_panels) + list(floor_panels),
     )
 
 
@@ -944,7 +984,7 @@ def generate_from_review(
     ribs: Optional[List[dict]] = None,
     columns: Optional[List[dict]] = None,
 ) -> List[OutputFile]:
-    work, wall_nesting, floor_nesting, sheet_cfg, _, _ = compute_nesting(
+    work, wall_nesting, floor_nesting, sheet_cfg, _, _, _ = compute_nesting(
         phase1, opts, overrides, wall_wall_decisions, merges, marks,
         user_cuts, flex, mark_lines, ribs, columns,
     )
