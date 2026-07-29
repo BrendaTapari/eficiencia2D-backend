@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 # Importamos nuestros tipos y servicios
 from core.services.types import Face3D
-from core.services.joint_detector import Joint
+from core.services.joint_detector import Joint, MIN_JOINT_ANGLE_DEG
 from core.group_classifier import GeometryGroup
 from core.services.joint_topology_classifier import (
     JointTopology,
@@ -18,6 +18,23 @@ from core.services.joint_topology_classifier import (
 # en MDF el grosor existe: es el estándar de 3 mm. Permite resolver los encastres
 # muro-muro (quién corta a quién) aunque la malla no tenga espesor.
 DEFAULT_MDF_THICKNESS_M = 0.003
+
+# Ángulo mínimo entre dos muros para tratarlos como una unión real. Se importa del
+# detector (única definición) para que no quede una franja de uniones detectadas pero
+# nunca ajustadas, ni al revés.
+
+
+def oblique_trim_factor(dihedral_angle_deg: float) -> float:
+    """Cuánto hay que acortar el muro que cede, en múltiplos de su espesor.
+
+    A 90° el muro que cede se acorta exactamente el espesor de la placa contra la que
+    topa. En una unión OBLICUA de ángulo θ, la misma placa se interpone a lo largo de
+    una distancia mayor medida sobre el eje del muro que cede: el recorte correcto es
+    espesor / sen(θ). Ejemplos: 90° → ×1.00, 45° → ×1.41, 30° → ×2.00.
+    Sin esta corrección, un muro en diagonal queda largo y las piezas chocan igual.
+    """
+    ang = max(MIN_JOINT_ANGLE_DEG, min(90.0, dihedral_angle_deg))
+    return 1.0 / math.sin(math.radians(ang))
 
 # ============================================================================
 # Assembly Adjuster
@@ -83,8 +100,9 @@ def compute_adjustments(
     wall_wall_joints: List[WallWallJoint] = []
 
     for ji, joint in enumerate(joints):
-        # Solo manejar uniones cercanas a 90°
-        if joint.dihedral_angle < 75 or joint.dihedral_angle > 95:
+        # Muro-muro admite uniones OBLICUAS (ver MIN_JOINT_ANGLE_DEG); muro-losa sigue
+        # restringido a ~90° más abajo, para no alterar el trato de techos inclinados.
+        if joint.dihedral_angle < MIN_JOINT_ANGLE_DEG or joint.dihedral_angle > 95:
             continue
 
         g_a = group_by_id.get(joint.group_a)
@@ -102,7 +120,10 @@ def compute_adjustments(
         b_is_floor = g_b.category == "floor" and abs_y_b > 0.5
 
         if a_is_floor != b_is_floor:
-            # Unión Muro–Losa (piso o techo)
+            # Unión Muro–Losa (piso o techo). Se mantiene acotada a ~90°: la lógica de
+            # apoyo (is_wall_on_top / is_roof_above_wall) asume encuentro perpendicular.
+            if joint.dihedral_angle < 75:
+                continue
             floor = g_a if a_is_floor else g_b
             wall = g_b if a_is_floor else g_a
 
@@ -170,8 +191,18 @@ def compute_adjustments(
             )
             wall_wall_joints.append(new_ww_joint)
 
-            # Aplicar la decisión del usuario si está presente
+            # El sistema SIEMPRE resuelve la junta: si el usuario no eligió, se aplica
+            # la sugerencia. Dejarla sin resolver haría que las piezas se solapen al
+            # cortar y la maqueta no se pueda armar si el usuario no repasa cada cruce.
+            # Su elección manual, cuando existe, tiene prioridad.
             decision = wall_wall_decisions_map.get(ji)
+            if decision is None:
+                decision = suggested_yield_group_id
+            if decision is None:
+                # Red de seguridad: ninguna regla decidió (no debería ocurrir con el
+                # espesor MDF por defecto). Se elige de forma determinística por id,
+                # para que el resultado sea estable entre ejecuciones.
+                decision = min(g_a.id, g_b.id)
             if decision is not None:
                 yield_group = group_by_id.get(decision)
                 other_group_id = g_b.id if decision == g_a.id else g_a.id
@@ -185,15 +216,23 @@ def compute_adjustments(
                     # recorte distinto en cada escala (4 mm a 1:50, 2 mm a 1:100) en vez
                     # de los 3 mm físicos que mide la placa. physical=True → se escala
                     # por scale_denom al descomponer para quedar en 3 mm reales.
-                    trim_thickness = DEFAULT_MDF_THICKNESS_M
+                    # En uniones oblicuas la placa se interpone a lo largo de más
+                    # distancia sobre el eje del muro que cede → espesor / sen(θ).
+                    factor = oblique_trim_factor(joint.dihedral_angle)
+                    trim_thickness = DEFAULT_MDF_THICKNESS_M * factor
 
+                    detalle = (
+                        "MDF 3mm"
+                        if factor < 1.02
+                        else f"MDF 3mm a {joint.dihedral_angle:.0f}° → {trim_thickness * 1000:.1f}mm"
+                    )
                     new_ww_joint.yield_group_id = decision
                     adjustments.append(
                         DimensionAdjustment(
                             group_id=decision,
                             delta=-trim_thickness,
                             axis="width",
-                            reason=f"Junta con {other_group.label} (MDF 3mm)",
+                            reason=f"Junta con {other_group.label} ({detalle})",
                             joint_index=ji,
                             physical=True,
                         )
