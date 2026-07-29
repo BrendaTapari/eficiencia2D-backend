@@ -68,6 +68,73 @@ def _coplanar_for_merge(member: GeometryGroup, survivor: GeometryGroup) -> bool:
     return abs(dot(ns, member.centroid) - dot(ns, survivor.centroid)) <= MERGE_PLANE_TOL
 
 
+# Tolerancia vertical para decidir si una losa cae en el límite entre dos tramos de
+# muro (el pipeline parte los muros justo al nivel de la losa).
+FLOOR_BAND_TOL_M = 0.05
+
+
+def _floor_between(
+    a: GeometryGroup, b: GeometryGroup, floors, faces
+) -> Optional[GeometryGroup]:
+    """Devuelve la losa que separa verticalmente a dos tramos de muro, si existe.
+
+    El pipeline parte los muros al nivel de cada losa (split_wall_groups_at_floors)
+    justamente para que la losa se inserte entre el tramo de abajo y el de arriba.
+    Volver a fusionarlos produce una pieza que cruza ese nivel y el piso ya no entra:
+    al armar la maqueta el entrepiso queda apoyado por encima en vez de encastrado.
+    """
+    if a.min_y is None or a.max_y is None or b.min_y is None or b.max_y is None:
+        return None
+    # Tramos apilados: uno termina donde empieza el otro.
+    if a.max_y <= b.min_y + FLOOR_BAND_TOL_M:
+        boundary = (a.max_y + b.min_y) / 2.0
+    elif b.max_y <= a.min_y + FLOOR_BAND_TOL_M:
+        boundary = (b.max_y + a.min_y) / 2.0
+    else:
+        return None  # se solapan en altura: no están en bandas distintas
+
+    # Banda que ocupa el muro a lo largo de su propia normal en planta.
+    import math as _math
+    from core.services.mesh_splitter import SLAB_PENETRATION_TOL
+
+    n = a.representative_normal
+    n_len = _math.hypot(n.x, n.z)
+    if n_len <= 1e-6:
+        return None
+    nx, nz = n.x / n_len, n.z / n_len
+    offs = [
+        v.x * nx + v.z * nz
+        for g in (a, b)
+        for fi in g.face_indices
+        if 0 <= fi < len(faces)
+        for v in faces[fi].vertices
+    ]
+    if not offs:
+        return None
+    w_lo, w_hi = min(offs), max(offs)
+
+    for f in floors:
+        if f.min_y is None or f.max_y is None:
+            continue
+        # La losa debe abarcar el nivel del límite entre los dos tramos.
+        if not (f.min_y - FLOOR_BAND_TOL_M <= boundary <= f.max_y + FLOOR_BAND_TOL_M):
+            continue
+        # ...y ATRAVESAR el plano del muro. Mismo criterio que usa el splitter para
+        # partirlo: si la losa sólo apoya contra la cara, el muro nunca se parte, así
+        # que tampoco hay que impedir que el usuario lo fusione.
+        f_offs = [
+            v.x * nx + v.z * nz
+            for fi in f.face_indices
+            if 0 <= fi < len(faces)
+            for v in faces[fi].vertices
+        ]
+        if not f_offs:
+            continue
+        if min(w_hi, max(f_offs)) - max(w_lo, min(f_offs)) > SLAB_PENETRATION_TOL:
+            return f
+    return None
+
+
 def apply_merges(
     phase1: Phase1Result,
     merges: List[List[int]],
@@ -80,6 +147,11 @@ def apply_merges(
     group_by_id: Dict[int, GeometryGroup] = {g.id: g for g in phase1.groups}
     merged_ids: set[int] = set()
     skipped = 0
+    floors = [
+        g for g in phase1.groups
+        if _effective_category(g, overrides) == "floor"
+    ]
+    blocked_by_floor: List[str] = []
 
     for merge_set in merges:
         # Categoría EFECTIVA (con overrides del usuario): un grupo rescatado de
@@ -103,6 +175,24 @@ def apply_merges(
             if m.id == survivor.id or _coplanar_for_merge(m, survivor)
         ]
         skipped += len(merge_set) - len(members)
+
+        # Tampoco se fusionan tramos separados por una LOSA: el pipeline los partió a
+        # ese nivel para que el entrepiso se encastre entre ellos. Fusionarlos genera
+        # una pieza que cruza el nivel de la losa y el piso deja de entrar (se apoya
+        # por encima). Los tramos bloqueados quedan como piezas independientes.
+        kept = [survivor]
+        for m in members:
+            if m.id == survivor.id:
+                continue
+            f = _floor_between(survivor, m, floors, phase1.faces)
+            if f is None:
+                kept.append(m)
+            else:
+                blocked_by_floor.append(
+                    f"{m.label or m.id} / {survivor.label or survivor.id}"
+                    f" (los separa {f.label or f.id})"
+                )
+        members = kept
         if len(members) < 2:
             continue
 
@@ -144,6 +234,19 @@ def apply_merges(
             f"  apply_merges: {skipped} paredes no coplanares omitidas de la fusión"
         )
 
+    warnings = list(phase1.warnings or [])
+    if blocked_by_floor:
+        import logging
+        logging.getLogger("eficiencia2d.pipeline").info(
+            f"  apply_merges: {len(blocked_by_floor)} fusiones bloqueadas por losa intermedia"
+        )
+        warnings.append(
+            "No se fusionaron tramos de pared separados por una losa: el entrepiso "
+            "debe encastrarse entre ellos y al unirlos dejaría de entrar. "
+            + "; ".join(blocked_by_floor[:4])
+            + ("…" if len(blocked_by_floor) > 4 else "")
+        )
+
     new_groups = [
         group_by_id[g.id] for g in phase1.groups if g.id not in merged_ids
     ]
@@ -157,6 +260,7 @@ def apply_merges(
         adjustments=adj.adjustments,
         wall_wall_joints=adj.wall_wall_joints,
         suggested_merges=[],
+        warnings=warnings,
     )
 
 
