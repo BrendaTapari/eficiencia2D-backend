@@ -121,6 +121,15 @@ def face_plane_crossings(verts: List[Vec3], n: Vec3, d: float, eps: float = EPS)
     return out
 
 
+# Espesor físico de la placa de MDF, en metros de plancha. Fuente única para todo lo que
+# depende del MATERIAL (ranuras, topes), a diferencia del espesor que trae el modelo 3D,
+# que es una cota del edificio.
+PLATE_THICKNESS_M = 0.003
+# Holgura por el kerf del láser: la ranura se corta un pelo más ancha que la placa para
+# que entre a presión. CALIBRAR con la cortadora real antes de producción.
+KERF_CLEARANCE_M = 0.0001
+
+
 @dataclass
 class PlateJoint:
     """Junta transversal entre dos placas (la futura línea de encastre)."""
@@ -128,7 +137,13 @@ class PlateJoint:
     cut_id: int             # placa que cede (recibe la ranura) / cuya cara recibe el apoyo
     a: Vec3                 # extremos del segmento de encastre en 3D
     b: Vec3
-    width: float            # ancho de la ranura = grosor de la placa cortante
+    # Ancho de la ranura en metros de PLANCHA (físicos). Por la ranura pasa una placa
+    # real de MDF, así que su ancho lo fija el material, NO el espesor que el muro tenga
+    # en el modelo: ese es una cota del edificio y al escalar daba una ranura distinta en
+    # cada escala (10mm a 1:20, 2mm a 1:100 para una placa de 3mm; y 0 si la malla no
+    # traía espesor, con lo cual no había ranura). Se multiplica por scale_denom al
+    # descomponer, igual que los recortes de ensamble.
+    width: float
     kind: str = "slot"      # "slot" = encastre físico (se corta) | "surface" = apoyo (se graba)
 
 
@@ -256,7 +271,9 @@ def resolve_plate_joints(
             yid = choose_wall_wall_yielder(ga, gb, t_a, t_b, None, faces)
             cut = by_id.get(yid, gb)
             cutter = ga if cut is gb else gb
-            width = (cutter.thickness or 0.0)
+            # Ancho físico: la placa que atraviesa, más la holgura del kerf para que
+            # entre a presión y no floja.
+            width = PLATE_THICKNESS_M + KERF_CLEARANCE_M
 
             seg = plate_joint_segment(cut, cutter, faces, eps)
             if seg is None:
