@@ -3,7 +3,7 @@ from typing import List, Dict, Optional, Literal, Tuple
 from dataclasses import dataclass
 
 # Importamos nuestros tipos y servicios
-from core.services.types import Face3D
+from core.services.types import Face3D, normalize
 from core.services.joint_detector import Joint, MIN_JOINT_ANGLE_DEG
 from core.group_classifier import GeometryGroup
 from core.services.joint_topology_classifier import (
@@ -18,6 +18,10 @@ from core.services.joint_topology_classifier import (
 # en MDF el grosor existe: es el estándar de 3 mm. Permite resolver los encastres
 # muro-muro (quién corta a quién) aunque la malla no tenga espesor.
 DEFAULT_MDF_THICKNESS_M = 0.003
+# Espesor físico de la placa de MDF, en metros de plancha. Fuente única de todo lo que
+# depende del MATERIAL. Se importa del mismo lugar que usa la ranura de encastre para que
+# tope y ranura no puedan desalinearse.
+from core.services.plate_intersect import PLATE_THICKNESS_M  # noqa: E402
 
 # Ángulo mínimo entre dos muros para tratarlos como una unión real. Se importa del
 # detector (única definición) para que no quede una franja de uniones detectadas pero
@@ -54,11 +58,15 @@ class DimensionAdjustment:
     axis: Literal["height", "height_top", "width"]
     reason: str
     joint_index: int
-    # `physical=True` → el `delta` es un grosor FÍSICO de la plancha (MDF 3mm asumido),
-    # no una cota del edificio. Al descomponer se multiplica por scale_denom para que en
-    # la plancha quede a su tamaño físico real (el nesting luego divide por scale_denom).
-    # Los espesores reales medidos (cotas del edificio) van con physical=False.
-    physical: bool = False
+    # El ajuste tiene DOS componentes con unidades distintas, y hay que sumarlas:
+    #   `delta`       -> metros de EDIFICIO (p. ej. el voladizo que el muro del modelo
+    #                    mete más allá del plano medio del vecino). Escala con el modelo.
+    #   `delta_plate` -> metros de PLANCHA (la media placa de MDF). NO escala: son 1.5mm
+    #                    a cualquier escala, así que se multiplica por scale_denom al
+    #                    descomponer para sobrevivir al 1/scale_denom del nesting.
+    # Mezclarlas es imprescindible: usar una sola hacía que el error cambiara de signo
+    # con la escala (+0.5mm a 1:20, -0.5mm a 1:50 en una esquina en L).
+    delta_plate: float = 0.0
 
 
 @dataclass
@@ -132,7 +140,11 @@ def compute_adjustments(
             # edificio (p. ej. 25 cm) y al reducirla por la escala daba un recorte
             # distinto en cada escala (5 mm a 1:50, 2.5 mm a 1:100) en vez de los 3 mm
             # físicos que mide la placa. Mismo criterio que las juntas muro-muro.
-            thickness = DEFAULT_MDF_THICKNESS_M
+            # El borde del muro debe apoyar sobre la CARA de la placa de piso: a media
+            # placa de su plano medio. Se descuenta además el voladizo que el muro del
+            # modelo mete más allá de ese plano.
+            voladizo = overshoot_past_plane_m(wall, floor, faces) or 0.0
+            media_placa = PLATE_THICKNESS_M / 2.0
 
             label = floor.label if floor.label else f"Grupo {floor.id}"
 
@@ -141,11 +153,11 @@ def compute_adjustments(
                 adjustments.append(
                     DimensionAdjustment(
                         group_id=wall.id,
-                        delta=-thickness,
+                        delta=-voladizo,
+                        delta_plate=-media_placa,
                         axis="height",
-                        reason=f"Junta con {label} (MDF 3mm)",
+                        reason=f"Apoyo en {label} (voladizo {voladizo * 1000:.0f}mm + media placa)",
                         joint_index=ji,
-                        physical=True,
                     )
                 )
             elif is_roof_above_wall(floor, wall, joint):
@@ -153,11 +165,11 @@ def compute_adjustments(
                 adjustments.append(
                     DimensionAdjustment(
                         group_id=wall.id,
-                        delta=-thickness,
+                        delta=-voladizo,
+                        delta_plate=-media_placa,
                         axis="height_top",
-                        reason=f"Techo sobre muro: {label} (MDF 3mm)",
+                        reason=f"Techo {label} (voladizo {voladizo * 1000:.0f}mm + media placa)",
                         joint_index=ji,
-                        physical=True,
                     )
                 )
 
@@ -231,32 +243,34 @@ def compute_adjustments(
                 other_group = group_by_id.get(other_group_id)
 
                 if yield_group and other_group:
-                    # El muro que cede SIEMPRE se acorta el grosor del material real que
-                    # se va a cortar: MDF estándar de 3 mm, sin importar el espesor que
-                    # traiga el archivo 3D. Ese espesor del modelo es una cota del
-                    # EDIFICIO (p. ej. 20 cm) y al reducirlo por la escala daba un
-                    # recorte distinto en cada escala (4 mm a 1:50, 2 mm a 1:100) en vez
-                    # de los 3 mm físicos que mide la placa. physical=True → se escala
-                    # por scale_denom al descomponer para quedar en 3 mm reales.
-                    # En uniones oblicuas la placa se interpone a lo largo de más
-                    # distancia sobre el eje del muro que cede → espesor / sen(θ).
+                    # El borde del muro que cede debe apoyar sobre la CARA de la placa
+                    # vecina, o sea a MEDIA PLACA de su plano medio. Hay que quitar dos
+                    # cosas, y están en unidades distintas:
+                    #   1) el voladizo: el contorno del panel se mide hasta la piel
+                    #      EXTERIOR del muro, así que en la esquina asoma más allá del
+                    #      eje del vecino. Es una cota del EDIFICIO y escala con él.
+                    #   2) la media placa: 1.5mm de MDF, iguales en toda escala.
+                    # Antes se restaba un valor fijo de 3mm que ignoraba el voladizo, y
+                    # el error cambiaba de signo con la escala (+0.5mm a 1:20, -0.5mm a
+                    # 1:50 en una esquina en L de 20cm).
+                    # En uniones oblicuas ambos términos se estiran por 1/sen(θ), porque
+                    # la placa se interpone a lo largo de más recorrido del muro.
                     factor = oblique_trim_factor(joint.dihedral_angle)
-                    trim_thickness = DEFAULT_MDF_THICKNESS_M * factor
+                    voladizo = overshoot_past_plane_m(yield_group, other_group, faces) or 0.0
+                    media_placa = PLATE_THICKNESS_M / 2.0
 
-                    detalle = (
-                        "MDF 3mm"
-                        if factor < 1.02
-                        else f"MDF 3mm a {joint.dihedral_angle:.0f}° → {trim_thickness * 1000:.1f}mm"
-                    )
+                    detalle = f"voladizo {voladizo * 1000:.0f}mm + media placa"
+                    if factor >= 1.02:
+                        detalle += f", a {joint.dihedral_angle:.0f}° (x{factor:.2f})"
                     new_ww_joint.yield_group_id = decision
                     adjustments.append(
                         DimensionAdjustment(
                             group_id=decision,
-                            delta=-trim_thickness,
+                            delta=-voladizo * factor,
+                            delta_plate=-media_placa * factor,
                             axis="width",
                             reason=f"Junta con {other_group.label} ({detalle})",
                             joint_index=ji,
-                            physical=True,
                         )
                     )
 
@@ -289,6 +303,58 @@ def compute_adjustments(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def overshoot_past_plane_m(
+    group: GeometryGroup,
+    other: GeometryGroup,
+    faces: Optional[List[Face3D]],
+) -> Optional[float]:
+    """Cuánto material de `group` se mete más allá del plano medio de `other`.
+
+    En metros de EDIFICIO. El contorno del panel se mide hasta la piel EXTERIOR del muro
+    (project_faces_to_2d proyecta ambas pieles y toma el bbox de la unión), así que en una
+    esquina el muro llega más allá del eje del vecino: justamente ese sobrante hay que
+    quitarlo, además de la media placa. Devuelve 0 si no lo cruza.
+    """
+    if not faces:
+        return None
+    n = normalize(other.representative_normal)
+    d_other = _mid_plane_offset(other, faces, n)
+    proj = [
+        n.x * v.x + n.y * v.y + n.z * v.z
+        for fi in group.face_indices
+        if 0 <= fi < len(faces)
+        for v in faces[fi].vertices
+    ]
+    if not proj:
+        return None
+    centro = sum(proj) / len(proj)
+    # El cuerpo del muro está de un lado del plano; el voladizo es lo que asoma del otro.
+    if centro >= d_other:
+        return max(0.0, d_other - min(proj))
+    return max(0.0, max(proj) - d_other)
+
+
+def _mid_plane_offset(group: GeometryGroup, faces: List[Face3D], n) -> float:
+    """Offset del plano MEDIO del grupo a lo largo de `n`: el punto medio entre sus dos
+    pieles, o sea (min + max) / 2 de las proyecciones.
+
+    NO es el promedio de los vértices: ese valor se sesga hacia la piel que tenga más
+    vértices (más teselada, o con aberturas) y da un plano que no es el medio. Con un muro
+    de 20 cm el promedio daba 0.0667 en vez de 0.100, y ese error de 3.3 cm se propagaba
+    al recorte del tope. Es la placa la que va en el plano medio, así que el punto medio
+    geométrico es la referencia correcta.
+    """
+    vals = [
+        n.x * v.x + n.y * v.y + n.z * v.z
+        for fi in group.face_indices
+        if 0 <= fi < len(faces)
+        for v in faces[fi].vertices
+    ]
+    if not vals:
+        return 0.0
+    return (min(vals) + max(vals)) / 2.0
 
 
 def joint_position_frac(
