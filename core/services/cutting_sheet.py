@@ -145,11 +145,6 @@ class Panel:
     edges: List[Edge2D]
     source_group_id: int
     is_mark: bool = False  # True si las aberturas de este panel se graban (no se cortan)
-    # Marco 3D de la pieza YA RECORTADA: {origin, u_dir, v_dir, normal}. Permite
-    # reconstruir dónde queda cada punto del panel en el edificio
-    # (world = origin + u·u_dir + v·v_dir) para verificar el ensamble antes de cortar.
-    # No se usa `placements`, que describe la proyección SIN recortar.
-    frame: Optional[Dict] = None
 
 
 @dataclass
