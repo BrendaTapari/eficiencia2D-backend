@@ -441,12 +441,13 @@ def decompose_panels_from_groups(
         phase1.faces,
     )
 
-    # Los deltas con physical=True son grosor FÍSICO de la plancha (MDF 3 mm): se
-    # multiplican por scale_denom acá para que, tras el 1/scale_denom del nesting,
-    # queden como 3 mm reales en la plancha a cualquier escala.
+    # El ajuste tiene dos componentes en unidades distintas y hay que sumarlas:
+    #   `delta`       ya está en metros de EDIFICIO (el voladizo del modelo).
+    #   `delta_plate` está en metros de PLANCHA (la media placa de MDF): se multiplica
+    #                 por scale_denom para que, tras el 1/scale_denom del nesting, queden
+    #                 los 1.5 mm físicos a cualquier escala.
     def _delta_m(adj) -> float:
-        d = adj.delta
-        return d * (opts.scale_denom or 1.0) if getattr(adj, "physical", False) else d
+        return adj.delta + getattr(adj, "delta_plate", 0.0) * (opts.scale_denom or 1.0)
 
     height_adj: Dict[int, float] = {}       # recorta la BASE del muro
     height_top_adj: Dict[int, float] = {}   # recorta la CIMA del muro (techo encima)
@@ -601,15 +602,30 @@ def decompose_panels_from_groups(
                     clip_off_u += clipped.get("offset_u", 0.0)
                     clip_off_v += clipped.get("offset_v", 0.0)
 
+        # Un mismo BORDE se recorta UNA sola vez, con el ajuste mayor. Antes se aplicaba
+        # un recorte por junta: un muro que cede en varias juntas del mismo lado perdía
+        # la suma de todas (p. ej. 10.3mm en vez de 5.2mm), y la pieza quedaba corta.
+        # El lado se decide en el marco ORIGINAL del panel, antes de cualquier clip, para
+        # que todas las juntas se comparen entre sí de forma coherente.
+        por_borde: Dict[bool, float] = {}
         for w_adj in width_adjs.get(group.id, []):
-            if w_adj.delta >= 0 or is_floor:
+            if w_adj.delta >= 0 and w_adj.delta_plate >= 0:
                 continue
-            strip = min(-_delta_m(w_adj), width_m - 0.01)
+            if is_floor:
+                continue
+            recorte = -_delta_m(w_adj)
+            if recorte <= 0.001:
+                continue
+            j = phase1.joints[w_adj.joint_index]
+            u_j = dot(j.edge_mid, result.u_axis) - result.origin_u
+            izquierda = u_j < result.width_m / 2
+            if recorte > por_borde.get(izquierda, 0.0):
+                por_borde[izquierda] = recorte
+
+        for joint_on_left, recorte in por_borde.items():
+            strip = min(recorte, width_m - 0.01)
             if strip <= 0.001:
                 continue
-            joint = phase1.joints[w_adj.joint_index]
-            u = dot(joint.edge_mid, result.u_axis) - result.origin_u
-            joint_on_left = u < width_m / 2
             clipped = (
                 clip_panel_at_u(edges, width_m - strip, False)
                 if joint_on_left
@@ -644,7 +660,11 @@ def decompose_panels_from_groups(
             )
             if seg is None:
                 continue
-            edges.extend(_slot_edges(*seg, slot_w, mark=(kind == "surface")))
+            # slot_w viene en metros de PLANCHA (es el material real). Se escala por
+            # scale_denom para que tras el 1/scale_denom del nesting la ranura mida
+            # exactamente lo que la placa que la atraviesa, en cualquier escala.
+            slot_w_m = slot_w * (opts.scale_denom or 1.0)
+            edges.extend(_slot_edges(*seg, slot_w_m, mark=(kind == "surface")))
 
         # Patrón de flexión (flex): se corta DENTRO del panel YA proyectado, trimado y
         # espejado — es decir, sobre EXACTAMENTE la misma silueta/orientación que sin
