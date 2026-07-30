@@ -40,6 +40,9 @@ class UserProfileResponse(BaseModel):
     total_proyectos: int
 
 
+class FirstTimeResponse(BaseModel):
+    first_time: bool
+
 class UpdateUserRequest(BaseModel):
     nombre: str = Field(min_length=1, max_length=120)
 
@@ -109,6 +112,39 @@ def get_my_profile(
 ):
     user = _load_user_with_rol(db, current_user.id)
     return _user_profile(db, user)
+
+
+@router.get("/users/me/first-time", response_model=FirstTimeResponse)
+def get_first_time(
+    current_user: Usuario = Depends(get_current_user),
+):
+    return FirstTimeResponse(
+        first_time=bool(current_user.first_time),
+    )
+
+
+@router.patch("/users/me/first-time", response_model=FirstTimeResponse)
+def complete_first_time(
+    current_user: Usuario = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Marca como completada la primera visita del usuario autenticado."""
+    current_user.first_time = False
+    try:
+        db.commit()
+        db.refresh(current_user)
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception(
+            "Error al actualizar first_time para el usuario %s",
+            current_user.id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo actualizar el estado de primera visita",
+        ) from None
+
+    return FirstTimeResponse(first_time=bool(current_user.first_time))
 
 
 @router.get("/users/me/terminos", response_model=TerminosStatusResponse)
