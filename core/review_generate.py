@@ -655,15 +655,24 @@ def decompose_panels_from_groups(
             va = dot(pa, result.v_axis) - result.origin_v - clip_off_v
             ub = dot(pb, result.u_axis) - result.origin_u - clip_off_u
             vb = dot(pb, result.v_axis) - result.origin_v - clip_off_v
-            seg = _clip_segment_to_rect(
-                width_m - ua, va, width_m - ub, vb, width_m, height_m
-            )
-            if seg is None:
-                continue
             # slot_w viene en metros de PLANCHA (es el material real). Se escala por
             # scale_denom para que tras el 1/scale_denom del nesting la ranura mida
             # exactamente lo que la placa que la atraviesa, en cualquier escala.
             slot_w_m = slot_w * (opts.scale_denom or 1.0)
+            # La recta se recorta contra el panel ACHICADO media ranura: _slot_edges
+            # construye un rectángulo de ±slot_w/2 alrededor de ella, y sin este margen
+            # ese rectángulo asomaba del contorno. _fit_panel_bbox lo absorbía agrandando
+            # la pieza (7.8250 -> 7.8358 m, o sea +0.217mm en plancha a 1:50), y el
+            # error crecía con la escala. Una ranura es un corte INTERIOR: no puede
+            # cambiar el tamaño de la pieza.
+            m = slot_w_m / 2.0
+            seg = _clip_segment_to_rect(
+                width_m - ua - m, va - m, width_m - ub - m, vb - m,
+                max(width_m - slot_w_m, 0.0), max(height_m - slot_w_m, 0.0),
+            )
+            if seg is None:
+                continue
+            seg = (seg[0] + m, seg[1] + m, seg[2] + m, seg[3] + m)
             edges.extend(_slot_edges(*seg, slot_w_m, mark=(kind == "surface")))
 
         # Patrón de flexión (flex): se corta DENTRO del panel YA proyectado, trimado y
