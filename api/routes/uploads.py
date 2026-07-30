@@ -30,7 +30,6 @@ from core.pipeline import parse_pipeline, generate_pipeline, Phase1Result
 from core.services.cutting_sheet import build_placements
 from core.services.curvature import build_curvature_map
 from core.services.assembly_check import compute_assembly_warnings
-from core.services.assembly_fit import check_piece_collisions
 from core.group_classifier import compute_assembly_steps
 from core.services.assembly_adjuster import DEFAULT_MDF_THICKNESS_M
 from core.services.types import PipelineOptions, SheetConfig
@@ -255,50 +254,6 @@ def serialize_nesting(nesting) -> Dict:
         "scale_denom": nesting.scale_denom,
         "unplaced": [_serialize_nesting_panel(p) for p in nesting.unplaced],
     }
-
-
-def serialize_final_pieces(panels) -> List[Dict]:
-    """Piezas TAL COMO se van a cortar, ubicadas en el edificio.
-
-    El instructivo se dibujaba con `placements`, que es la proyección del modelo SIN
-    recortar: por eso mostraba las piezas superponiéndose donde en realidad el encastre
-    ya las resolvió. Acá va el contorno final (con sus recortes) más el marco 3D de la
-    pieza ya recortada: world = origin + u·u_dir + v·v_dir. Dibujando esto, el
-    instructivo muestra la maqueta que realmente se va a armar.
-    """
-    out: List[Dict] = []
-    for p in panels:
-        fr = getattr(p, "frame", None)
-        if not fr:
-            continue
-
-        def vec(v) -> Dict:
-            return {"x": v.x, "y": v.y, "z": v.z}
-
-        out.append({
-            "id": p.id,
-            "group_id": p.source_group_id,
-            "category": p.category,
-            "width_m": p.width_m,
-            "height_m": p.height_m,
-            "origin": vec(fr["origin"]),
-            "u_dir": vec(fr["u_dir"]),
-            "v_dir": vec(fr["v_dir"]),
-            "normal": vec(fr["normal"]),
-            # Contorno final en coordenadas locales de la pieza (metros de edificio).
-            # `hole` marca las aberturas; `joint`, las ranuras de encastre.
-            "edges": [
-                {
-                    "a": {"x": e.a.x, "y": e.a.y},
-                    "b": {"x": e.b.x, "y": e.b.y},
-                    "hole": e.hole,
-                    "joint": getattr(e, "joint", False),
-                }
-                for e in p.edges
-                if not getattr(e, "score", False)
-            ],
-        })
-    return out
 
 
 def serialize_plate_joints(plate_joints) -> List[Dict]:
@@ -968,7 +923,7 @@ async def nesting_preview_endpoint(
         )
 
         with timer.step("compute_nesting"):
-            work, wall_nesting, floor_nesting, cfg, panel_id_by_group, plate_joints, final_panels = compute_nesting(
+            work, wall_nesting, floor_nesting, cfg, panel_id_by_group, plate_joints = compute_nesting(
                 rebuilt,
                 opts,
                 overrides=request.overrides,
@@ -989,12 +944,6 @@ async def nesting_preview_endpoint(
                 assembly_warnings = compute_assembly_warnings(
                     work.groups, work.faces, panel_id_by_group
                 )
-                # Además, "armar la maqueta" con las piezas TAL COMO se van a cortar:
-                # detecta placas que se atraviesan, que es lo que hasta ahora sólo se
-                # descubría pegando el MDF. Va en la misma lista de avisos.
-                assembly_warnings = assembly_warnings + check_piece_collisions(
-                    final_panels
-                )
             except Exception:
                 logger.exception("[nesting-preview] assembly_check falló")
                 assembly_warnings = []
@@ -1003,9 +952,6 @@ async def nesting_preview_endpoint(
         return JSONResponse(content={
             "wall_nesting": serialize_nesting(wall_nesting),
             "floor_nesting": serialize_nesting(floor_nesting),
-            # Piezas finales ubicadas en 3D, para que el instructivo dibuje lo que
-            # realmente se va a cortar (ver serialize_final_pieces).
-            "final_pieces": serialize_final_pieces(final_panels),
             "config": {
                 "width_m": cfg.width_m,
                 "height_m": cfg.height_m,
