@@ -440,7 +440,7 @@ def decompose_panels_from_groups(
     joints_by_cut: Dict[int, list] = {}
     for pj in plate_joints or []:
         joints_by_cut.setdefault(pj.cut_id, []).append(
-            (pj.a, pj.b, pj.width, getattr(pj, "kind", "slot"))
+            (pj.a, pj.b, pj.width, getattr(pj, "kind", "slot"), pj.cutter_id)
         )
 
     # No hace falta sembrar las sugerencias: compute_adjustments ya resuelve por su
@@ -727,7 +727,8 @@ def decompose_panels_from_groups(
         # ranuras que caen fuera de la pieza ya recortada: si no, se dibujaban en el
         # marco viejo y quedaban fuera del bounding box del panel, invadiendo al vecino
         # en la plancha (el nesting sólo conoce width_m × height_m).
-        for (pa, pb, slot_w, kind) in joints_by_cut.get(group.id, []):
+        slots_cortadas: List[int] = []
+        for (pa, pb, slot_w, kind, cutter_id) in joints_by_cut.get(group.id, []):
             ua = dot(pa, result.u_axis) - result.origin_u - clip_off_u
             va = dot(pa, result.v_axis) - result.origin_v - clip_off_v
             ub = dot(pb, result.u_axis) - result.origin_u - clip_off_u
@@ -751,6 +752,11 @@ def decompose_panels_from_groups(
                 continue
             seg = (seg[0] + m, seg[1] + m, seg[2] + m, seg[3] + m)
             edges.extend(_slot_edges(*seg, slot_w_m, mark=(kind == "surface")))
+            # La ranura SOBREVIVIÓ al recorte: recién ahora es material que se quita de
+            # verdad. Las que caen fuera del panel ya trimado no se registran, porque el
+            # tope ya resolvió esa junta y la ranura sobraba.
+            if kind != "surface":
+                slots_cortadas.append(cutter_id)
 
         # Patrón de flexión (flex): se corta DENTRO del panel YA proyectado, trimado y
         # espejado — es decir, sobre EXACTAMENTE la misma silueta/orientación que sin
@@ -805,6 +811,7 @@ def decompose_panels_from_groups(
                     source_group_id=group.id,
                     is_mark=group.id in marks_set,
                     frame=marco,
+                    slots_against=slots_cortadas,
                 )
             )
         else:
@@ -821,6 +828,7 @@ def decompose_panels_from_groups(
                     source_group_id=group.id,
                     is_mark=group.id in marks_set,
                     frame=marco,
+                    slots_against=slots_cortadas,
                 )
             )
 
@@ -1011,7 +1019,7 @@ def compute_nesting(
     mark_lines: Optional[List[dict]] = None,
     ribs: Optional[List[dict]] = None,
     columns: Optional[List[dict]] = None,
-) -> Tuple[Phase1Result, NestingResult, NestingResult, SheetConfig, Dict[int, str], List, Dict[str, Dict]]:
+) -> Tuple[Phase1Result, NestingResult, NestingResult, SheetConfig, Dict[int, str], List, Dict[str, Dict], List]:
     """Descompone y anida paneles. Compartido por /generate y /nesting-preview."""
     work, wall_panels, floor_panels, plate_joints = _decompose(
         phase1, opts, overrides, wall_wall_decisions, merges, marks,
@@ -1061,7 +1069,39 @@ def compute_nesting(
         panel_ids_by_group(wall_panels, floor_panels),
         plate_joints,
         final_placements(wall_panels, floor_panels),
+        # Fase D: ¿las piezas que se van a cortar arman el edificio? Se calcula acá, sobre
+        # los paneles FINALES y con la escala ya elegida, porque la respuesta depende de
+        # ambas cosas: a escalas gruesas la placa ocupa más edificio y aparecen choques
+        # que a escalas finas no existen.
+        _verificar(work, wall_panels, floor_panels, plate_joints, opts.scale_denom or 1.0),
     )
+
+
+def _verificar(work, wall_panels, floor_panels, plate_joints, scale_denom):
+    """Corre la verificación de ensamble, sin dejar que un fallo suyo tumbe la generación.
+
+    Es un chequeo, no una etapa del cálculo: si se rompe, se pierde el aviso pero las
+    piezas siguen saliendo. Lo contrario -que un verificador con un bug impida cortar-
+    sería peor que no tenerlo.
+    """
+    try:
+        from core.services.assembly_verify import verificar_ensamble
+        from core.services.plate_intersect import pair_key
+
+        detectadas = {pair_key(j.group_a, j.group_b) for j in work.joints}
+        sin_resolver = {
+            pair_key(j.group_a, j.group_b)
+            for j in work.wall_wall_joints
+            if j.yield_group_id is None
+        }
+        return verificar_ensamble(
+            list(wall_panels) + list(floor_panels), plate_joints, scale_denom,
+            detectadas, sin_resolver,
+        )
+    except Exception:
+        import logging
+        logging.getLogger("eficiencia2d.pipeline").exception("verificar_ensamble falló")
+        return []
 
 
 def final_placements(
@@ -1094,7 +1134,7 @@ def generate_from_review(
     ribs: Optional[List[dict]] = None,
     columns: Optional[List[dict]] = None,
 ) -> List[OutputFile]:
-    work, wall_nesting, floor_nesting, sheet_cfg, _, _, _ = compute_nesting(
+    work, wall_nesting, floor_nesting, sheet_cfg, _, _, _, _ = compute_nesting(
         phase1, opts, overrides, wall_wall_decisions, merges, marks,
         user_cuts, flex, mark_lines, ribs, columns,
     )
