@@ -1353,6 +1353,7 @@ def emit_panel_entities(
     scale_denom: float = 1.0,
     include_text: bool = True,
     is_mark: bool = False,
+    label_dims: Optional[Tuple[float, float]] = None,
 ):
     for edge in edges:
         # Los encastres (joint) NO se dibujan en la lámina de corte: son geometría de
@@ -1396,7 +1397,14 @@ def emit_panel_entities(
     if not include_text:
         return
 
-    real_w, real_h = pw * scale_denom, ph * scale_denom
+    # Las medidas se rotulan SIEMPRE en el marco propio de la pieza, no en el que quedó
+    # tras rotarla para que entre en la plancha. Con las rotadas al revés, dos piezas que
+    # se comparan (un entrepiso contra el piso de abajo, por ejemplo) imprimían sus ejes
+    # cruzados: una decía "6.96 x 7.18" y la otra "7.51 x 7.01", y comparar los primeros
+    # números era comparar la Z de una contra la X de la otra. La etiqueta llevaba a
+    # conclusiones falsas sobre piezas que estaban bien.
+    lw, lh = label_dims if label_dims else (pw, ph)
+    real_w, real_h = lw * scale_denom, lh * scale_denom
     dim_text = f"{real_w:.2f} x {real_h:.2f} m"
     label_h = fit_text_height(panel_id, pw, ph * 0.45, 0.008)
     dim_h = fit_text_height(dim_text, pw, ph * 0.30, 0.005)
@@ -1588,6 +1596,7 @@ def nested_sheets_to_dxf(nesting: NestingResult, include_text: bool = True) -> s
                 nesting.scale_denom,
                 include_text,
                 is_mark=getattr(placed.panel, "is_mark", False),
+                label_dims=(placed.panel.width_m, placed.panel.height_m),
             )
 
     lines.extend(["0", "ENDSEC", "0", "EOF"])
