@@ -923,7 +923,10 @@ async def nesting_preview_endpoint(
         )
 
         with timer.step("compute_nesting"):
-            work, wall_nesting, floor_nesting, cfg, panel_id_by_group, plate_joints = compute_nesting(
+            (
+                work, wall_nesting, floor_nesting, cfg, panel_id_by_group,
+                plate_joints, final_places,
+            ) = compute_nesting(
                 rebuilt,
                 opts,
                 overrides=request.overrides,
@@ -959,6 +962,11 @@ async def nesting_preview_endpoint(
             },
             # Encastres 3D (world coords) para superponer ranuras en el instructivo.
             "plate_joints": serialize_plate_joints(plate_joints),
+            # Marco 3D de cada pieza YA RECORTADA (group_id -> placement). Misma forma
+            # que topology.placements, pero con las medidas que se van a cortar: el
+            # instructivo debe dibujar ESTO. topology.placements es la proyección cruda
+            # del modelo y muestra las piezas sin recortar, pisándose entre sí.
+            "placements": final_places,
             # Chequeo de ensamble: [] = verificado; si no, gap/overlap/unsupported.
             "assembly_warnings": assembly_warnings,
         })
