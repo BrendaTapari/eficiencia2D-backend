@@ -175,6 +175,7 @@ def init_db() -> None:
     _migrate_usuario_terminos_schema()
     _migrate_usuario_first_time_schema()
     _migrate_usuario_google_schema()
+    _migrate_proyectos_ultima_edicion_schema()
     _migrate_cupones_schema()
     _migrate_planes_contract_schema()
     _migrate_precios_plan_schema()
@@ -428,6 +429,45 @@ def _migrate_usuario_google_schema() -> None:
         for sql in statements:
             conn.execute(text(sql))
     logger.info("Esquema de Google OAuth (usuarios.google_sub/avatar_url) verificado")
+
+
+def _migrate_proyectos_ultima_edicion_schema() -> None:
+    """Agrega fecha_ultima_edicion a proyectos (backfill con fecha_creacion)."""
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                ALTER TABLE proyectos
+                ADD COLUMN IF NOT EXISTS fecha_ultima_edicion TIMESTAMPTZ
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                UPDATE proyectos
+                SET fecha_ultima_edicion = fecha_creacion
+                WHERE fecha_ultima_edicion IS NULL
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                ALTER TABLE proyectos
+                ALTER COLUMN fecha_ultima_edicion SET DEFAULT NOW()
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                ALTER TABLE proyectos
+                ALTER COLUMN fecha_ultima_edicion SET NOT NULL
+                """
+            )
+        )
+    logger.info("Esquema de fecha_ultima_edicion en proyectos verificado")
 
 
 def _migrate_cupones_schema() -> None:
@@ -811,6 +851,11 @@ class Proyecto(Base):
     url_archivo = Column(String, nullable=False)
     metadata_impresion = Column(JSONB, nullable=True)
     fecha_creacion = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    fecha_ultima_edicion = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
 
     # Relaciones
     usuario = relationship("Usuario", back_populates="proyectos")

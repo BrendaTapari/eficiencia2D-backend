@@ -40,6 +40,7 @@ class ProyectoResponse(BaseModel):
     url_archivo: str
     metadata_impresion: dict[str, Any] | None
     fecha_creacion: str
+    fecha_ultima_edicion: str
     download_url: str | None = None
 
 
@@ -147,8 +148,14 @@ def _proyecto_tiene_estado_guardado(proyecto: Proyecto, estado: dict[str, Any]) 
     return bool(estado)
 
 
+def _touch_proyecto_edicion(proyecto: Proyecto) -> None:
+    """Marca el proyecto como editado ahora (para ordenar listados)."""
+    proyecto.fecha_ultima_edicion = datetime.now(timezone.utc)
+
+
 def _commit_proyecto_nombre(db: Session, proyecto: Proyecto, nombre: str) -> None:
     proyecto.nombre = nombre
+    _touch_proyecto_edicion(proyecto)
     try:
         db.commit()
     except SQLAlchemyError as exc:
@@ -249,6 +256,7 @@ def _persist_estado_proyecto(
     meta["estado_r2"] = ruta_r2
     meta["estado_actualizado_at"] = actualizado_at
     proyecto.metadata_impresion = meta
+    _touch_proyecto_edicion(proyecto)
 
     try:
         db.commit()
@@ -266,6 +274,7 @@ def _persist_estado_proyecto(
 
 def _proyecto_to_response(proyecto: Proyecto, *, include_download_url: bool = False) -> ProyectoResponse:
     download_url = obtener_url_archivo(proyecto.url_archivo) if include_download_url else None
+    fecha_edicion = proyecto.fecha_ultima_edicion or proyecto.fecha_creacion
     return ProyectoResponse(
         id=str(proyecto.id),
         nombre=proyecto.nombre,
@@ -274,6 +283,7 @@ def _proyecto_to_response(proyecto: Proyecto, *, include_download_url: bool = Fa
         url_archivo=proyecto.url_archivo,
         metadata_impresion=proyecto.metadata_impresion,
         fecha_creacion=proyecto.fecha_creacion.isoformat(),
+        fecha_ultima_edicion=fecha_edicion.isoformat(),
         download_url=download_url,
     )
 
@@ -292,7 +302,7 @@ def list_proyectos_for_user(db: Session, user: Usuario) -> ProyectoListResponse:
     proyectos = (
         db.query(Proyecto)
         .filter(Proyecto.usuario_id == user.id)
-        .order_by(Proyecto.fecha_creacion.desc())
+        .order_by(Proyecto.fecha_ultima_edicion.desc(), Proyecto.fecha_creacion.desc())
         .all()
     )
     return ProyectoListResponse(
@@ -346,6 +356,7 @@ async def create_proyecto_for_user(
             "archivo_original": original_filename,
             "summary": processed["summary"],
         },
+        fecha_ultima_edicion=datetime.now(timezone.utc),
     )
     db.add(proyecto)
 

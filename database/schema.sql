@@ -47,6 +47,7 @@ CREATE TABLE proyectos (
     url_archivo VARCHAR NOT NULL,
     metadata_impresion JSONB,
     fecha_creacion TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    fecha_ultima_edicion TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT fk_proyectos_usuario FOREIGN KEY (usuario_id) REFERENCES usuarios (id)
 );
 
