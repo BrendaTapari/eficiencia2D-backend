@@ -467,8 +467,12 @@ def decompose_panels_from_groups(
     height_adj: Dict[int, float] = {}       # recorta la BASE del muro
     height_top_adj: Dict[int, float] = {}   # recorta la CIMA del muro (techo encima)
     width_adjs: Dict[int, list] = {}
+    plane_adjs: Dict[int, list] = {}        # recorta la pieza en su plano (losa entre muros)
+    group_by_id: Dict[int, GeometryGroup] = {g.id: g for g in phase1.groups}
     for adj in adj_result.adjustments:
-        if adj.axis == "height":
+        if adj.axis == "plane":
+            plane_adjs.setdefault(adj.group_id, []).append(adj)
+        elif adj.axis == "height":
             height_adj[adj.group_id] = height_adj.get(adj.group_id, 0.0) + _delta_m(adj)
         elif adj.axis == "height_top":
             # Antes caía en width_adjs y recortaba el ANCHO del panel en vez de su cima.
@@ -646,6 +650,57 @@ def decompose_panels_from_groups(
                 if joint_on_left
                 else clip_panel_at_u(edges, strip, True)
             )
+            if clipped:
+                width_m, height_m, edges = (
+                    clipped["width_m"],
+                    clipped["height_m"],
+                    clipped["edges"],
+                )
+                clip_off_u += clipped.get("offset_u", 0.0)
+                clip_off_v += clipped.get("offset_v", 0.0)
+
+        # Recorte EN EL PLANO de la pieza contra un grupo continuo (axis="plane"): el caso
+        # del entrepiso que tiene que ENTRAR entre dos muros que siguen de largo por
+        # arriba y por abajo. El eje (u o v) y el lado salen de la normal de ese muro, no
+        # de `v_up`, que en una losa no significa nada. Los pisos no recibían ningún
+        # recorte, así que el entrepiso salía con el ancho que tiene entre las pieles del
+        # modelo y al armar la maqueta no entraba.
+        por_lado: Dict[Tuple[str, bool], float] = {}
+        for p_adj in plane_adjs.get(group.id, []):
+            recorte = -_delta_m(p_adj)
+            if recorte <= 0.001:
+                continue
+            otro = group_by_id.get(p_adj.against_group_id)
+            if otro is None:
+                continue
+            n_otro = normalize(otro.representative_normal)
+            du = dot(n_otro, result.u_axis)
+            dv = dot(n_otro, result.v_axis)
+            eje = "u" if abs(du) >= abs(dv) else "v"
+            # La normal del muro apunta hacia afuera: si va en el sentido creciente del
+            # eje, el borde que toca ese muro es el ALTO.
+            alto = (du if eje == "u" else dv) > 0
+            clave = (eje, alto)
+            if recorte > por_lado.get(clave, 0.0):
+                por_lado[clave] = recorte
+
+        for (eje, alto), recorte in sorted(por_lado.items()):
+            limite = (width_m if eje == "u" else height_m) - 0.01
+            strip = min(recorte, limite)
+            if strip <= 0.001:
+                continue
+            if eje == "u":
+                clipped = (
+                    clip_panel_at_u(edges, width_m - strip, False)
+                    if alto
+                    else clip_panel_at_u(edges, strip, True)
+                )
+            else:
+                clipped = (
+                    clip_panel_at_v(edges, height_m - strip, False)
+                    if alto
+                    else clip_panel_at_v(edges, strip, True)
+                )
             if clipped:
                 width_m, height_m, edges = (
                     clipped["width_m"],
