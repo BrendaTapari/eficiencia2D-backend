@@ -1,7 +1,7 @@
 import time
 import logging
 from typing import List, Dict, Optional, Literal, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from core.profiler import PipelineTimer
 from core.services.types import Face3D, PipelineOptions, OutputFile, Vec3, IndexedFace3D
@@ -16,7 +16,7 @@ from core.group_classifier import (
     DEFAULT_MIN_REAL_AREA,
 )
 from core.services.mesh_splitter import split_wall_groups_at_floors
-from core.services.joint_detector import Joint, detect_joints
+from core.services.joint_detector import Joint, build_group_adjacency, detect_joints
 from core.services.assembly_adjuster import (
     DimensionAdjustment,
     WallWallJoint,
@@ -42,6 +42,10 @@ class Phase1Result:
     pre_split_face_count: int
     suggested_merges: List[List[int]]
     timing: Optional[Dict] = None  # Reporte de timing para debug
+    # Vecindad entre grupos (group_id -> [ids vecinos], ordenada). Fuente única de
+    # "quién toca a quién": se deriva de `joints` y la comparten los encastres y el
+    # instructivo, en vez de que cada consumidor la reconstruya con su propio criterio.
+    group_adjacency: Dict[int, List[int]] = field(default_factory=dict)
 
 
 def _rotate_z_to_y(face: Face3D) -> Face3D:
@@ -172,6 +176,7 @@ def parse_pipeline(
         pre_split_face_count=pre_split_face_count,
         suggested_merges=[],
         timing=timing_report,
+        group_adjacency=build_group_adjacency(joints),
     )
 
 
