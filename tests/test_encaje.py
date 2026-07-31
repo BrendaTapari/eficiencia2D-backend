@@ -34,6 +34,7 @@ import pytest
 from core.pipeline import parse_pipeline
 from core.review_generate import _decompose
 from core.services.assembly_adjuster import compute_adjustments, yield_by_pair
+from core.services.assembly_verify import verificar_ensamble
 from core.services.cutting_sheet import (
     orient_group_normals_outward,
     project_faces_to_2d,
@@ -106,6 +107,27 @@ class _ObjBuilder:
             (x0 - nx * h, z0 - nz * h),
         ]
         self.prisma(planta, y0, y1)
+
+    def losa_inclinada(self, x0, x1, z0, y0, z1, y1, t):
+        """Placa inclinada: sección en el plano (z,y) de (z0,y0) a (z1,y1), espesor `t`,
+        extruida en X de x0 a x1. `prisma` sólo extruye en vertical, así que no puede
+        representar un faldón de techo."""
+        dz, dy = z1 - z0, y1 - y0
+        L = math.hypot(dz, dy)
+        uz, uy = dz / L, dy / L
+        mz, my = -uy, uz          # normal de la sección
+        h = t / 2.0
+        sec = [
+            (z0 + mz * h, y0 + my * h), (z1 + mz * h, y1 + my * h),
+            (z1 - mz * h, y1 - my * h), (z0 - mz * h, y0 - my * h),
+        ]
+        a = [(x0, y, z) for (z, y) in sec]
+        b = [(x1, y, z) for (z, y) in sec]
+        for i in range(4):
+            j = (i + 1) % 4
+            self.quad(a[i], a[j], b[j], b[i])
+        self.quad(*reversed(a))
+        self.quad(*b)
 
     def prisma(self, planta, y0, y1):
         """Extruye un polígono en planta [(x,z), ...] entre las alturas y0 e y1."""
@@ -220,6 +242,38 @@ def _extremos_a_lo_largo(panel, grupo, faces, direccion):
     return bruto_lo, bruto_hi, recorte, sgn
 
 
+def _ocupa(panel, direccion):
+    """Intervalo que ocupa la pieza FINAL sobre `direccion`, LEÍDO de su marco 3D.
+
+    Es la diferencia entre verificar el TAMAÑO y verificar la POSICIÓN. Reconstruir el
+    borde a partir de la proyección y del recorte —que es lo que hacía este banco— da por
+    sentado de qué extremo salió el material, así que no puede detectar que el código lo
+    saque del otro. Y eso pasó: las dos ramas del clip lateral estaban invertidas, la
+    pieza salía con el largo correcto y corrida el recorte entero, y los 41 casos pasaban
+    en verde. Acá se lee dónde quedó la pieza y se compara contra el mundo.
+    """
+    m = panel.frame
+    assert m is not None, f"la pieza {panel.id} no trae marco 3D"
+    o, u, v = m["origin"], m["u_axis"], m["v_axis"]
+    proy = [
+        direccion.x * (o["x"] + a * u["x"] + b * v["x"])
+        + direccion.y * (o["y"] + a * u["y"] + b * v["y"])
+        + direccion.z * (o["z"] + a * u["z"] + b * v["z"])
+        for a, b in ((0.0, 0.0), (m["width_m"], 0.0),
+                     (m["width_m"], m["height_m"]), (0.0, m["height_m"]))
+    ]
+    return min(proy), max(proy)
+
+
+def _borde_contra(panel, otro, faces):
+    """Distancia del borde de `panel` al plano medio de `otro`, sobre la posición REAL."""
+    n = normalize(otro.representative_normal)
+    d = mid_plane_offset(otro, faces, n)
+    lo, hi = _ocupa(panel, n)
+    borde = lo if abs(lo - d) < abs(hi - d) else hi
+    return abs(borde - d)
+
+
 # ---------------------------------------------------------------------------
 # Casos
 # ---------------------------------------------------------------------------
@@ -261,20 +315,11 @@ def test_esquina_L_borde_cae_sobre_la_cara_vecina(scale):
     otro = grupos[ww.group_b if ww.yield_group_id == ww.group_a else ww.group_a]
     panel = next(p for p in paneles if p.source_group_id == cede.id)
 
-    n_otro, d_otro = _plano_medio(otro, work.faces)
-
-    # Distancia del borde recortado de `cede` al plano medio de `otro`.
-    ext = _extremos_a_lo_largo(panel, cede, work.faces, n_otro)
-    assert ext is not None, "el muro que cede no corre a lo largo de la normal del otro"
-    bruto_lo, bruto_hi, recorte, sgn = ext
-
-    # El extremo que mira al otro muro es el más cercano a su plano medio.
-    borde_bruto = bruto_lo if abs(bruto_lo - d_otro) < abs(bruto_hi - d_otro) else bruto_hi
-    # Tras el recorte, ese borde se aleja del plano medio.
-    borde_final = borde_bruto + recorte if borde_bruto < d_otro else borde_bruto - recorte
-    distancia_m = abs(borde_final - d_otro)
-
-    distancia_mm = distancia_m / scale * 1000.0
+    # Distancia del borde recortado al plano medio del vecino, medida sobre la POSICIÓN
+    # real de la pieza. Antes se reconstruía a partir de la proyección y del recorte,
+    # asumiendo de qué extremo había salido el material: por eso este mismo caso pasaba
+    # en verde con las ramas del clip invertidas.
+    distancia_mm = _borde_contra(panel, otro, work.faces) / scale * 1000.0
     objetivo_mm = objetivo_m / scale * 1000.0  # == PLATE_THICKNESS_M/2 * 1000 == 1.5
 
     assert objetivo_mm == pytest.approx(1.5, abs=1e-9)
@@ -282,6 +327,24 @@ def test_esquina_L_borde_cae_sobre_la_cara_vecina(scale):
         f"1:{scale:.0f} el borde quedó a {distancia_mm:.3f}mm del plano medio vecino, "
         f"y debía quedar a {objetivo_mm:.3f}mm "
         f"(diferencia {distancia_mm - objetivo_mm:+.3f}mm en la pieza real)"
+    )
+
+    # Y que el material se haya sacado del extremo CORRECTO: la pieza tiene que seguir
+    # llegando a su extremo libre, no haberse corrido entera.
+    n_otro = normalize(otro.representative_normal)
+    lo_f, hi_f = _ocupa(panel, n_otro)
+    proy_bruto = [
+        dot(n_otro, v)
+        for fi in cede.face_indices
+        if 0 <= fi < len(work.faces)
+        for v in work.faces[fi].vertices
+    ]
+    d_otro = mid_plane_offset(otro, work.faces, n_otro)
+    lejano_bruto = max(proy_bruto) if abs(max(proy_bruto) - d_otro) > abs(min(proy_bruto) - d_otro) else min(proy_bruto)
+    lejano_final = hi_f if abs(hi_f - d_otro) > abs(lo_f - d_otro) else lo_f
+    assert lejano_final == pytest.approx(lejano_bruto, abs=1e-6), (
+        f"1:{scale:.0f} el extremo LIBRE de la pieza se movió de {lejano_bruto:.4f} a "
+        f"{lejano_final:.4f}: el recorte salió del extremo equivocado"
     )
 
 
@@ -731,6 +794,49 @@ def test_entrepiso_entra_entre_muros_continuos(scale):
 
 
 @pytest.mark.parametrize("scale", ESCALAS)
+def test_extremo_del_muro_apoya_en_la_cara_de_la_losa_sin_junta_detectada(scale):
+    """El extremo del muro topa contra la placa de losa AUNQUE no haya junta detectada.
+
+    Las dos ramas que resolvían esto (`is_wall_on_top` / `is_roof_above_wall`) viven
+    dentro del bucle de juntas, y `detect_joints` es topológico: si la losa no comparte
+    vértices con el muro, no hay junta y el encuentro se quedaba sin resolver EN SILENCIO.
+    Acá el muro va insetado en planta, así que no comparte ningún vértice con la losa.
+    """
+    b = _ObjBuilder()
+    b.box(0.0, 8.0, 2.0, 2.40, 0.0, 6.0)          # losa de 40cm, plano medio y=2.20
+    b.box(1.0, 7.0, 2.20, 5.0, 2.0, 2.20)         # muro que NACE en ese plano
+    work, paneles, grupos, _ = _procesar(b.text(), scale)
+
+    objetivo_mm = 1.5
+    revisados = 0
+    for panel in paneles:
+        g = grupos[panel.source_group_id]
+        if g.category != "wall" or g.min_y is None:
+            continue
+        if abs(g.min_y - 2.20) > 0.02:      # sólo el muro que este caso construye
+            continue
+        base_final = g.min_y + (_altura_bruta(g, work.faces) - panel.height_m)
+        distancia_mm = abs(base_final - 2.20) / scale * 1000.0
+        revisados += 1
+        assert distancia_mm == pytest.approx(objetivo_mm, abs=TOL_MM), (
+            f"1:{scale:.0f} la base del muro quedó a {distancia_mm:.2f}mm del plano medio "
+            f"de la losa y debía quedar a {objetivo_mm:.2f}mm (media placa)"
+        )
+    assert revisados, "no se encontró el muro del caso"
+
+
+def _altura_bruta(grupo, faces):
+    """Alto del panel SIN recortar, para deducir cuánto se le quitó."""
+    oriented = orient_group_normals_outward([grupo])
+    res = project_faces_to_2d(
+        [faces[i] for i in grupo.face_indices if i < len(faces)],
+        oriented.get(grupo.id, grupo.representative_normal),
+        "Y",
+    )
+    return res.height_m if res else 0.0
+
+
+@pytest.mark.parametrize("scale", ESCALAS)
 def test_losa_de_base_no_se_recorta(scale):
     """Sobre la losa de planta baja APOYAN los muros: no hay que achicarla.
 
@@ -763,6 +869,158 @@ def test_losa_de_base_no_se_recorta(scale):
             f"1:{scale:.0f} la losa de base se achicó {recorte_mm:.2f}mm, y los muros "
             "apoyan sobre ella: no hay nada entre lo que entrar"
         )
+
+
+# ---------------------------------------------------------------------------
+# Fase D — la verificación del ensamble tiene que valer para algo
+#
+# Un chequeo que puede dar un falso OK es peor que no tener ninguno. Estos casos son la
+# validación del verificador: tiene que dar 0 donde el banco afirma que encastra, >0 donde
+# se reintroduce un defecto conocido, y NO condenar los encastres por ranura, que se
+# atraviesan a propósito.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("scale", ESCALAS)
+def test_verificacion_no_marca_un_ensamble_correcto(scale):
+    """La esquina en L encastra —lo afirman los otros casos— así que no debe marcar nada."""
+    work, paneles, grupos, pjs = _procesar(_modelo_esquina_L(t=0.20), scale)
+    fallos = verificar_ensamble(paneles, pjs, scale)
+    assert fallos == [], (
+        f"1:{scale:.0f} el verificador marca {len(fallos)} choques en un ensamble que el "
+        f"resto del banco da por bueno: {[(f.pieza_a, f.pieza_b, round(f.penetracion_mm,2)) for f in fallos]}"
+    )
+
+
+def _placa(pid, gid, origen, u_dir, v_dir, ancho, alto):
+    """Placa rectangular puesta a mano, para probar el verificador contra casos cuya
+    respuesta se calcula sin correr el pipeline."""
+    from core.services.cutting_sheet import Edge2D, Panel
+    from core.services.types import Vec2
+
+    esq = [(0.0, 0.0), (ancho, 0.0), (ancho, alto), (0.0, alto)]
+    edges = [
+        Edge2D(a=Vec2(*esq[i]), b=Vec2(*esq[(i + 1) % 4])) for i in range(4)
+    ]
+    return Panel(
+        id=pid, group_name=pid, category="wall", floor_index=0,
+        width_m=ancho, height_m=alto, edges=edges, source_group_id=gid,
+        frame={
+            "origin": {"x": origen[0], "y": origen[1], "z": origen[2]},
+            "u_axis": {"x": u_dir[0], "y": u_dir[1], "z": u_dir[2]},
+            "v_axis": {"x": v_dir[0], "y": v_dir[1], "z": v_dir[2]},
+            "normal": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "width_m": ancho, "height_m": alto, "mirrored": False,
+        },
+    )
+
+
+@pytest.mark.parametrize("scale", ESCALAS)
+def test_verificacion_detecta_dos_placas_que_se_pisan(scale):
+    """Dos placas perpendiculares donde una ATRAVIESA a la otra: tiene que marcarlo.
+
+    Es la otra mitad de la validación: sin este caso, un verificador que devolviera
+    siempre la lista vacía pasaría el caso anterior. Se arma a mano en vez de romper el
+    pipeline, porque quitarle los recortes al modelo en L hace que la ranura resuelva la
+    junta legítimamente — o sea que no queda roto.
+    """
+    media = PLATE_THICKNESS_M * scale / 2.0
+    # A en el plano z=0, de x 0 a 4. B en el plano x=2, de z -1 a 1: lo cruza al medio.
+    a = _placa("A1", 1, (0.0, 0.0, 0.0), (1, 0, 0), (0, 1, 0), 4.0, 3.0)
+    b = _placa("A2", 2, (2.0, 0.0, -1.0), (0, 0, 1), (0, 1, 0), 2.0, 3.0)
+    fallos = verificar_ensamble([a, b], [], scale)
+    assert fallos, f"1:{scale:.0f} dos placas que se atraviesan y no se detectó nada"
+    # La profundidad es una COTA INFERIOR (sale del muestreo): tiene que ser positiva y no
+    # puede pasar de media placa, que es lo máximo que una placa puede meterse en otra
+    # antes de salir del otro lado.
+    p = fallos[0].penetracion_mm
+    assert 0.0 < p <= 1.5 + TOL_MM, (
+        f"1:{scale:.0f} penetración informada fuera de rango: {p:.3f}mm (media placa = 1.5)"
+    )
+
+
+@pytest.mark.parametrize("scale", ESCALAS)
+def test_verificacion_no_marca_un_tope_correcto(scale):
+    """Un tope bien resuelto es TANGENTE: el borde de A apoya sobre la cara de B.
+
+    Si el verificador marcara esto, condenaría todos los encastres correctos.
+    """
+    media = PLATE_THICKNESS_M * scale / 2.0
+    # B en el plano x=2. A termina justo a media placa de ese plano: apoya, no penetra.
+    a = _placa("A1", 1, (0.0, 0.0, 0.0), (1, 0, 0), (0, 1, 0), 2.0 - media, 3.0)
+    b = _placa("A2", 2, (2.0, 0.0, -1.0), (0, 0, 1), (0, 1, 0), 2.0, 3.0)
+    fallos = verificar_ensamble([a, b], [], scale)
+    assert fallos == [], (
+        f"1:{scale:.0f} un tope tangente se marcó como choque: "
+        f"{[(f.pieza_a, f.pieza_b, round(f.penetracion_mm,3)) for f in fallos]}"
+    )
+
+
+@pytest.mark.parametrize("scale", ESCALAS)
+def test_verificacion_no_condena_un_encastre_por_ranura(scale):
+    """Dos placas encastradas SE ATRAVIESAN: la ranura es el hueco que lo permite.
+
+    Una primera versión de este chequeo las marcaba como choque. Es el falso positivo que
+    haría inservible toda la Fase D.
+    """
+    # Cruce en X: un muro atraviesa a otro por el medio de ambos → se resuelve con ranura.
+    b = _ObjBuilder()
+    t = 0.20
+    b.box(-4.0, 4.0, 0.0, 3.0, 0.0, t)
+    b.box(-0.1, 0.1, 0.0, 3.0, -3.0, 3.0)
+    work, paneles, grupos, pjs = _procesar(b.text(), scale)
+    assert pjs, "el cruce en X no generó ninguna ranura: el caso no prueba lo que dice"
+
+    con_ranura = {pair_key(pj.cutter_id, pj.cut_id) for pj in pjs}
+    gid = {p.id: p.source_group_id for p in paneles}
+    for f in verificar_ensamble(paneles, pjs, scale):
+        k = pair_key(gid[f.pieza_a], gid[f.pieza_b])
+        assert k not in con_ranura, (
+            f"1:{scale:.0f} {f.pieza_a}/{f.pieza_b} tienen ranura entre sí y el "
+            "verificador las marcó como choque"
+        )
+
+
+@pytest.mark.parametrize("scale", ESCALAS)
+def test_contacto_horizontal_se_resuelve_recortando_la_altura(scale):
+    """Dos muros que se encuentran A LO LARGO ceden en ALTURA, no en ancho.
+
+    Un faldón de techo apoyado sobre el borde de un muro: el contacto es horizontal y
+    recorre las dos piezas de punta a punta. Preguntar si la junta cae en un extremo
+    LATERAL no tiene sentido ahí, y acortar el ancho no resuelve nada. Antes esas juntas
+    se marcaban como "cruce en medio de ambos", se delegaban a una ranura que tampoco
+    correspondía —no se atraviesan, sólo se tocan— y quedaban sin recorte y sin encastre.
+    """
+    b = _ObjBuilder()
+    b.box(0.0, 8.0, 0.0, 2.0, 0.0, 0.20)                    # muro vertical
+    b.losa_inclinada(0.0, 8.0, 0.10, 2.0, 3.10, 5.0, 0.20)  # faldón que apoya en su cima
+    work, paneles, grupos, pjs = _procesar(b.text(), scale)
+
+    horizontales = [
+        j for j in work.wall_wall_joints
+        if work.joints[j.joint_index].horizontal_frac >= 0.5
+    ]
+    assert horizontales, "el modelo no produjo ninguna unión de contacto horizontal"
+    for j in horizontales:
+        assert j.yield_group_id is not None, (
+            f"1:{scale:.0f} la unión horizontal g{j.group_a}-g{j.group_b} quedó sin "
+            "resolver: no se recortó ninguna de las dos y no hay ranura"
+        )
+
+    # Y que esas dos piezas efectivamente dejen de pisarse. La Fase D como oráculo del
+    # arreglo. Se mira SÓLO el par de cada unión horizontal: el modelo genera además
+    # tapas horizontales que se clasifican como piso, y sus encuentros son otro caso
+    # (muro-losa) que este test no cubre.
+    gid = {p.id: p.source_group_id for p in paneles}
+    pares = {pair_key(j.group_a, j.group_b) for j in horizontales}
+    choques = [
+        f for f in verificar_ensamble(paneles, pjs, scale)
+        if pair_key(gid[f.pieza_a], gid[f.pieza_b]) in pares
+    ]
+    assert choques == [], (
+        f"1:{scale:.0f} las piezas de la unión horizontal se siguen pisando: "
+        f"{[(f.pieza_a, f.pieza_b, round(f.penetracion_mm, 2)) for f in choques]}"
+    )
 
 
 @pytest.mark.parametrize("scale", ESCALAS)
