@@ -14,6 +14,7 @@ Robustez: una sola ecuación de plano para clasificar y cortar; `s` clampeado a 
 Los booleanos 2D siguen en shapely.
 """
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -39,18 +40,41 @@ def plane_of(face: Face3D) -> Tuple[Vec3, float]:
     return n, dot(n, face.vertices[0])
 
 
+def mid_plane_offset(group: GeometryGroup, faces: List[Face3D], n: Vec3) -> float:
+    """Offset del plano MEDIO del grupo a lo largo de `n`: el punto medio entre sus dos
+    pieles, o sea (min + max) / 2 de las proyecciones.
+
+    FUENTE ÚNICA. Es la misma referencia que usa el recorte del tope
+    (`assembly_adjuster._mid_plane_offset`, que delega acá) y la que usa la ranura
+    (`group_plane`). Tenerlas separadas era un defecto real: `group_plane` promediaba los
+    vértices y `_mid_plane_offset` tomaba el punto medio, así que la ranura se ubicaba en
+    un plano y el recorte se calculaba contra otro. Diferencia medida en un modelo real:
+    hasta 8.4 mm de edificio.
+
+    NO es el promedio de los vértices: ese valor se sesga hacia la piel que tenga más
+    vértices (más teselada, o con aberturas) y da un plano que no es el medio. Con un muro
+    de 20 cm el promedio daba 0.0667 en vez de 0.100. Es la placa la que va en el plano
+    medio, así que el punto medio geométrico es la referencia correcta.
+    """
+    return mid_plane_offset_faces(
+        [faces[fi] for fi in group.face_indices if 0 <= fi < len(faces)], n
+    )
+
+
+def mid_plane_offset_faces(group_faces: List[Face3D], n: Vec3) -> float:
+    """Igual que `mid_plane_offset` pero sobre una lista de caras ya resuelta, para los
+    consumidores que no tienen el GeometryGroup a mano (p. ej. el marco de proyección
+    que usa el instructivo)."""
+    vals = [dot(n, v) for f in group_faces for v in f.vertices]
+    if not vals:
+        return 0.0
+    return (min(vals) + max(vals)) / 2.0
+
+
 def group_plane(group: GeometryGroup, faces: List[Face3D]) -> Tuple[Vec3, float]:
-    """Plano representativo del grupo: normal representativa + d medio sobre sus caras."""
+    """Plano representativo del grupo: normal representativa + plano MEDIO entre pieles."""
     n = normalize(group.representative_normal)
-    s = 0.0
-    cnt = 0
-    for fi in group.face_indices:
-        if 0 <= fi < len(faces):
-            for v in faces[fi].vertices:
-                s += dot(n, v)
-                cnt += 1
-    d = s / cnt if cnt else 0.0
-    return n, d
+    return n, mid_plane_offset(group, faces, n)
 
 
 def signed_dist(v: Vec3, n: Vec3, d: float) -> float:
@@ -128,6 +152,11 @@ PLATE_THICKNESS_M = 0.003
 # Holgura por el kerf del láser: la ranura se corta un pelo más ancha que la placa para
 # que entre a presión. CALIBRAR con la cortadora real antes de producción.
 KERF_CLEARANCE_M = 0.0001
+# Por encima de este |cos| entre normales dos placas son casi coplanares: se solapan, no
+# se cruzan, y no hay nada que encastrar. Es el complemento de MIN_JOINT_ANGLE_DEG, que
+# usa el detector de uniones: mantener los dos umbrales iguales evita que una unión sea
+# "real" para una etapa e inexistente para la otra.
+MAX_COPLANAR_DOT = math.cos(math.radians(20.0))
 
 
 @dataclass
@@ -225,16 +254,37 @@ def _aabb_overlap(a, b, tol: float = 0.05) -> bool:
     )
 
 
+def pair_key(a: int, b: int) -> Tuple[int, int]:
+    """Clave canónica de un par de grupos, independiente del orden."""
+    return (a, b) if a <= b else (b, a)
+
+
 def resolve_plate_joints(
-    groups: List[GeometryGroup], faces: List[Face3D], eps: float = EPS
+    groups: List[GeometryGroup],
+    faces: List[Face3D],
+    eps: float = EPS,
+    yield_by_pair: Optional[Dict[Tuple[int, int], int]] = None,
 ) -> List[PlateJoint]:
     """
     Encuentra placas (paredes) que se cruzan en 3D y devuelve las juntas de encastre.
     Broad-phase por AABB (evita O(n²) real: sólo clasifica pares con AABB que solapa).
-    Jerarquía (quién cede) vía assembly_adjuster.choose_wall_wall_yielder.
+
+    `yield_by_pair` es la decisión YA TOMADA por `compute_adjustments`
+    (`pair_key(a,b) -> id del grupo que cede`), y manda. Es obligatorio pasarla desde el
+    pipeline: sin ella esta función recalculaba la jerarquía por su cuenta, con
+    `topo_info=None`, con los espesores crudos (sin el fallback de 3 mm) y **sin ver
+    `wall_wall_decisions`**, o sea ignorando la elección del usuario. Las dos decisiones
+    se contradecían en 7 de 15 pares de un modelo real: la placa que se acortaba no era la
+    que recibía la ranura, así que se quitaba material de un lado y se abría la ranura del
+    otro. Ese era el fallo físico del par 255/261.
+
+    El fallback local sólo actúa cuando el par no tiene decisión: cruces en medio de AMBOS
+    muros, que `compute_adjustments` deja deliberadamente sin recorte
+    (`suggested_yield_group_id = None`) porque el encastre ahí es la ranura, no el tope.
     """
     from core.services.assembly_adjuster import choose_wall_wall_yielder
 
+    yield_by_pair = yield_by_pair or {}
     walls = [g for g in groups if g.category == "wall"]
     boxes = {g.id: _aabb(g, faces) for g in walls}
     by_id = {g.id: g for g in walls}
@@ -244,9 +294,15 @@ def resolve_plate_joints(
         ga = walls[i]
         for j in range(i + 1, len(walls)):
             gb = walls[j]
-            # sólo placas ~perpendiculares pueden atravesarse (no coplanares ni paralelas)
+            # Dos placas se atraviesan salvo que sean casi coplanares. El umbral es el
+            # MISMO que usa el resto del pipeline para considerar que dos muros forman
+            # una unión real (MIN_JOINT_ANGLE_DEG). Antes era `ndot > 0.5`, o sea 60°, y
+            # eso abría un hueco de 40°: `compute_adjustments` no recorta los cruces en
+            # medio de ambos muros —delega en la ranura— pero la ranura no se generaba
+            # por debajo de 60°, así que toda unión oblicua en X quedaba sin recorte Y sin
+            # encastre. Medido en un modelo real: dos cruces a 53° que se pisaban.
             ndot = abs(dot(normalize(ga.representative_normal), normalize(gb.representative_normal)))
-            if ndot > 0.5:
+            if ndot > MAX_COPLANAR_DOT:
                 continue
             if not _aabb_overlap(boxes[ga.id], boxes[gb.id]):
                 continue
@@ -265,15 +321,24 @@ def resolve_plate_joints(
             if not (a_spans_b or b_spans_a):
                 continue
 
-            # Jerarquía: el yielder es la placa CORTADA (recibe la ranura).
-            t_a = ga.thickness or 0.0
-            t_b = gb.thickness or 0.0
-            yid = choose_wall_wall_yielder(ga, gb, t_a, t_b, None, faces)
+            # Jerarquía: el yielder es la placa CORTADA (recibe la ranura). La decisión
+            # de compute_adjustments manda; sólo se recalcula si ese par no tiene una.
+            yid = yield_by_pair.get(pair_key(ga.id, gb.id))
+            if yid is None:
+                t_a = ga.thickness or 0.0
+                t_b = gb.thickness or 0.0
+                yid = choose_wall_wall_yielder(ga, gb, t_a, t_b, None, faces)
             cut = by_id.get(yid, gb)
             cutter = ga if cut is gb else gb
             # Ancho físico: la placa que atraviesa, más la holgura del kerf para que
-            # entre a presión y no floja.
-            width = PLATE_THICKNESS_M + KERF_CLEARANCE_M
+            # entre a presión y no floja. En una unión OBLICUA la placa se presenta de
+            # costado y su sección aparente es mayor: hay que abrir la ranura
+            # `espesor / sen(θ)`, el mismo factor 1/sen(θ) con el que se estiran los
+            # recortes. Con una ranura de 3.1 mm recta, una placa que cruza a 53° no
+            # entra.
+            from core.services.assembly_adjuster import oblique_trim_factor
+            ang = math.degrees(math.acos(max(-1.0, min(1.0, ndot))))
+            width = (PLATE_THICKNESS_M + KERF_CLEARANCE_M) * oblique_trim_factor(ang)
 
             seg = plate_joint_segment(cut, cutter, faces, eps)
             if seg is None:

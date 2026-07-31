@@ -268,6 +268,28 @@ def detect_joints(faces: List[Face3D], groups: List[GeometryGroup]) -> List[Join
     return joints
 
 
+def build_group_adjacency(joints: List[Joint]) -> Dict[int, List[int]]:
+    """Grafo de vecindad entre grupos: `group_id -> [ids vecinos]`, ordenado.
+
+    Vive en `Phase1Result` y es la ÚNICA respuesta a "quién toca a quién". Hasta ahora la
+    adyacencia se reconstruía en cada consumidor y con criterios distintos: acá por
+    aristas/contacto real, y en `assembly_logic._build_adjacency` por solape de AABB
+    expandido, que es una aproximación mucho más gruesa (dos muros paralelos y separados
+    solapan AABB sin tocarse). Que el instructivo y los encastres opinen distinto sobre la
+    misma maqueta era una fuente de confusión.
+
+    Se construye a partir de las juntas ya detectadas, que son la fuente autoritativa, y
+    las listas salen ordenadas: el resultado no depende del orden de iteración.
+    """
+    adj: Dict[int, set] = {}
+    for j in joints:
+        if j.group_a == j.group_b:
+            continue
+        adj.setdefault(j.group_a, set()).add(j.group_b)
+        adj.setdefault(j.group_b, set()).add(j.group_a)
+    return {gid: sorted(vecinos) for gid, vecinos in sorted(adj.items())}
+
+
 # ---------------------------------------------------------------------------
 # Detección geométrica de contactos muro-muro (complemento del método topológico)
 # ---------------------------------------------------------------------------

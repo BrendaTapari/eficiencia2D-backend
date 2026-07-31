@@ -31,6 +31,7 @@ from core.services.cutting_sheet import build_placements
 from core.services.curvature import build_curvature_map
 from core.services.assembly_check import compute_assembly_warnings
 from core.group_classifier import compute_assembly_steps
+from core.services.assembly_verify import MENSAJES as MENSAJES_INTERFERENCIA
 from core.services.assembly_adjuster import DEFAULT_MDF_THICKNESS_M
 from core.services.types import PipelineOptions, SheetConfig
 
@@ -923,7 +924,10 @@ async def nesting_preview_endpoint(
         )
 
         with timer.step("compute_nesting"):
-            work, wall_nesting, floor_nesting, cfg, panel_id_by_group, plate_joints = compute_nesting(
+            (
+                work, wall_nesting, floor_nesting, cfg, panel_id_by_group,
+                plate_joints, final_places, interferencias,
+            ) = compute_nesting(
                 rebuilt,
                 opts,
                 overrides=request.overrides,
@@ -959,8 +963,25 @@ async def nesting_preview_endpoint(
             },
             # Encastres 3D (world coords) para superponer ranuras en el instructivo.
             "plate_joints": serialize_plate_joints(plate_joints),
+            # Marco 3D de cada pieza YA RECORTADA (group_id -> placement). Misma forma
+            # que topology.placements, pero con las medidas que se van a cortar: el
+            # instructivo debe dibujar ESTO. topology.placements es la proyección cruda
+            # del modelo y muestra las piezas sin recortar, pisándose entre sí.
+            "placements": final_places,
             # Chequeo de ensamble: [] = verificado; si no, gap/overlap/unsupported.
             "assembly_warnings": assembly_warnings,
+            # Fase D: pares de piezas que ocupan el mismo material. `causa` dice de quién
+            # es el problema y por lo tanto qué puede hacer el usuario; ver MENSAJES en
+            # core/services/assembly_verify.py. Vacío = las piezas arman el edificio.
+            "interferencias": [
+                {
+                    "piezas": [i.pieza_a, i.pieza_b],
+                    "penetracion_mm": round(i.penetracion_mm, 2),
+                    "causa": i.causa,
+                    "mensaje": MENSAJES_INTERFERENCIA.get(i.causa, ""),
+                }
+                for i in interferencias
+            ],
         })
 
     except HTTPException:

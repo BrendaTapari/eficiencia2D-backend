@@ -13,17 +13,24 @@ from typing import Dict, List, Optional, Tuple
 
 from core.group_classifier import GeometryGroup
 from core.pipeline import Phase1Result
-from core.services.assembly_adjuster import compute_adjustments
+from core.services.assembly_adjuster import (
+    AdjustmentsResult,
+    compute_adjustments,
+    yield_by_pair,
+)
 from core.services.cutting_sheet import (
     Edge2D,
     Panel,
     apply_user_cuts,
     clip_panel_at_u,
     clip_panel_at_v,
+    compute_group_placement,
     mirror_edges_horizontal,
     nested_sheets_to_dxf,
     orient_group_normals_outward,
+    panel_cut_area_m2,
     project_faces_to_2d,
+    shift_placement,
 )
 from core.services.plate_intersect import resolve_plate_joints
 from core.services.flex_bending import (
@@ -35,7 +42,7 @@ from core.services.flex_bending import (
 from core.services.reinforcements import build_reinforcements
 from core.services.facade_extractor import extract_facades
 from core.services.floor_plan_extractor import extract_floor_plans
-from core.services.joint_detector import detect_joints
+from core.services.joint_detector import build_group_adjacency, detect_joints
 from core.services.pdf_writer import generate_nesting_pdf, generate_pdf
 from core.services.sheet_nester import (
     NestingPanel,
@@ -261,6 +268,9 @@ def apply_merges(
         wall_wall_joints=adj.wall_wall_joints,
         suggested_merges=[],
         warnings=warnings,
+        # Los merges cambian qué grupos existen: la vecindad se reconstruye sobre las
+        # juntas nuevas, no se arrastra la del modelo sin fusionar.
+        group_adjacency=build_group_adjacency(joints),
     )
 
 
@@ -385,6 +395,7 @@ def decompose_panels_from_groups(
     mark_lines: Optional[List[dict]] = None,
     ribs: Optional[List[dict]] = None,
     columns: Optional[List[dict]] = None,
+    adj_result: Optional[AdjustmentsResult] = None,
 ) -> Tuple[List[Panel], List[Panel]]:
     overrides = overrides or {}
     marks_set = set(marks or [])  # ids de grupos cuyas aberturas se graban (no se cortan)
@@ -429,17 +440,21 @@ def decompose_panels_from_groups(
     joints_by_cut: Dict[int, list] = {}
     for pj in plate_joints or []:
         joints_by_cut.setdefault(pj.cut_id, []).append(
-            (pj.a, pj.b, pj.width, getattr(pj, "kind", "slot"))
+            (pj.a, pj.b, pj.width, getattr(pj, "kind", "slot"), pj.cutter_id)
         )
 
     # No hace falta sembrar las sugerencias: compute_adjustments ya resuelve por su
     # cuenta toda junta sin decisión del usuario (una sola fuente de verdad).
-    adj_result = compute_adjustments(
-        phase1.joints,
-        phase1.groups,
-        wall_wall_decisions,
-        phase1.faces,
-    )
+    # `adj_result` viene precalculado desde `_decompose`, que necesita las decisiones
+    # ANTES para pasárselas a resolve_plate_joints. Se reutiliza tal cual: recalcularlo
+    # acá abriría de nuevo la puerta a que el recorte y la ranura decidan distinto.
+    if adj_result is None:
+        adj_result = compute_adjustments(
+            phase1.joints,
+            phase1.groups,
+            wall_wall_decisions,
+            phase1.faces,
+        )
 
     # El ajuste tiene dos componentes en unidades distintas y hay que sumarlas:
     #   `delta`       ya está en metros de EDIFICIO (el voladizo del modelo).
@@ -452,8 +467,12 @@ def decompose_panels_from_groups(
     height_adj: Dict[int, float] = {}       # recorta la BASE del muro
     height_top_adj: Dict[int, float] = {}   # recorta la CIMA del muro (techo encima)
     width_adjs: Dict[int, list] = {}
+    plane_adjs: Dict[int, list] = {}        # recorta la pieza en su plano (losa entre muros)
+    group_by_id: Dict[int, GeometryGroup] = {g.id: g for g in phase1.groups}
     for adj in adj_result.adjustments:
-        if adj.axis == "height":
+        if adj.axis == "plane":
+            plane_adjs.setdefault(adj.group_id, []).append(adj)
+        elif adj.axis == "height":
             height_adj[adj.group_id] = height_adj.get(adj.group_id, 0.0) + _delta_m(adj)
         elif adj.axis == "height_top":
             # Antes caía en width_adjs y recortaba el ANCHO del panel en vez de su cima.
@@ -626,11 +645,69 @@ def decompose_panels_from_groups(
             strip = min(recorte, width_m - 0.01)
             if strip <= 0.001:
                 continue
+            # El material se saca del extremo DONDE ESTÁ LA JUNTA. Las dos ramas estaban
+            # invertidas: con la junta en el extremo bajo se recortaba el alto y al revés.
+            # La pieza salía con el largo correcto pero desplazada el recorte entero, así
+            # que en la junta se metía dentro del vecino y en el extremo libre no llegaba
+            # — los dos síntomas reportados a la vez. `clip_panel_at_u(cut, keep_above)`:
+            # keep_above=True conserva u >= cut (quita el extremo BAJO); keep_above=False
+            # conserva u <= cut (quita el ALTO). Las ramas de altura ya lo hacían bien.
             clipped = (
-                clip_panel_at_u(edges, width_m - strip, False)
+                clip_panel_at_u(edges, strip, True)
                 if joint_on_left
-                else clip_panel_at_u(edges, strip, True)
+                else clip_panel_at_u(edges, width_m - strip, False)
             )
+            if clipped:
+                width_m, height_m, edges = (
+                    clipped["width_m"],
+                    clipped["height_m"],
+                    clipped["edges"],
+                )
+                clip_off_u += clipped.get("offset_u", 0.0)
+                clip_off_v += clipped.get("offset_v", 0.0)
+
+        # Recorte EN EL PLANO de la pieza contra un grupo continuo (axis="plane"): el caso
+        # del entrepiso que tiene que ENTRAR entre dos muros que siguen de largo por
+        # arriba y por abajo. El eje (u o v) y el lado salen de la normal de ese muro, no
+        # de `v_up`, que en una losa no significa nada. Los pisos no recibían ningún
+        # recorte, así que el entrepiso salía con el ancho que tiene entre las pieles del
+        # modelo y al armar la maqueta no entraba.
+        por_lado: Dict[Tuple[str, bool], float] = {}
+        for p_adj in plane_adjs.get(group.id, []):
+            recorte = -_delta_m(p_adj)
+            if recorte <= 0.001:
+                continue
+            otro = group_by_id.get(p_adj.against_group_id)
+            if otro is None:
+                continue
+            n_otro = normalize(otro.representative_normal)
+            du = dot(n_otro, result.u_axis)
+            dv = dot(n_otro, result.v_axis)
+            eje = "u" if abs(du) >= abs(dv) else "v"
+            # La normal del muro apunta hacia afuera: si va en el sentido creciente del
+            # eje, el borde que toca ese muro es el ALTO.
+            alto = (du if eje == "u" else dv) > 0
+            clave = (eje, alto)
+            if recorte > por_lado.get(clave, 0.0):
+                por_lado[clave] = recorte
+
+        for (eje, alto), recorte in sorted(por_lado.items()):
+            limite = (width_m if eje == "u" else height_m) - 0.01
+            strip = min(recorte, limite)
+            if strip <= 0.001:
+                continue
+            if eje == "u":
+                clipped = (
+                    clip_panel_at_u(edges, width_m - strip, False)
+                    if alto
+                    else clip_panel_at_u(edges, strip, True)
+                )
+            else:
+                clipped = (
+                    clip_panel_at_v(edges, height_m - strip, False)
+                    if alto
+                    else clip_panel_at_v(edges, strip, True)
+                )
             if clipped:
                 width_m, height_m, edges = (
                     clipped["width_m"],
@@ -650,7 +727,8 @@ def decompose_panels_from_groups(
         # ranuras que caen fuera de la pieza ya recortada: si no, se dibujaban en el
         # marco viejo y quedaban fuera del bounding box del panel, invadiendo al vecino
         # en la plancha (el nesting sólo conoce width_m × height_m).
-        for (pa, pb, slot_w, kind) in joints_by_cut.get(group.id, []):
+        slots_cortadas: List[int] = []
+        for (pa, pb, slot_w, kind, cutter_id) in joints_by_cut.get(group.id, []):
             ua = dot(pa, result.u_axis) - result.origin_u - clip_off_u
             va = dot(pa, result.v_axis) - result.origin_v - clip_off_v
             ub = dot(pb, result.u_axis) - result.origin_u - clip_off_u
@@ -674,6 +752,11 @@ def decompose_panels_from_groups(
                 continue
             seg = (seg[0] + m, seg[1] + m, seg[2] + m, seg[3] + m)
             edges.extend(_slot_edges(*seg, slot_w_m, mark=(kind == "surface")))
+            # La ranura SOBREVIVIÓ al recorte: recién ahora es material que se quita de
+            # verdad. Las que caen fuera del panel ya trimado no se registran, porque el
+            # tope ya resolvió esa junta y la ranura sobraba.
+            if kind != "surface":
+                slots_cortadas.append(cutter_id)
 
         # Patrón de flexión (flex): se corta DENTRO del panel YA proyectado, trimado y
         # espejado — es decir, sobre EXACTAMENTE la misma silueta/orientación que sin
@@ -702,6 +785,18 @@ def decompose_panels_from_groups(
         # las piezas por width×height, así que cualquier trazo fuera invadiría al vecino.
         edges, width_m, height_m = _fit_panel_bbox(edges, width_m, height_m)
 
+        # Marco 3D de la pieza YA RECORTADA, para que el instructivo dibuje lo que se
+        # corta y no la proyección cruda del modelo. Sale del MISMO cálculo que la
+        # plancha: no hay una segunda ruta que pueda discrepar.
+        marco = compute_group_placement(
+            faces, oriented_normals.get(group.id, group.representative_normal), "Y"
+        )
+        if marco is not None:
+            marco = shift_placement(
+                marco, clip_off_u, clip_off_v, width_m, height_m,
+                panel_cut_area_m2(edges, width_m, height_m),
+            )
+
         if is_floor:
             floor_count += 1
             floor_panels.append(
@@ -715,6 +810,8 @@ def decompose_panels_from_groups(
                     edges=edges,
                     source_group_id=group.id,
                     is_mark=group.id in marks_set,
+                    frame=marco,
+                    slots_against=slots_cortadas,
                 )
             )
         else:
@@ -730,6 +827,8 @@ def decompose_panels_from_groups(
                     edges=edges,
                     source_group_id=group.id,
                     is_mark=group.id in marks_set,
+                    frame=marco,
+                    slots_against=slots_cortadas,
                 )
             )
 
@@ -815,12 +914,24 @@ def _decompose(
 ) -> Tuple[Phase1Result, List[Panel], List[Panel], List]:
     """Aplica merges, resuelve encastres 3D y descompone a paneles 2D."""
     work = apply_merges(phase1, merges or [], overrides)
+
+    # ORDEN IMPORTANTE: primero se decide quién cede en cada junta, y recién después se
+    # resuelven las ranuras CONSUMIENDO esa decisión. Antes era al revés y cada una la
+    # calculaba por su cuenta: la placa que se acortaba no era la que recibía la ranura en
+    # 7 de 15 pares de un modelo real. Una sola decisión por junta, una sola vez.
+    adj_result = compute_adjustments(
+        work.joints, work.groups, wall_wall_decisions, work.faces
+    )
+
     # Misión 1: resolver intersecciones placa-placa en 3D (encastres) sobre la
     # topología final (post-merges), antes de proyectar.
-    plate_joints = resolve_plate_joints(work.groups, work.faces)
+    plate_joints = resolve_plate_joints(
+        work.groups, work.faces, yield_by_pair=yield_by_pair(adj_result)
+    )
     wall_panels, floor_panels = decompose_panels_from_groups(
         work, opts, overrides, wall_wall_decisions, marks, plate_joints,
         user_cuts, flex, mark_lines, ribs, columns,
+        adj_result=adj_result,
     )
     return work, wall_panels, floor_panels, plate_joints
 
@@ -908,7 +1019,7 @@ def compute_nesting(
     mark_lines: Optional[List[dict]] = None,
     ribs: Optional[List[dict]] = None,
     columns: Optional[List[dict]] = None,
-) -> Tuple[Phase1Result, NestingResult, NestingResult, SheetConfig, Dict[int, str], List]:
+) -> Tuple[Phase1Result, NestingResult, NestingResult, SheetConfig, Dict[int, str], List, Dict[str, Dict], List]:
     """Descompone y anida paneles. Compartido por /generate y /nesting-preview."""
     work, wall_panels, floor_panels, plate_joints = _decompose(
         phase1, opts, overrides, wall_wall_decisions, merges, marks,
@@ -957,7 +1068,57 @@ def compute_nesting(
         sheet_cfg,
         panel_ids_by_group(wall_panels, floor_panels),
         plate_joints,
+        final_placements(wall_panels, floor_panels),
+        # Fase D: ¿las piezas que se van a cortar arman el edificio? Se calcula acá, sobre
+        # los paneles FINALES y con la escala ya elegida, porque la respuesta depende de
+        # ambas cosas: a escalas gruesas la placa ocupa más edificio y aparecen choques
+        # que a escalas finas no existen.
+        _verificar(work, wall_panels, floor_panels, plate_joints, opts.scale_denom or 1.0),
     )
+
+
+def _verificar(work, wall_panels, floor_panels, plate_joints, scale_denom):
+    """Corre la verificación de ensamble, sin dejar que un fallo suyo tumbe la generación.
+
+    Es un chequeo, no una etapa del cálculo: si se rompe, se pierde el aviso pero las
+    piezas siguen saliendo. Lo contrario -que un verificador con un bug impida cortar-
+    sería peor que no tenerlo.
+    """
+    try:
+        from core.services.assembly_verify import verificar_ensamble
+        from core.services.plate_intersect import pair_key
+
+        detectadas = {pair_key(j.group_a, j.group_b) for j in work.joints}
+        sin_resolver = {
+            pair_key(j.group_a, j.group_b)
+            for j in work.wall_wall_joints
+            if j.yield_group_id is None
+        }
+        return verificar_ensamble(
+            list(wall_panels) + list(floor_panels), plate_joints, scale_denom,
+            detectadas, sin_resolver,
+        )
+    except Exception:
+        import logging
+        logging.getLogger("eficiencia2d.pipeline").exception("verificar_ensamble falló")
+        return []
+
+
+def final_placements(
+    wall_panels: List[Panel], floor_panels: List[Panel]
+) -> Dict[str, Dict]:
+    """`group_id (str) -> marco de la pieza YA RECORTADA`, para el instructivo.
+
+    Misma forma que `topology.placements` (origin / u_axis / v_axis / normal / width_m /
+    height_m / mirrored) más `area_m2` y `panel_id`. La diferencia es que estas medidas
+    son las que se van a cortar: `topology.placements` es la proyección cruda del modelo
+    y en un modelo real 20 de 28 piezas salían más grandes ahí que en la plancha.
+    """
+    out: Dict[str, Dict] = {}
+    for p in list(wall_panels) + list(floor_panels):
+        if p.frame and p.source_group_id is not None and p.source_group_id >= 0:
+            out[str(p.source_group_id)] = dict(p.frame, panel_id=p.id)
+    return out
 
 
 def generate_from_review(
@@ -973,7 +1134,7 @@ def generate_from_review(
     ribs: Optional[List[dict]] = None,
     columns: Optional[List[dict]] = None,
 ) -> List[OutputFile]:
-    work, wall_nesting, floor_nesting, sheet_cfg, _, _ = compute_nesting(
+    work, wall_nesting, floor_nesting, sheet_cfg, _, _, _, _ = compute_nesting(
         phase1, opts, overrides, wall_wall_decisions, merges, marks,
         user_cuts, flex, mark_lines, ribs, columns,
     )

@@ -140,13 +140,39 @@ def _orientation_bucket(normal: Vec3, up: UpAxis) -> int:
 
 
 def _build_adjacency(
-    pieces: Sequence[AssemblyPiece], epsilon: float
+    pieces: Sequence[AssemblyPiece],
+    epsilon: float,
+    adjacency_by_group: Optional[Dict[int, List[int]]] = None,
 ) -> Dict[str, List[str]]:
-    by_id = {p.id: p for p in pieces}
+    """Vecindad entre piezas para el BFS de niveles de armado.
+
+    Si se pasa `adjacency_by_group` (el `Phase1Result.group_adjacency` derivado de las
+    juntas reales), se usa ese: es la misma vecindad que resuelve los encastres, así que
+    el instructivo y la plancha dejan de opinar distinto sobre la misma maqueta. El
+    fallback por AABB expandido sólo actúa cuando no hay grafo o la pieza no tiene
+    `group_id`; es más grueso, porque dos muros paralelos y separados solapan AABB sin
+    llegar a tocarse.
+    """
     adj: Dict[str, List[str]] = {p.id: [] for p in pieces}
     ids = [p.id for p in pieces]
-    expanded = {p.id: p.bbox.expanded(epsilon) for p in pieces}
 
+    if adjacency_by_group:
+        # group_id -> ids de pieza (una pieza por grupo en el caso normal, pero un grupo
+        # partido por una losa aporta varias).
+        pieces_by_group: Dict[int, List[str]] = {}
+        for p in pieces:
+            if p.group_id is not None:
+                pieces_by_group.setdefault(p.group_id, []).append(p.id)
+        if pieces_by_group:
+            for gid, vecinos in adjacency_by_group.items():
+                for pid in pieces_by_group.get(gid, ()):
+                    for vgid in vecinos:
+                        for vpid in pieces_by_group.get(vgid, ()):
+                            if vpid != pid and vpid not in adj[pid]:
+                                adj[pid].append(vpid)
+            return {pid: sorted(vecinos) for pid, vecinos in adj.items()}
+
+    expanded = {p.id: p.bbox.expanded(epsilon) for p in pieces}
     for i, id_a in enumerate(ids):
         box_a = expanded[id_a]
         for id_b in ids[i + 1 :]:
@@ -301,20 +327,22 @@ def generate_assembly_sequence(
     *,
     epsilon: float = DEFAULT_EPSILON,
     up_axis: UpAxis = "Y",
+    adjacency_by_group: Optional[Dict[int, List[int]]] = None,
 ) -> List[Dict]:
     """
     Calcula la secuencia de ensamble paso a paso.
 
     Heurística:
       1. Base = piezas horizontales más bajas.
-      2. Grafo de adyacencia por AABB + tolerancia.
+      2. Grafo de adyacencia: `Phase1Result.group_adjacency` si se pasa (las juntas
+         reales); si no, AABB + tolerancia.
       3. BFS: nivel 0 base → 1 muros sobre base → 2 muros sobre muros → 3 techos.
     """
     if not pieces:
         return []
 
     by_id = {p.id: p for p in pieces}
-    adj = _build_adjacency(pieces, epsilon)
+    adj = _build_adjacency(pieces, epsilon, adjacency_by_group)
     base_ids = _identify_base_ids(pieces, up_axis)
     levels = _assign_bfs_levels(pieces, base_ids, adj, up_axis)
 

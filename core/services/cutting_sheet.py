@@ -145,6 +145,18 @@ class Panel:
     edges: List[Edge2D]
     source_group_id: int
     is_mark: bool = False  # True si las aberturas de este panel se graban (no se cortan)
+    # Marco de proyección 3D de la pieza YA RECORTADA (mismas claves que
+    # `compute_group_placement`). El instructivo dibujaba `build_placements`, que es la
+    # proyección CRUDA del modelo: 20 de 28 piezas de un modelo real se mostraban más
+    # grandes de lo que se cortan (dos muros, 55 cm de más), así que en el instructivo se
+    # pisaban unas con otras aunque en la plancha encastraran bien.
+    frame: Optional[Dict] = None
+    # Ids de los grupos vecinos cuya ranura quedó REALMENTE cortada en esta pieza. No es
+    # lo mismo que `plate_joints`: ahí hay ranuras que después se descartan porque su
+    # segmento cae fuera del panel ya recortado (el tope resolvió la junta y la ranura
+    # sobra). Quien verifique el ensamble tiene que mirar esto y no la lista de juntas, o
+    # va a excusar un choque por una ranura que no existe.
+    slots_against: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -625,15 +637,12 @@ def compute_group_placement(
     n = normalize(group_normal)
     u, v = res.u_axis, res.v_axis
 
-    # d = desplazamiento del plano (n·X = d), promediado sobre los vértices (plano medio
-    # del grupo, robusto ante las dos pieles de un muro).
-    s = 0.0
-    cnt = 0
-    for f in faces:
-        for vv in f.vertices:
-            s += n.x * vv.x + n.y * vv.y + n.z * vv.z
-            cnt += 1
-    d = s / cnt if cnt else 0.0
+    # d = desplazamiento del plano (n·X = d). Es el PUNTO MEDIO entre las dos pieles, la
+    # misma definición que usan el recorte y la ranura (plate_intersect.mid_plane_offset).
+    # Antes promediaba los vértices, que se sesga hacia la piel más teselada: el
+    # instructivo dibujaba la placa desplazada respecto del plano donde realmente va.
+    from core.services.plate_intersect import mid_plane_offset_faces
+    d = mid_plane_offset_faces(faces, n)
 
     ou, ov = res.origin_u, res.origin_v
     origin = Vec3(
@@ -654,6 +663,63 @@ def compute_group_placement(
         "height_m": res.height_m,
         "mirrored": True,
     }
+
+
+def shift_placement(placement: Dict, off_u: float, off_v: float,
+                    width_m: float, height_m: float, area_m2: float) -> Dict:
+    """Mismo marco, corrido a la pieza YA RECORTADA.
+
+    Los recortes de ensamble re-normalizan el panel a un origen nuevo (`offset_u/v`
+    acumulados). El marco crudo sigue apuntando al origen viejo, así que hay que
+    trasladarlo por esos offsets y reemplazar las medidas por las finales. Sin esto el
+    instructivo dibuja la pieza sin recortar y en su posición original.
+    """
+    o = placement["origin"]
+    u = placement["u_axis"]
+    v = placement["v_axis"]
+    out = dict(placement)
+    # 1) Al marco crudo se le aplican los offsets de los recortes, que están en el marco
+    #    de la PROYECCIÓN (antes del espejado).
+    ox = o["x"] + off_u * u["x"] + off_v * v["x"]
+    oy = o["y"] + off_u * u["y"] + off_v * v["y"]
+    oz = o["z"] + off_u * u["z"] + off_v * v["z"]
+    # 2) El contorno del panel se ESPEJA antes de cortarse (mirror_edges_horizontal), para
+    #    que el quemado del láser quede del lado interior de la maqueta. O sea que las
+    #    coordenadas `u` de las aristas son `ancho - u_proyección`, y mapearlas al mundo
+    #    con `origin + u·u_axis` deja cada pieza asimétrica dada vuelta sobre su propio
+    #    eje: medido en un modelo real, hasta 2.49 m de desvío contra los 0.37 m de la
+    #    fórmula correcta. El espejado se hornea acá, en el marco: se corre el origen al
+    #    otro extremo y se invierte `u_axis`. Así `world = origin + u·u_axis + v·v_axis`
+    #    vale TAL CUAL para las coordenadas del panel, sin que el consumidor compense
+    #    nada — y por eso `mirrored` queda en False.
+    out["origin"] = {
+        "x": ox + width_m * u["x"],
+        "y": oy + width_m * u["y"],
+        "z": oz + width_m * u["z"],
+    }
+    out["u_axis"] = {"x": -u["x"], "y": -u["y"], "z": -u["z"]}
+    out["mirrored"] = False
+    out["width_m"] = width_m
+    out["height_m"] = height_m
+    # Área de la PIEZA que se corta (contorno menos aberturas). El front venía mostrando
+    # `GeometryGroup.total_area`, que es la suma de las caras de la malla: para un sólido
+    # cuenta las dos pieles y para una chapa de una sola cara, una. Dos piezas casi
+    # iguales se veían con áreas muy distintas (55.91 m² contra 46.65 m²).
+    out["area_m2"] = area_m2
+    return out
+
+
+def panel_cut_area_m2(edges: List[Edge2D], width_m: float, height_m: float) -> float:
+    """Área de MATERIAL de la pieza (contorno menos aberturas), en m² de edificio.
+
+    Reusa `_edges_to_polygon`, que ya reconstruye exterior + huecos con shapely: sumar
+    las aristas a mano daría mal en cuanto el contorno no viniera ordenado, cosa que
+    después de los recortes y el espejado no está garantizada. Si el polígono no se
+    puede reconstruir se cae al bounding box, que es una cota superior honesta."""
+    poly = _edges_to_polygon([e for e in edges if not getattr(e, "flex", False)])
+    if poly is None or poly.area <= 1e-9:
+        return width_m * height_m
+    return float(poly.area)
 
 
 def build_placements(groups, faces: List[Face3D], up: UpAxis = "Y") -> Dict[str, Dict]:
