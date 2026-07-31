@@ -84,6 +84,52 @@ def are_thin_twins(
     return None
 
 
+COPLANAR_SHEET_TOL = 1e-3
+
+
+def are_coplanar_sheet(a: TwinCandidate, b: TwinCandidate) -> bool:
+    """Las dos caras de una superficie de ESPESOR CERO, separadas en grupos distintos.
+
+    Un muro modelado como una sola chapa tiene caras mirando para los dos lados. El
+    clasificador las agrupa por dirección de normal, así que quedan en dos grupos: mismo
+    plano, mismas dimensiones, normales opuestas. Se cortan DOS VECES y las dos piezas
+    ocupan el mismo lugar en la maqueta.
+
+    `are_thin_twins` no las une porque descarta `distance < 1e-4`: ese guard evita
+    emparejar un grupo consigo mismo, pero también bloquea justo este caso. Acá se exige
+    lo contrario —que estén en el MISMO plano— y se conserva el resto de las guardas
+    (normales opuestas y solape lateral), para no fusionar dos muros distintos que
+    casualmente comparten plano pero están en zonas separadas de la planta.
+    """
+    ndot = a.normal.x * b.normal.x + a.normal.y * b.normal.y + a.normal.z * b.normal.z
+    if ndot > OPPOSITE_NORMAL_DOT:
+        return False
+
+    distance = abs(
+        a.normal.x * b.centroid.x
+        + a.normal.y * b.centroid.y
+        + a.normal.z * b.centroid.z
+        - a.d
+    )
+    if distance > COPLANAR_SHEET_TOL:
+        return False
+
+    dx = b.centroid.x - a.centroid.x
+    dy = b.centroid.y - a.centroid.y
+    dz = b.centroid.z - a.centroid.z
+    nc = dx * a.normal.x + dy * a.normal.y + dz * a.normal.z
+    lx = dx - nc * a.normal.x
+    ly = dy - nc * a.normal.y
+    lz = dz - nc * a.normal.z
+    lateral_dist = math.sqrt(lx * lx + ly * ly + lz * lz)
+
+    min_extent = min(a.extent, b.extent)
+    max_extent = max(a.extent, b.extent)
+    if max_extent > 1e-6 and min_extent / max_extent < MIN_EXTENT_RATIO:
+        return False
+    return lateral_dist <= min_extent * LATERAL_OVERLAP_FACTOR
+
+
 @dataclass
 class VerticalCluster:
     normal: Vec3
