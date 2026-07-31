@@ -151,6 +151,12 @@ class Panel:
     # grandes de lo que se cortan (dos muros, 55 cm de más), así que en el instructivo se
     # pisaban unas con otras aunque en la plancha encastraran bien.
     frame: Optional[Dict] = None
+    # Ids de los grupos vecinos cuya ranura quedó REALMENTE cortada en esta pieza. No es
+    # lo mismo que `plate_joints`: ahí hay ranuras que después se descartan porque su
+    # segmento cae fuera del panel ya recortado (el tope resolvió la junta y la ranura
+    # sobra). Quien verifique el ensamble tiene que mirar esto y no la lista de juntas, o
+    # va a excusar un choque por una ranura que no existe.
+    slots_against: List[int] = field(default_factory=list)
 
 
 @dataclass
