@@ -851,6 +851,38 @@ def _altura_bruta(grupo, faces):
 
 
 @pytest.mark.parametrize("scale", ESCALAS)
+def test_muro_de_una_sola_chapa_da_UNA_pieza(scale):
+    """Un muro de espesor CERO no puede salir dos veces, una por cada cara.
+
+    El clasificador agrupa por dirección de normal, así que una chapa con caras mirando
+    para los dos lados quedaba en DOS grupos: mismo plano, mismas medidas, normales
+    opuestas. Se cortaban dos piezas idénticas que en la maqueta ocupan el mismo lugar.
+    `are_thin_twins` no las unía porque descarta `distance < 1e-4` —el guard que evita
+    emparejar un grupo consigo mismo—, y ese mismo guard tapaba este caso. Medido en un
+    modelo real del usuario: 21 piezas donde debían ser 17.
+    """
+    b = _ObjBuilder()
+    b.quad((0.0, 0.0, 0.0), (8.0, 0.0, 0.0), (8.0, 0.0, 6.0), (0.0, 0.0, 6.0))   # piso
+    b.quad((0.0, 0.0, 6.0), (8.0, 0.0, 6.0), (8.0, 6.0, 6.0), (0.0, 6.0, 6.0))   # muro +Z
+    b.quad((0.0, 0.0, 6.0), (0.0, 6.0, 6.0), (8.0, 6.0, 6.0), (8.0, 0.0, 6.0))   # muro -Z
+    work, paneles, grupos, pjs = _procesar(b.text(), scale)
+
+    del_muro = [
+        p for p in paneles
+        if grupos[p.source_group_id].category == "wall"
+        and p.width_m > 4.0 and p.height_m > 3.0
+    ]
+    assert len(del_muro) == 1, (
+        f"1:{scale:.0f} la chapa salió como {len(del_muro)} piezas "
+        f"({[(p.id, round(p.width_m,2), round(p.height_m,2)) for p in del_muro]}): "
+        "es un muro solo, con caras para los dos lados"
+    )
+    assert verificar_ensamble(paneles, pjs, scale) == [], (
+        f"1:{scale:.0f} quedaron piezas ocupando el mismo material"
+    )
+
+
+@pytest.mark.parametrize("scale", ESCALAS)
 def test_losa_de_base_no_se_recorta(scale):
     """Sobre la losa de planta baja APOYAN los muros: no hay que achicarla.
 
