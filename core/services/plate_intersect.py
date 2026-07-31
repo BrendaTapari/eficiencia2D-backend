@@ -14,6 +14,7 @@ Robustez: una sola ecuación de plano para clasificar y cortar; `s` clampeado a 
 Los booleanos 2D siguen en shapely.
 """
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -151,6 +152,11 @@ PLATE_THICKNESS_M = 0.003
 # Holgura por el kerf del láser: la ranura se corta un pelo más ancha que la placa para
 # que entre a presión. CALIBRAR con la cortadora real antes de producción.
 KERF_CLEARANCE_M = 0.0001
+# Por encima de este |cos| entre normales dos placas son casi coplanares: se solapan, no
+# se cruzan, y no hay nada que encastrar. Es el complemento de MIN_JOINT_ANGLE_DEG, que
+# usa el detector de uniones: mantener los dos umbrales iguales evita que una unión sea
+# "real" para una etapa e inexistente para la otra.
+MAX_COPLANAR_DOT = math.cos(math.radians(20.0))
 
 
 @dataclass
@@ -288,9 +294,15 @@ def resolve_plate_joints(
         ga = walls[i]
         for j in range(i + 1, len(walls)):
             gb = walls[j]
-            # sólo placas ~perpendiculares pueden atravesarse (no coplanares ni paralelas)
+            # Dos placas se atraviesan salvo que sean casi coplanares. El umbral es el
+            # MISMO que usa el resto del pipeline para considerar que dos muros forman
+            # una unión real (MIN_JOINT_ANGLE_DEG). Antes era `ndot > 0.5`, o sea 60°, y
+            # eso abría un hueco de 40°: `compute_adjustments` no recorta los cruces en
+            # medio de ambos muros —delega en la ranura— pero la ranura no se generaba
+            # por debajo de 60°, así que toda unión oblicua en X quedaba sin recorte Y sin
+            # encastre. Medido en un modelo real: dos cruces a 53° que se pisaban.
             ndot = abs(dot(normalize(ga.representative_normal), normalize(gb.representative_normal)))
-            if ndot > 0.5:
+            if ndot > MAX_COPLANAR_DOT:
                 continue
             if not _aabb_overlap(boxes[ga.id], boxes[gb.id]):
                 continue
@@ -319,8 +331,14 @@ def resolve_plate_joints(
             cut = by_id.get(yid, gb)
             cutter = ga if cut is gb else gb
             # Ancho físico: la placa que atraviesa, más la holgura del kerf para que
-            # entre a presión y no floja.
-            width = PLATE_THICKNESS_M + KERF_CLEARANCE_M
+            # entre a presión y no floja. En una unión OBLICUA la placa se presenta de
+            # costado y su sección aparente es mayor: hay que abrir la ranura
+            # `espesor / sen(θ)`, el mismo factor 1/sen(θ) con el que se estiran los
+            # recortes. Con una ranura de 3.1 mm recta, una placa que cruza a 53° no
+            # entra.
+            from core.services.assembly_adjuster import oblique_trim_factor
+            ang = math.degrees(math.acos(max(-1.0, min(1.0, ndot))))
+            width = (PLATE_THICKNESS_M + KERF_CLEARANCE_M) * oblique_trim_factor(ang)
 
             seg = plate_joint_segment(cut, cutter, faces, eps)
             if seg is None:
