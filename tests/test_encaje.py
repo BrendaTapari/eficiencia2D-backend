@@ -33,12 +33,14 @@ import pytest
 
 from core.pipeline import parse_pipeline
 from core.review_generate import _decompose
+from core.services.assembly_adjuster import compute_adjustments, yield_by_pair
 from core.services.cutting_sheet import (
     orient_group_normals_outward,
     project_faces_to_2d,
 )
 from core.services.obj_parser import parse_obj
-from core.services.types import PipelineOptions, dot
+from core.services.plate_intersect import group_plane, mid_plane_offset, pair_key
+from core.services.types import PipelineOptions, dot, normalize
 
 # Espesor físico de la placa de MDF, en metros de plancha.
 PLATE_THICKNESS_M = 0.003
@@ -71,7 +73,10 @@ class _ObjBuilder:
         return self._vmap[key]
 
     def quad(self, a, b, c, d):
-        self._faces.append(tuple(self._vid(p) for p in (a, b, c, d)))
+        self.poligono([a, b, c, d])
+
+    def poligono(self, pts):
+        self._faces.append(tuple(self._vid(p) for p in pts))
 
     def box(self, x0, x1, y0, y1, z0, z1):
         """Caja sólida: seis caras. Representa un muro o losa con espesor real."""
@@ -82,13 +87,44 @@ class _ObjBuilder:
         self.quad((x0, y1, z0), (x1, y1, z0), (x1, y1, z1), (x0, y1, z1))
         self.quad((x0, y0, z0), (x0, y0, z1), (x1, y0, z1), (x1, y0, z0))
 
+    def muro(self, x0, z0, x1, z1, t, y0, y1):
+        """Muro sólido a lo largo del eje (x0,z0)→(x1,z1), espesor `t`, altura y0..y1.
+
+        `box` sólo construye cajas paralelas a los ejes, así que no puede representar una
+        unión OBLICUA. Esto sí: el muro se centra sobre su eje, de modo que su plano medio
+        es exactamente ese segmento.
+        """
+        dx, dz = x1 - x0, z1 - z0
+        largo = math.hypot(dx, dz)
+        ux, uz = dx / largo, dz / largo
+        nx, nz = -uz, ux          # normal en planta
+        h = t / 2.0
+        planta = [
+            (x0 + nx * h, z0 + nz * h),
+            (x1 + nx * h, z1 + nz * h),
+            (x1 - nx * h, z1 - nz * h),
+            (x0 - nx * h, z0 - nz * h),
+        ]
+        self.prisma(planta, y0, y1)
+
+    def prisma(self, planta, y0, y1):
+        """Extruye un polígono en planta [(x,z), ...] entre las alturas y0 e y1."""
+        n = len(planta)
+        bajo = [(x, y0, z) for (x, z) in planta]
+        alto = [(x, y1, z) for (x, z) in planta]
+        for i in range(n):
+            j = (i + 1) % n
+            self.quad(bajo[i], bajo[j], alto[j], alto[i])
+        self.poligono(list(reversed(bajo)))
+        self.poligono(alto)
+
     def text(self) -> str:
         lines = [f"v {x} {y} {z}" for (x, y, z) in self._verts]
         lines += [f"f {' '.join(map(str, f))}" for f in self._faces]
         return "\n".join(lines)
 
 
-def _procesar(obj_text: str, scale_denom: float):
+def _procesar(obj_text: str, scale_denom: float, wall_wall_decisions=None):
     """Corre el pipeline completo y devuelve (work, paneles, grupos por id)."""
     parsed = parse_obj(obj_text)
     # Los modelos de este banco están escritos con Y hacia ARRIBA. Sin forzar el eje,
@@ -101,9 +137,34 @@ def _procesar(obj_text: str, scale_denom: float):
     opts = PipelineOptions(
         scale_denom=scale_denom, paper="A4", min_area_m2=1.0, sheet_config=None
     )
-    work, walls, floors, plate_joints = _decompose(p1, opts, None, None, None, None)
+    work, walls, floors, plate_joints = _decompose(
+        p1, opts, None, wall_wall_decisions, None, None
+    )
     grupos = {g.id: g for g in work.groups}
     return work, walls + floors, grupos, plate_joints
+
+
+def _decisiones(work, forzar=None):
+    """`pair_key(a,b) -> grupo que cede`, tal como lo ve el recorte."""
+    return yield_by_pair(
+        compute_adjustments(work.joints, work.groups, forzar, work.faces)
+    )
+
+
+def _forzar_lo_contrario(work):
+    """`joint_index -> el muro CONTRARIO al que el sistema sugiere`.
+
+    Simula al usuario cambiando la decisión en el selector del visor 3D.
+    """
+    res = compute_adjustments(work.joints, work.groups, None, work.faces)
+    forz = {}
+    for ww in res.wall_wall_joints:
+        if ww.suggested_yield_group_id is None:
+            continue
+        forz[ww.joint_index] = (
+            ww.group_b if ww.suggested_yield_group_id == ww.group_a else ww.group_a
+        )
+    return forz
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +371,259 @@ def test_muro_sobre_losa_se_acorta_el_espesor_de_placa(scale):
             f"1:{scale:.0f} el muro se acortó {recorte_mm:.2f}mm y debía acortarse "
             f"1.50mm (media placa)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Coherencia entre el RECORTE y la RANURA
+#
+# Eran dos decisiones independientes: `compute_adjustments` elegía quién se acorta y
+# `resolve_plate_joints` volvía a elegir, por su cuenta, quién recibe la ranura — con
+# `topo_info=None`, con los espesores crudos y sin ver la decisión del usuario. En un
+# modelo real se contradecían en 7 de 15 pares: se quitaba material de una placa y se
+# abría la ranura en la otra. Ése era el fallo del par 255/261 en la maqueta física.
+# ---------------------------------------------------------------------------
+
+
+def _modelo_cruce_en_extremo(t=0.20, largo=8.0, alto=3.0, fondo=3.0):
+    """Un muro pasa DE LARGO por el extremo de otro: hay tope Y hay ranura.
+
+    Es la geometría del par 255/261. El muro B atraviesa el plano de A (por eso se genera
+    ranura) pero lo hace en el EXTREMO de A (por eso A tiene decisión de recorte). Un
+    simple tope en T no sirve para este caso: sin penetración no hay ranura que comparar.
+    """
+    b = _ObjBuilder()
+    b.box(0.0, largo, 0.0, alto, 0.0, t)          # A corre en X
+    b.box(0.0, t, 0.0, alto, -fondo, fondo)       # B corre en Z y cruza el extremo de A
+    return b.text()
+
+
+@pytest.mark.parametrize("scale", ESCALAS)
+def test_recorte_y_ranura_eligen_la_misma_placa(scale):
+    """La placa que se acorta y la que recibe la ranura son la misma.
+
+    GUARDA, no reproducción: sobre dos muros sintéticos este caso también pasaba ANTES
+    del arreglo, porque la regla de posición (quién tiene un extremo en la junta) decide
+    sola y las reglas de `choose_wall_wall_yielder` donde las dos rutas discrepaban ni
+    siquiera llegan a correr. El desacuerdo real (7 de 15 pares) aparece con topologías de
+    3+ muros. Lo que sí queda cerrado acá es que un cambio futuro no pueda volver a
+    separar las dos decisiones sin que el banco se entere.
+    """
+    work, _, _, plate_joints = _procesar(_modelo_cruce_en_extremo(), scale)
+    ceden = _decisiones(work)
+
+    comparables = 0
+    for pj in plate_joints:
+        k = pair_key(pj.cutter_id, pj.cut_id)
+        if k not in ceden:
+            # Cruce en medio de AMBOS muros: no hay tope, sólo ranura. Sin decisión que
+            # respetar, y así debe ser.
+            continue
+        comparables += 1
+        assert pj.cut_id == ceden[k], (
+            f"1:{scale:.0f} par {k}: se acorta g{ceden[k]} pero la ranura va a "
+            f"g{pj.cut_id}. Se saca material de una placa y se abre la ranura en la otra."
+        )
+    assert comparables, "el modelo de cruce en extremo no generó ninguna ranura comparable"
+
+
+@pytest.mark.parametrize("scale", ESCALAS)
+def test_la_decision_del_usuario_llega_a_la_ranura(scale):
+    """Si el usuario cambia quién cede en el visor, la ranura tiene que seguirlo.
+
+    `resolve_plate_joints` ni siquiera recibía `wall_wall_decisions`: la elección movía
+    el recorte y dejaba la ranura donde estaba. Es el síntoma de "la intersección entre
+    A10 y A3 no está resuelta pese a que en el selector hay una decisión tomada".
+    """
+    obj = _modelo_cruce_en_extremo()
+    work_auto, _, _, _ = _procesar(obj, scale)
+    forzado = _forzar_lo_contrario(work_auto)
+    assert forzado, "el modelo de cruce en extremo no ofreció ninguna junta para elegir"
+
+    work, _, _, plate_joints = _procesar(obj, scale, wall_wall_decisions=forzado)
+    ceden = _decisiones(work, forzado)
+
+    comparables = 0
+    for pj in plate_joints:
+        k = pair_key(pj.cutter_id, pj.cut_id)
+        if k not in ceden:
+            continue
+        comparables += 1
+        assert pj.cut_id == ceden[k], (
+            f"1:{scale:.0f} par {k}: el usuario eligió acortar g{ceden[k]}, pero la "
+            f"ranura se abrió en g{pj.cut_id}"
+        )
+    assert comparables, "ninguna ranura quedó ligada a la decisión del usuario"
+
+
+def test_el_plano_de_la_ranura_es_el_mismo_que_el_del_recorte():
+    """`group_plane` (ranura) y `_mid_plane_offset` (recorte) deben dar el MISMO plano.
+
+    Uno promediaba los vértices y el otro tomaba el punto medio entre pieles. El promedio
+    se sesga hacia la piel más teselada, así que la ranura se ubicaba en un plano y el
+    recorte se medía contra otro. Acá una piel está subdividida en 4 y la otra no, que es
+    lo que pasa en un modelo real con aberturas.
+    """
+    b = _ObjBuilder()
+    largo, alto, t = 8.0, 3.0, 0.20
+    # Piel z=t subdividida en 4 tramos; piel z=0 de una sola pieza.
+    for i in range(4):
+        xa = largo * i / 4.0
+        xb = largo * (i + 1) / 4.0
+        b.quad((xa, 0.0, t), (xa, alto, t), (xb, alto, t), (xb, 0.0, t))
+    b.quad((0.0, 0.0, 0.0), (largo, 0.0, 0.0), (largo, alto, 0.0), (0.0, alto, 0.0))
+    # Cantos, para que el grupo tenga volumen cerrado.
+    b.quad((0.0, 0.0, 0.0), (0.0, alto, 0.0), (0.0, alto, t), (0.0, 0.0, t))
+    b.quad((largo, 0.0, 0.0), (largo, 0.0, t), (largo, alto, t), (largo, alto, 0.0))
+
+    work, _, grupos, _ = _procesar(b.text(), 50.0)
+
+    revisados = 0
+    for g in grupos.values():
+        if g.category == "discard":
+            continue
+        n, d_ranura = group_plane(g, work.faces)
+        d_recorte = mid_plane_offset(g, work.faces, normalize(g.representative_normal))
+        assert d_ranura == pytest.approx(d_recorte, abs=1e-9), (
+            f"grupo {g.id}: la ranura se ubica en {d_ranura:.4f} y el recorte se mide "
+            f"contra {d_recorte:.4f}"
+        )
+        # Y que el test muerda: sobre esta malla el promedio SÍ difiere del punto medio.
+        proy = [
+            dot(n, v)
+            for fi in g.face_indices
+            if 0 <= fi < len(work.faces)
+            for v in work.faces[fi].vertices
+        ]
+        if proy and (max(proy) - min(proy)) > 0.01:
+            promedio = sum(proy) / len(proy)
+            assert abs(promedio - d_recorte) > 1e-6, (
+                "la malla de prueba quedó simétrica: el caso no distingue promedio de "
+                "punto medio y no prueba nada"
+            )
+            revisados += 1
+    assert revisados, "ningún grupo con espesor: el caso no ejercita el sesgo"
+
+
+# ---------------------------------------------------------------------------
+# Uniones oblicuas
+# ---------------------------------------------------------------------------
+
+
+def _distancia_borde_a_plano_vecino(panel, grupo, otro, faces):
+    """Distancia del borde recortado de `panel` al plano medio de `otro`, en metros.
+
+    Sirve para cualquier ángulo: el recorte se mide a lo largo del eje `u` del panel, y
+    acá se lo proyecta sobre la normal del vecino. `_extremos_a_lo_largo` da por sentado
+    que `u` es paralelo a esa normal, cosa que sólo vale a 90°.
+    """
+    oriented = orient_group_normals_outward([grupo])
+    res = project_faces_to_2d(
+        [faces[i] for i in grupo.face_indices if i < len(faces)],
+        oriented.get(grupo.id, grupo.representative_normal),
+        "Y",
+    )
+    if res is None:
+        return None
+    n = normalize(otro.representative_normal)
+    su = dot(res.u_axis, n)
+    if abs(su) < 1e-6:
+        return None
+    d_otro = mid_plane_offset(otro, faces, n)
+    proy = [
+        dot(n, v)
+        for fi in grupo.face_indices
+        if 0 <= fi < len(faces)
+        for v in faces[fi].vertices
+    ]
+    if not proy:
+        return None
+    lo, hi = min(proy), max(proy)
+    borde = lo if abs(lo - d_otro) < abs(hi - d_otro) else hi
+    # El recorte se hace sobre `u`; lo que se aleja del plano vecino es su proyección.
+    desplazamiento = (res.width_m - panel.width_m) * abs(su)
+    borde_final = borde + desplazamiento if borde < d_otro else borde - desplazamiento
+    return abs(borde_final - d_otro)
+
+
+def _inter_rectas(p0, u0, p1, u1):
+    """Intersección de dos rectas dadas por punto + dirección, en planta."""
+    det = u0[0] * (-u1[1]) - u0[1] * (-u1[0])
+    if abs(det) < 1e-12:
+        return None
+    dx, dz = p1[0] - p0[0], p1[1] - p0[1]
+    s = (dx * (-u1[1]) - dz * (-u1[0])) / det
+    return (p0[0] + s * u0[0], p0[1] + s * u0[1])
+
+
+def _planta_mitrada(eje, t):
+    """Contorno en planta de una polilínea de muros de espesor `t`, a inglete.
+
+    Dos muros oblicuos modelados como cajas sueltas NO comparten vértices, y entonces
+    ninguno de los dos detectores los une: el topológico exige arista compartida, y
+    `detect_contact_joints` compara VÉRTICES contra triángulos con una tolerancia de 2 cm
+    — en una esquina de muros de 20 cm a 45° los vértices quedan a ~7 cm. Un modelo real
+    trae la esquina resuelta a inglete, que es lo que se construye acá.
+    """
+    h = t / 2.0
+    dirs = []
+    for i in range(len(eje) - 1):
+        dx, dz = eje[i + 1][0] - eje[i][0], eje[i + 1][1] - eje[i][1]
+        L = math.hypot(dx, dz)
+        dirs.append((dx / L, dz / L))
+
+    def lado(signo):
+        pts = []
+        offs = [
+            ((eje[i][0] - dirs[i][1] * h * signo, eje[i][1] + dirs[i][0] * h * signo), dirs[i])
+            for i in range(len(dirs))
+        ]
+        pts.append(offs[0][0])
+        for i in range(len(offs) - 1):
+            p = _inter_rectas(offs[i][0], offs[i][1], offs[i + 1][0], offs[i + 1][1])
+            pts.append(p if p else offs[i][0])
+        p_ult, u_ult = offs[-1]
+        pts.append((p_ult[0] + u_ult[0] * _largo(eje, -1), p_ult[1] + u_ult[1] * _largo(eje, -1)))
+        return pts
+
+    return lado(+1) + list(reversed(lado(-1)))
+
+
+def _largo(eje, i):
+    a, b = eje[i - 1], eje[i]
+    return math.hypot(b[0] - a[0], b[1] - a[1])
+
+
+@pytest.mark.parametrize("scale", ESCALAS)
+def test_esquina_oblicua_a_45_grados(scale):
+    """En una unión a 45° el borde también debe apoyar sobre la cara del vecino.
+
+    `oblique_trim_factor` estira el recorte por 1/sen(θ) porque la placa vecina se
+    interpone a lo largo de más recorrido del muro que cede. No había ni un caso oblicuo
+    en el banco: todos los modelos eran ortogonales. COBERTURA NUEVA, no regresión: la
+    fórmula ya era correcta y este caso también pasa con el código anterior.
+    """
+    t = 0.20
+    a = 6.0 / math.sqrt(2.0)
+    eje = [(0.0, 0.0), (8.0, 0.0), (8.0 + a, a)]   # tramo en X + tramo a 45°
+    b = _ObjBuilder()
+    b.prisma(_planta_mitrada(eje, t), 0.0, 3.0)
+    work, paneles, grupos, _ = _procesar(b.text(), scale)
+
+    assert work.wall_wall_joints, "no se detectó la unión oblicua"
+    ww = next((j for j in work.wall_wall_joints if j.yield_group_id is not None), None)
+    assert ww is not None, "la unión oblicua quedó sin resolver"
+
+    cede = grupos[ww.yield_group_id]
+    otro = grupos[ww.group_b if ww.yield_group_id == ww.group_a else ww.group_a]
+    panel = next(p for p in paneles if p.source_group_id == cede.id)
+
+    d = _distancia_borde_a_plano_vecino(panel, cede, otro, work.faces)
+    assert d is not None, "no se pudo medir el borde contra el plano del vecino"
+    distancia_mm = d / scale * 1000.0
+    assert distancia_mm == pytest.approx(1.5, abs=TOL_MM), (
+        f"1:{scale:.0f} en la esquina a 45° el borde quedó a {distancia_mm:.3f}mm del "
+        f"plano medio vecino, y debía quedar a 1.500mm"
+    )
 
 
 @pytest.mark.parametrize("scale", ESCALAS)
