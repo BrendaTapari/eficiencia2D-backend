@@ -24,10 +24,13 @@ from core.services.cutting_sheet import (
     apply_user_cuts,
     clip_panel_at_u,
     clip_panel_at_v,
+    compute_group_placement,
     mirror_edges_horizontal,
     nested_sheets_to_dxf,
     orient_group_normals_outward,
+    panel_cut_area_m2,
     project_faces_to_2d,
+    shift_placement,
 )
 from core.services.plate_intersect import resolve_plate_joints
 from core.services.flex_bending import (
@@ -714,6 +717,18 @@ def decompose_panels_from_groups(
         # las piezas por width×height, así que cualquier trazo fuera invadiría al vecino.
         edges, width_m, height_m = _fit_panel_bbox(edges, width_m, height_m)
 
+        # Marco 3D de la pieza YA RECORTADA, para que el instructivo dibuje lo que se
+        # corta y no la proyección cruda del modelo. Sale del MISMO cálculo que la
+        # plancha: no hay una segunda ruta que pueda discrepar.
+        marco = compute_group_placement(
+            faces, oriented_normals.get(group.id, group.representative_normal), "Y"
+        )
+        if marco is not None:
+            marco = shift_placement(
+                marco, clip_off_u, clip_off_v, width_m, height_m,
+                panel_cut_area_m2(edges, width_m, height_m),
+            )
+
         if is_floor:
             floor_count += 1
             floor_panels.append(
@@ -727,6 +742,7 @@ def decompose_panels_from_groups(
                     edges=edges,
                     source_group_id=group.id,
                     is_mark=group.id in marks_set,
+                    frame=marco,
                 )
             )
         else:
@@ -742,6 +758,7 @@ def decompose_panels_from_groups(
                     edges=edges,
                     source_group_id=group.id,
                     is_mark=group.id in marks_set,
+                    frame=marco,
                 )
             )
 
@@ -932,7 +949,7 @@ def compute_nesting(
     mark_lines: Optional[List[dict]] = None,
     ribs: Optional[List[dict]] = None,
     columns: Optional[List[dict]] = None,
-) -> Tuple[Phase1Result, NestingResult, NestingResult, SheetConfig, Dict[int, str], List]:
+) -> Tuple[Phase1Result, NestingResult, NestingResult, SheetConfig, Dict[int, str], List, Dict[str, Dict]]:
     """Descompone y anida paneles. Compartido por /generate y /nesting-preview."""
     work, wall_panels, floor_panels, plate_joints = _decompose(
         phase1, opts, overrides, wall_wall_decisions, merges, marks,
@@ -981,7 +998,25 @@ def compute_nesting(
         sheet_cfg,
         panel_ids_by_group(wall_panels, floor_panels),
         plate_joints,
+        final_placements(wall_panels, floor_panels),
     )
+
+
+def final_placements(
+    wall_panels: List[Panel], floor_panels: List[Panel]
+) -> Dict[str, Dict]:
+    """`group_id (str) -> marco de la pieza YA RECORTADA`, para el instructivo.
+
+    Misma forma que `topology.placements` (origin / u_axis / v_axis / normal / width_m /
+    height_m / mirrored) más `area_m2` y `panel_id`. La diferencia es que estas medidas
+    son las que se van a cortar: `topology.placements` es la proyección cruda del modelo
+    y en un modelo real 20 de 28 piezas salían más grandes ahí que en la plancha.
+    """
+    out: Dict[str, Dict] = {}
+    for p in list(wall_panels) + list(floor_panels):
+        if p.frame and p.source_group_id is not None and p.source_group_id >= 0:
+            out[str(p.source_group_id)] = dict(p.frame, panel_id=p.id)
+    return out
 
 
 def generate_from_review(
@@ -997,7 +1032,7 @@ def generate_from_review(
     ribs: Optional[List[dict]] = None,
     columns: Optional[List[dict]] = None,
 ) -> List[OutputFile]:
-    work, wall_nesting, floor_nesting, sheet_cfg, _, _ = compute_nesting(
+    work, wall_nesting, floor_nesting, sheet_cfg, _, _, _ = compute_nesting(
         phase1, opts, overrides, wall_wall_decisions, merges, marks,
         user_cuts, flex, mark_lines, ribs, columns,
     )
