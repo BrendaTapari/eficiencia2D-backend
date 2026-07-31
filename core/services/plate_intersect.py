@@ -39,18 +39,37 @@ def plane_of(face: Face3D) -> Tuple[Vec3, float]:
     return n, dot(n, face.vertices[0])
 
 
+def mid_plane_offset(group: GeometryGroup, faces: List[Face3D], n: Vec3) -> float:
+    """Offset del plano MEDIO del grupo a lo largo de `n`: el punto medio entre sus dos
+    pieles, o sea (min + max) / 2 de las proyecciones.
+
+    FUENTE ÚNICA. Es la misma referencia que usa el recorte del tope
+    (`assembly_adjuster._mid_plane_offset`, que delega acá) y la que usa la ranura
+    (`group_plane`). Tenerlas separadas era un defecto real: `group_plane` promediaba los
+    vértices y `_mid_plane_offset` tomaba el punto medio, así que la ranura se ubicaba en
+    un plano y el recorte se calculaba contra otro. Diferencia medida en un modelo real:
+    hasta 8.4 mm de edificio.
+
+    NO es el promedio de los vértices: ese valor se sesga hacia la piel que tenga más
+    vértices (más teselada, o con aberturas) y da un plano que no es el medio. Con un muro
+    de 20 cm el promedio daba 0.0667 en vez de 0.100. Es la placa la que va en el plano
+    medio, así que el punto medio geométrico es la referencia correcta.
+    """
+    vals = [
+        dot(n, v)
+        for fi in group.face_indices
+        if 0 <= fi < len(faces)
+        for v in faces[fi].vertices
+    ]
+    if not vals:
+        return 0.0
+    return (min(vals) + max(vals)) / 2.0
+
+
 def group_plane(group: GeometryGroup, faces: List[Face3D]) -> Tuple[Vec3, float]:
-    """Plano representativo del grupo: normal representativa + d medio sobre sus caras."""
+    """Plano representativo del grupo: normal representativa + plano MEDIO entre pieles."""
     n = normalize(group.representative_normal)
-    s = 0.0
-    cnt = 0
-    for fi in group.face_indices:
-        if 0 <= fi < len(faces):
-            for v in faces[fi].vertices:
-                s += dot(n, v)
-                cnt += 1
-    d = s / cnt if cnt else 0.0
-    return n, d
+    return n, mid_plane_offset(group, faces, n)
 
 
 def signed_dist(v: Vec3, n: Vec3, d: float) -> float:
@@ -225,16 +244,37 @@ def _aabb_overlap(a, b, tol: float = 0.05) -> bool:
     )
 
 
+def pair_key(a: int, b: int) -> Tuple[int, int]:
+    """Clave canónica de un par de grupos, independiente del orden."""
+    return (a, b) if a <= b else (b, a)
+
+
 def resolve_plate_joints(
-    groups: List[GeometryGroup], faces: List[Face3D], eps: float = EPS
+    groups: List[GeometryGroup],
+    faces: List[Face3D],
+    eps: float = EPS,
+    yield_by_pair: Optional[Dict[Tuple[int, int], int]] = None,
 ) -> List[PlateJoint]:
     """
     Encuentra placas (paredes) que se cruzan en 3D y devuelve las juntas de encastre.
     Broad-phase por AABB (evita O(n²) real: sólo clasifica pares con AABB que solapa).
-    Jerarquía (quién cede) vía assembly_adjuster.choose_wall_wall_yielder.
+
+    `yield_by_pair` es la decisión YA TOMADA por `compute_adjustments`
+    (`pair_key(a,b) -> id del grupo que cede`), y manda. Es obligatorio pasarla desde el
+    pipeline: sin ella esta función recalculaba la jerarquía por su cuenta, con
+    `topo_info=None`, con los espesores crudos (sin el fallback de 3 mm) y **sin ver
+    `wall_wall_decisions`**, o sea ignorando la elección del usuario. Las dos decisiones
+    se contradecían en 7 de 15 pares de un modelo real: la placa que se acortaba no era la
+    que recibía la ranura, así que se quitaba material de un lado y se abría la ranura del
+    otro. Ese era el fallo físico del par 255/261.
+
+    El fallback local sólo actúa cuando el par no tiene decisión: cruces en medio de AMBOS
+    muros, que `compute_adjustments` deja deliberadamente sin recorte
+    (`suggested_yield_group_id = None`) porque el encastre ahí es la ranura, no el tope.
     """
     from core.services.assembly_adjuster import choose_wall_wall_yielder
 
+    yield_by_pair = yield_by_pair or {}
     walls = [g for g in groups if g.category == "wall"]
     boxes = {g.id: _aabb(g, faces) for g in walls}
     by_id = {g.id: g for g in walls}
@@ -265,10 +305,13 @@ def resolve_plate_joints(
             if not (a_spans_b or b_spans_a):
                 continue
 
-            # Jerarquía: el yielder es la placa CORTADA (recibe la ranura).
-            t_a = ga.thickness or 0.0
-            t_b = gb.thickness or 0.0
-            yid = choose_wall_wall_yielder(ga, gb, t_a, t_b, None, faces)
+            # Jerarquía: el yielder es la placa CORTADA (recibe la ranura). La decisión
+            # de compute_adjustments manda; sólo se recalcula si ese par no tiene una.
+            yid = yield_by_pair.get(pair_key(ga.id, gb.id))
+            if yid is None:
+                t_a = ga.thickness or 0.0
+                t_b = gb.thickness or 0.0
+                yid = choose_wall_wall_yielder(ga, gb, t_a, t_b, None, faces)
             cut = by_id.get(yid, gb)
             cutter = ga if cut is gb else gb
             # Ancho físico: la placa que atraviesa, más la holgura del kerf para que
