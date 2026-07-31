@@ -348,11 +348,42 @@ def resolve_plate_joints(
                            width=width, kind="slot")
             )
 
+    joints.extend(_floor_slots(groups, faces, eps))
+
     # NOTA: las "marcas de apoyo" (surface) se detectan en resolve_support_joints, pero NO
     # se agregan acá: inundaban la lámina de corte con rectángulos/diagonales rojos y
     # ensuciaban plate_joints (que el visor 3D usa para las intersecciones). Si se quieren
     # exponer, van en un array/entregable propio, no mezcladas en plate_joints.
     return joints
+
+
+def _floor_slots(
+    groups: List[GeometryGroup], faces: List[Face3D], eps: float = EPS
+) -> List[PlateJoint]:
+    """Ranura PASANTE en el muro para que la losa se apoye.
+
+    Un entrepiso que pasa entre dos muros continuos entraba sin chocar pero sin nada que
+    lo sostuviera: de 21 ranuras de un modelo real, CERO involucraban una losa, porque
+    `resolve_plate_joints` sólo mira pares muro-muro. La losa quedaba encajada a fricción
+    y al armar la maqueta se cae.
+
+    El muro recibe una ranura horizontal al nivel de la losa (`cut_id` = muro) y la losa
+    la atraviesa (`cutter_id` = losa). El par sale de `floor_wall_encounters`, la misma
+    función que decide el recorte de la losa: una sola decisión, dos consumidores.
+    """
+    from core.services.assembly_adjuster import floor_wall_encounters
+
+    out: List[PlateJoint] = []
+    width = PLATE_THICKNESS_M + KERF_CLEARANCE_M
+    for f, w, _s in floor_wall_encounters(groups, faces):
+        seg = plate_joint_segment(w, f, faces, eps)
+        if seg is None:
+            continue
+        out.append(
+            PlateJoint(cutter_id=f.id, cut_id=w.id, a=seg[0], b=seg[1],
+                       width=width, kind="slot")
+        )
+    return out
 
 
 def resolve_support_joints(

@@ -786,9 +786,23 @@ def test_entrepiso_entra_entre_muros_continuos(scale):
             borde = min(proy, key=lambda p: abs(p - d_muro))
             distancia_mm = abs(d_muro - borde) / scale * 1000.0
             revisados += 1
-            assert distancia_mm == pytest.approx(1.5, abs=TOL_MM), (
+            # El borde de la losa tiene que quedar DENTRO de la ranura del muro. La
+            # versión anterior afirmaba 1.5mm —el tope contra la cara— y era el
+            # comportamiento que se reemplazó: así la losa entraba sin chocar pero nada
+            # la sostenía. Ahora la losa llega al plano medio y se mete en una ranura
+            # pasante, así que lo que hay que afirmar es que su borde cae dentro del
+            # ancho de esa ranura.
+            media_ranura_mm = (PLATE_THICKNESS_M + 0.0001) / 2.0 * 1000.0
+            assert distancia_mm <= media_ranura_mm + TOL_MM, (
                 f"1:{scale:.0f} el borde del entrepiso quedó a {distancia_mm:.2f}mm del "
-                f"plano medio del muro g{w.id} y debía quedar a 1.50mm: no entra"
+                f"plano medio del muro g{w.id}: fuera de la ranura de "
+                f"{media_ranura_mm * 2:.2f}mm, no engancha"
+            )
+            # Y que la ranura EXISTA: sin ella la losa queda a fricción y se cae.
+            panel_muro = next((p for p in paneles if p.source_group_id == w.id), None)
+            assert panel_muro is not None and g.id in (panel_muro.slots_against or []), (
+                f"1:{scale:.0f} el muro g{w.id} no recibió ranura para el entrepiso: "
+                "la losa entra pero nada la sostiene"
             )
     assert revisados >= 2, f"sólo se midieron {revisados} muros continuos, debían ser 2"
 

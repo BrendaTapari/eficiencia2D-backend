@@ -384,6 +384,38 @@ def floor_fit_adjustments(
     planta baja conserva su tamaño y el entrepiso no.
     """
     out: List[DimensionAdjustment] = []
+    for f, w, s in floor_wall_encounters(groups, faces):
+        # La losa llega HASTA EL PLANO MEDIO del muro, no media placa antes: su borde se
+        # mete en la ranura pasante que `resolve_plate_joints` abre en el muro a ese
+        # nivel. Antes se la recortaba media placa para que topara contra la cara del
+        # muro, y así entraba sin chocar pero NADA la sostenía: quedaba encajada a
+        # fricción entre dos muros continuos, sin ranura y sin apoyo.
+        out.append(
+            DimensionAdjustment(
+                group_id=f.id,
+                delta=-s,
+                delta_plate=0.0,
+                axis="plane",
+                reason=f"Entra en la ranura de {w.label or w.id} (borde {s * 1000:+.0f}mm)",
+                joint_index=-1,
+                against_group_id=w.id,
+            )
+        )
+    return out
+
+
+def floor_wall_encounters(
+    groups: List[GeometryGroup], faces: Optional[List[Face3D]]
+) -> List[Tuple[GeometryGroup, GeometryGroup, float]]:
+    """`(losa, muro, s)` de cada encuentro donde un muro CONTINUO atraviesa el nivel de
+    una losa. `s` es la distancia con signo del borde de la losa al plano medio del muro.
+
+    FUENTE ÚNICA de ese encuentro: la consumen el recorte de la losa
+    (`floor_fit_adjustments`) y la ranura del muro (`plate_intersect.resolve_plate_joints`).
+    Tenerlo en dos lados fue exactamente el defecto que costó más caro en este pipeline —
+    el recorte y la ranura decidiendo por separado y contradiciéndose en 7 de 15 pares.
+    """
+    out: List[Tuple[GeometryGroup, GeometryGroup, float]] = []
     if not faces:
         return out
 
@@ -408,7 +440,6 @@ def floor_fit_adjustments(
             return None
         return (min(xs), max(xs), min(ys), max(ys), min(zs), max(zs))
 
-    media_placa = PLATE_THICKNESS_M / 2.0
     cajas = {g.id: caja(g) for g in floors + walls}
 
     for f in floors:
@@ -444,21 +475,7 @@ def floor_fit_adjustments(
             s = (hi - d) if centro < d else (d - lo)
             if abs(s) > FLOOR_REACH_TOL_M:
                 continue  # no se encuentran: es un vacío de diseño, no un encastre
-
-            out.append(
-                DimensionAdjustment(
-                    group_id=f.id,
-                    delta=-s,
-                    delta_plate=-media_placa,
-                    axis="plane",
-                    reason=(
-                        f"Entra entre placas de {w.label or w.id} "
-                        f"(borde {s * 1000:+.0f}mm del plano medio + media placa)"
-                    ),
-                    joint_index=-1,
-                    against_group_id=w.id,
-                )
-            )
+            out.append((f, w, s))
     return out
 
 
