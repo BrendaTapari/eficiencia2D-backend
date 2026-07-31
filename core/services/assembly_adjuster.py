@@ -59,9 +59,15 @@ class DimensionAdjustment:
     # "height"     → recorta la BASE del muro (muro encima de losa de piso)
     # "height_top" → recorta la CIMA del muro (techo/losa encima del muro)
     # "width"      → recorta un lado lateral (muro-muro)
-    axis: Literal["height", "height_top", "width"]
+    # "plane"      → recorta la pieza EN SU PROPIO PLANO contra `against_group_id`; el eje
+    #                (u o v) y el lado salen de la normal de ese grupo. Es el caso de una
+    #                losa que tiene que entrar entre dos muros continuos.
+    axis: Literal["height", "height_top", "width", "plane"]
     reason: str
     joint_index: int
+    # Grupo CONTRA el que se recorta. Sólo lo usa `axis="plane"`, donde el eje del panel
+    # (u o v) y el lado se deducen de la normal de ese grupo.
+    against_group_id: Optional[int] = None
     # El ajuste tiene DOS componentes con unidades distintas, y hay que sumarlas:
     #   `delta`       -> metros de EDIFICIO (p. ej. el voladizo que el muro del modelo
     #                    mete más allá del plano medio del vecino). Escala con el modelo.
@@ -295,6 +301,9 @@ def compute_adjustments(
                         )
                     )
 
+    # Encaje de las losas: se calcula por geometría, no por juntas (ver la función).
+    adjustments.extend(floor_fit_adjustments(groups, faces))
+
     # Deduplicar ajustes de altura: mantener el delta más negativo por grupo y eje.
     # Los ajustes de ancho (muro-muro) pasan directos.
     seen_height: Dict[int, DimensionAdjustment] = {}
@@ -326,17 +335,143 @@ def compute_adjustments(
 # ---------------------------------------------------------------------------
 
 
+FLOOR_CROSS_TOL_M = 0.05
+# Hasta dónde puede estar el borde de la losa del plano medio del muro para considerar
+# que se encuentran. Más lejos que esto es un hueco de DISEÑO (un vacío, un patio) y
+# achicar la losa abriría una luz en vez de cerrarla.
+FLOOR_REACH_TOL_M = 0.30
+
+
+def floor_fit_adjustments(
+    groups: List[GeometryGroup], faces: Optional[List[Face3D]]
+) -> List[DimensionAdjustment]:
+    """Recortes para que cada losa ENTRE entre los muros que la atraviesan.
+
+    Va por geometría y NO por juntas detectadas, a propósito. `detect_joints` es
+    topológico (exige arista compartida) y su complemento geométrico
+    `detect_contact_joints` sólo mira pares muro-muro, así que una losa que no esté
+    soldada a los muros en la malla no genera ninguna junta con ellos: el entrepiso se
+    quedaba sin recorte EN SILENCIO y salía con el ancho que tiene entre las pieles del
+    modelo. Al armar la maqueta no entraba. Acá se recorren los pares (losa, muro) —son
+    pocos: 2 x 26 en un modelo real— y se mide directamente.
+
+    Sólo se recorta contra muros que ATRAVIESAN el nivel de la losa. Si el muro nace o
+    muere en ella, la losa se apoya y no hay nada entre lo que entrar: por eso la losa de
+    planta baja conserva su tamaño y el entrepiso no.
+    """
+    out: List[DimensionAdjustment] = []
+    if not faces:
+        return out
+
+    floors = [
+        g for g in groups
+        if g.category == "floor" and abs(normalize(g.representative_normal).y) > 0.5
+    ]
+    walls = [
+        g for g in groups
+        if g.category == "wall" and abs(normalize(g.representative_normal).y) <= 0.5
+    ]
+    if not floors or not walls:
+        return out
+
+    def caja(g: GeometryGroup):
+        xs = []; ys = []; zs = []
+        for fi in g.face_indices:
+            if 0 <= fi < len(faces):
+                for v in faces[fi].vertices:
+                    xs.append(v.x); ys.append(v.y); zs.append(v.z)
+        if not xs:
+            return None
+        return (min(xs), max(xs), min(ys), max(ys), min(zs), max(zs))
+
+    media_placa = PLATE_THICKNESS_M / 2.0
+    cajas = {g.id: caja(g) for g in floors + walls}
+
+    for f in floors:
+        cf = cajas.get(f.id)
+        if cf is None:
+            continue
+        for w in walls:
+            if not wall_crosses_level(w, f):
+                continue
+            cw = cajas.get(w.id)
+            if cw is None:
+                continue
+            # Tienen que coincidir en planta: si no, es un muro de otra parte del edificio.
+            tol = FLOOR_CROSS_TOL_M
+            if (min(cf[1], cw[1]) - max(cf[0], cw[0]) < -tol
+                    or min(cf[5], cw[5]) - max(cf[4], cw[4]) < -tol):
+                continue
+
+            n = normalize(w.representative_normal)
+            d = _mid_plane_offset(w, faces, n)
+            proj = [
+                n.x * v.x + n.y * v.y + n.z * v.z
+                for fi in f.face_indices
+                if 0 <= fi < len(faces)
+                for v in faces[fi].vertices
+            ]
+            if not proj:
+                continue
+            lo, hi = min(proj), max(proj)
+            centro = (lo + hi) / 2.0
+            # Distancia CON SIGNO del borde de la losa al plano medio del muro, hacia
+            # afuera: positiva = la losa pasa del plano; negativa = se queda corta.
+            s = (hi - d) if centro < d else (d - lo)
+            if abs(s) > FLOOR_REACH_TOL_M:
+                continue  # no se encuentran: es un vacío de diseño, no un encastre
+
+            out.append(
+                DimensionAdjustment(
+                    group_id=f.id,
+                    delta=-s,
+                    delta_plate=-media_placa,
+                    axis="plane",
+                    reason=(
+                        f"Entra entre placas de {w.label or w.id} "
+                        f"(borde {s * 1000:+.0f}mm del plano medio + media placa)"
+                    ),
+                    joint_index=-1,
+                    against_group_id=w.id,
+                )
+            )
+    return out
+
+
+def wall_crosses_level(wall: GeometryGroup, floor: GeometryGroup) -> bool:
+    """El muro atraviesa el nivel de la losa: sigue de largo por ARRIBA y por ABAJO.
+
+    Distingue el entrepiso —que tiene que entrar entre las placas de muro— del piso de
+    planta baja, sobre el que los muros simplemente apoyan. Si el muro NACE en la losa
+    (min_y ≈ el nivel de la losa) no la cruza: la sostiene.
+    """
+    if None in (wall.min_y, wall.max_y, floor.min_y, floor.max_y):
+        return False
+    return (
+        wall.min_y < floor.min_y - FLOOR_CROSS_TOL_M
+        and wall.max_y > floor.max_y + FLOOR_CROSS_TOL_M
+    )
+
+
 def overshoot_past_plane_m(
     group: GeometryGroup,
     other: GeometryGroup,
     faces: Optional[List[Face3D]],
 ) -> Optional[float]:
-    """Cuánto material de `group` se mete más allá del plano medio de `other`.
+    """Distancia CON SIGNO del borde de `group` al plano medio de `other`, hacia afuera.
 
-    En metros de EDIFICIO. El contorno del panel se mide hasta la piel EXTERIOR del muro
-    (project_faces_to_2d proyecta ambas pieles y toma el bbox de la unión), así que en una
-    esquina el muro llega más allá del eje del vecino: justamente ese sobrante hay que
-    quitarlo, además de la media placa. Devuelve 0 si no lo cruza.
+    En metros de EDIFICIO. Positiva = el material pasa del plano (hay que quitarlo);
+    NEGATIVA = el borde se queda corto y el recorte total es menor que la media placa.
+    Antes se clampeaba a 0, con lo cual una pieza que ya llegaba corta igual perdía la
+    media placa entera y quedaba con una luz del tamaño de lo que le faltaba (1 cm en el
+    entrepiso de un modelo real). El clamp del recorte total sigue existiendo, pero está
+    donde corresponde: en `decompose_panels_from_groups`, que es quien conoce la escala y
+    puede sumar las dos componentes antes de decidir si hay algo que recortar.
+
+    El contorno del panel se mide hasta la piel EXTERIOR del muro (project_faces_to_2d
+    proyecta ambas pieles y toma el bbox de la unión), así que en una esquina el muro
+    llega más allá del eje del vecino: ese sobrante hay que quitarlo, además de la media
+    placa.
     """
     if not faces:
         return None
@@ -350,11 +485,12 @@ def overshoot_past_plane_m(
     ]
     if not proj:
         return None
-    centro = sum(proj) / len(proj)
-    # El cuerpo del muro está de un lado del plano; el voladizo es lo que asoma del otro.
+    centro = (min(proj) + max(proj)) / 2.0
+    # El cuerpo de la pieza está de un lado del plano; el borde que mira al vecino es el
+    # extremo del otro lado. Sin clamp: si se queda corto el valor sale negativo.
     if centro >= d_other:
-        return max(0.0, d_other - min(proj))
-    return max(0.0, max(proj) - d_other)
+        return d_other - min(proj)
+    return max(proj) - d_other
 
 
 def _mid_plane_offset(group: GeometryGroup, faces: List[Face3D], n) -> float:
