@@ -219,10 +219,27 @@ def compute_adjustments(
             # una pieza le quita material de un EXTREMO. Si el cruce cae en el medio de
             # un muro, acortarlo no toca ese choque y encima lo deja corto donde sí
             # tenía que llegar (era la causa de piezas que no alcanzaban a la vecina).
-            fa = joint_position_frac(g_a, joint, faces)
-            fb = joint_position_frac(g_b, joint, faces)
-            a_at_end = fa is None or fa <= END_ZONE_FRAC or fa >= 1.0 - END_ZONE_FRAC
-            b_at_end = fb is None or fb <= END_ZONE_FRAC or fb >= 1.0 - END_ZONE_FRAC
+            #
+            # Pero ANTES hay que saber QUÉ dimensión sobra. Un contacto HORIZONTAL —dos
+            # muros que se encuentran a lo largo, como un faldón de techo contra la banda
+            # de borde— recorre las dos piezas de punta a punta: preguntar si la junta cae
+            # en un extremo LATERAL no tiene sentido, y acortar el ancho no resuelve nada.
+            # Lo que sobra ahí es ALTURA. Sin esta distinción esas juntas quedaban
+            # marcadas como "cruce en medio de ambos", se delegaban a una ranura que
+            # tampoco correspondía (no se atraviesan, sólo se tocan) y terminaban sin
+            # recorte y sin encastre. Medido: 3 de 38 uniones en un modelo real, las 3 sin
+            # resolver y las 3 pisándose.
+            if joint.horizontal_frac >= 0.5:
+                eje_a = vertical_end_axis(g_a, joint)
+                eje_b = vertical_end_axis(g_b, joint)
+                a_at_end = eje_a is not None
+                b_at_end = eje_b is not None
+            else:
+                eje_a = eje_b = "width"
+                fa = joint_position_frac(g_a, joint, faces)
+                fb = joint_position_frac(g_b, joint, faces)
+                a_at_end = fa is None or fa <= END_ZONE_FRAC or fa >= 1.0 - END_ZONE_FRAC
+                b_at_end = fb is None or fb <= END_ZONE_FRAC or fb >= 1.0 - END_ZONE_FRAC
 
             if a_at_end and not b_at_end:
                 suggested_yield_group_id = g_a.id   # sólo A puede acortarse
@@ -289,20 +306,27 @@ def compute_adjustments(
                     detalle = f"voladizo {voladizo * 1000:.0f}mm + media placa"
                     if factor >= 1.02:
                         detalle += f", a {joint.dihedral_angle:.0f}° (x{factor:.2f})"
+                    # El eje sale de la orientación del contacto: "width" si se encuentran
+                    # por un lateral, "height"/"height_top" si se encuentran a lo largo.
+                    eje = eje_a if decision == g_a.id else eje_b
                     new_ww_joint.yield_group_id = decision
                     adjustments.append(
                         DimensionAdjustment(
                             group_id=decision,
                             delta=-voladizo * factor,
                             delta_plate=-media_placa * factor,
-                            axis="width",
+                            axis=eje or "width",
                             reason=f"Junta con {other_group.label} ({detalle})",
                             joint_index=ji,
                         )
                     )
 
-    # Encaje de las losas: se calcula por geometría, no por juntas (ver la función).
+    # Encuentros muro-losa: se calculan por geometría, no por juntas (ver las funciones).
+    # La losa entra entre los muros que la atraviesan; el extremo del muro apoya sobre la
+    # cara de la placa de losa. Los duplicados con lo que ya emitió el bucle de juntas los
+    # absorbe el dedupe de altura de más abajo.
     adjustments.extend(floor_fit_adjustments(groups, faces))
+    adjustments.extend(wall_end_fit_adjustments(groups, faces))
 
     # Deduplicar ajustes de altura: mantener el delta más negativo por grupo y eje.
     # Los ajustes de ancho (muro-muro) pasan directos.
@@ -438,6 +462,100 @@ def floor_fit_adjustments(
     return out
 
 
+def wall_end_fit_adjustments(
+    groups: List[GeometryGroup], faces: Optional[List[Face3D]]
+) -> List[DimensionAdjustment]:
+    """Recortes para que el EXTREMO de cada muro apoye sobre la cara de la placa de losa.
+
+    Es la contraparte de `floor_fit_adjustments`: allá la losa entra entre los muros,
+    acá el muro topa contra la losa. Las dos ramas que ya existían para esto
+    (`is_wall_on_top` y `is_roof_above_wall`) viven dentro del bucle de JUNTAS, así que
+    sólo actúan si `detect_joints` encontró la unión — y ese detector es topológico, con
+    un complemento geométrico que sólo mira pares muro-muro. Una losa que no comparte
+    vértices con el muro no genera ninguna junta con él, y el encuentro se quedaba sin
+    resolver en silencio. Medido: en dos modelos distintos, un muro que nace dentro del
+    canto de la losa y otro cuya cima queda dentro de la placa del entrepiso.
+
+    Va por geometría, como el encaje de las losas, y por los mismos motivos.
+    """
+    out: List[DimensionAdjustment] = []
+    if not faces:
+        return out
+
+    floors = [
+        g for g in groups
+        if g.category == "floor" and abs(normalize(g.representative_normal).y) > 0.5
+    ]
+    walls = [
+        g for g in groups
+        if g.category == "wall" and abs(normalize(g.representative_normal).y) <= 0.5
+    ]
+    if not floors or not walls:
+        return out
+
+    def caja(g: GeometryGroup):
+        xs = []; ys = []; zs = []
+        for fi in g.face_indices:
+            if 0 <= fi < len(faces):
+                for v in faces[fi].vertices:
+                    xs.append(v.x); ys.append(v.y); zs.append(v.z)
+        return (min(xs), max(xs), min(ys), max(ys), min(zs), max(zs)) if xs else None
+
+    media_placa = PLATE_THICKNESS_M / 2.0
+    cajas = {g.id: caja(g) for g in floors + walls}
+
+    for w in walls:
+        cw = cajas.get(w.id)
+        if cw is None:
+            continue
+        for f in floors:
+            cf = cajas.get(f.id)
+            if cf is None:
+                continue
+            # Tienen que coincidir en planta.
+            tol = FLOOR_CROSS_TOL_M
+            if (min(cw[1], cf[1]) - max(cw[0], cf[0]) < -tol
+                    or min(cw[5], cf[5]) - max(cw[4], cf[4]) < -tol):
+                continue
+
+            # Plano medio de la losa, en Y (las losas son horizontales, así que el eje es
+            # el vertical y no hace falta arrastrar el signo de su normal).
+            d_y = (cf[2] + cf[3]) / 2.0
+            w_lo, w_hi = cw[2], cw[3]
+            if w_hi - w_lo <= 1e-6:
+                continue
+            centro = (w_lo + w_hi) / 2.0
+
+            if centro > d_y:
+                # El muro está por ENCIMA: apoya sobre la losa, se recorta su BASE.
+                s = d_y - w_lo
+                eje = "height"
+                extremo = w_lo
+            else:
+                # La losa está por encima: el muro topa con ella, se recorta su CIMA.
+                s = w_hi - d_y
+                eje = "height_top"
+                extremo = w_hi
+            if abs(extremo - d_y) > FLOOR_REACH_TOL_M:
+                continue  # el extremo del muro no llega a la losa: no se encuentran
+
+            out.append(
+                DimensionAdjustment(
+                    group_id=w.id,
+                    delta=-s,
+                    delta_plate=-media_placa,
+                    axis=eje,
+                    reason=(
+                        f"Topa con {f.label or f.id} "
+                        f"(extremo {s * 1000:+.0f}mm del plano medio + media placa)"
+                    ),
+                    joint_index=-1,
+                    against_group_id=f.id,
+                )
+            )
+    return out
+
+
 def wall_crosses_level(wall: GeometryGroup, floor: GeometryGroup) -> bool:
     """El muro atraviesa el nivel de la losa: sigue de largo por ARRIBA y por ABAJO.
 
@@ -498,6 +616,27 @@ def _mid_plane_offset(group: GeometryGroup, faces: List[Face3D], n) -> float:
     `plate_intersect` para que el tope y la ranura no puedan referirse a planos distintos
     (ver `plate_intersect.mid_plane_offset`)."""
     return mid_plane_offset(group, faces, n)
+
+
+def vertical_end_axis(group: GeometryGroup, joint: Joint) -> Optional[str]:
+    """Qué borde HORIZONTAL de la pieza toca la junta: `"height"` (la base),
+    `"height_top"` (la cima), o `None` si el contacto cae en su franja media.
+
+    La contraparte vertical de `joint_position_frac`. Un muro sólo puede ceder ahí donde
+    tiene un borde: si el contacto horizontal le cae por el medio, acortarlo no toca el
+    choque y encima lo deja corto donde sí llegaba.
+    """
+    if group.min_y is None or group.max_y is None:
+        return None
+    span = group.max_y - group.min_y
+    if span <= 1e-6:
+        return None
+    f = (joint.edge_mid.y - group.min_y) / span
+    if f <= END_ZONE_FRAC:
+        return "height"
+    if f >= 1.0 - END_ZONE_FRAC:
+        return "height_top"
+    return None
 
 
 def joint_position_frac(
