@@ -13,7 +13,11 @@ from typing import Dict, List, Optional, Tuple
 
 from core.group_classifier import GeometryGroup
 from core.pipeline import Phase1Result
-from core.services.assembly_adjuster import compute_adjustments
+from core.services.assembly_adjuster import (
+    AdjustmentsResult,
+    compute_adjustments,
+    yield_by_pair,
+)
 from core.services.cutting_sheet import (
     Edge2D,
     Panel,
@@ -35,7 +39,7 @@ from core.services.flex_bending import (
 from core.services.reinforcements import build_reinforcements
 from core.services.facade_extractor import extract_facades
 from core.services.floor_plan_extractor import extract_floor_plans
-from core.services.joint_detector import detect_joints
+from core.services.joint_detector import build_group_adjacency, detect_joints
 from core.services.pdf_writer import generate_nesting_pdf, generate_pdf
 from core.services.sheet_nester import (
     NestingPanel,
@@ -261,6 +265,9 @@ def apply_merges(
         wall_wall_joints=adj.wall_wall_joints,
         suggested_merges=[],
         warnings=warnings,
+        # Los merges cambian qué grupos existen: la vecindad se reconstruye sobre las
+        # juntas nuevas, no se arrastra la del modelo sin fusionar.
+        group_adjacency=build_group_adjacency(joints),
     )
 
 
@@ -385,6 +392,7 @@ def decompose_panels_from_groups(
     mark_lines: Optional[List[dict]] = None,
     ribs: Optional[List[dict]] = None,
     columns: Optional[List[dict]] = None,
+    adj_result: Optional[AdjustmentsResult] = None,
 ) -> Tuple[List[Panel], List[Panel]]:
     overrides = overrides or {}
     marks_set = set(marks or [])  # ids de grupos cuyas aberturas se graban (no se cortan)
@@ -434,12 +442,16 @@ def decompose_panels_from_groups(
 
     # No hace falta sembrar las sugerencias: compute_adjustments ya resuelve por su
     # cuenta toda junta sin decisión del usuario (una sola fuente de verdad).
-    adj_result = compute_adjustments(
-        phase1.joints,
-        phase1.groups,
-        wall_wall_decisions,
-        phase1.faces,
-    )
+    # `adj_result` viene precalculado desde `_decompose`, que necesita las decisiones
+    # ANTES para pasárselas a resolve_plate_joints. Se reutiliza tal cual: recalcularlo
+    # acá abriría de nuevo la puerta a que el recorte y la ranura decidan distinto.
+    if adj_result is None:
+        adj_result = compute_adjustments(
+            phase1.joints,
+            phase1.groups,
+            wall_wall_decisions,
+            phase1.faces,
+        )
 
     # El ajuste tiene dos componentes en unidades distintas y hay que sumarlas:
     #   `delta`       ya está en metros de EDIFICIO (el voladizo del modelo).
@@ -815,12 +827,24 @@ def _decompose(
 ) -> Tuple[Phase1Result, List[Panel], List[Panel], List]:
     """Aplica merges, resuelve encastres 3D y descompone a paneles 2D."""
     work = apply_merges(phase1, merges or [], overrides)
+
+    # ORDEN IMPORTANTE: primero se decide quién cede en cada junta, y recién después se
+    # resuelven las ranuras CONSUMIENDO esa decisión. Antes era al revés y cada una la
+    # calculaba por su cuenta: la placa que se acortaba no era la que recibía la ranura en
+    # 7 de 15 pares de un modelo real. Una sola decisión por junta, una sola vez.
+    adj_result = compute_adjustments(
+        work.joints, work.groups, wall_wall_decisions, work.faces
+    )
+
     # Misión 1: resolver intersecciones placa-placa en 3D (encastres) sobre la
     # topología final (post-merges), antes de proyectar.
-    plate_joints = resolve_plate_joints(work.groups, work.faces)
+    plate_joints = resolve_plate_joints(
+        work.groups, work.faces, yield_by_pair=yield_by_pair(adj_result)
+    )
     wall_panels, floor_panels = decompose_panels_from_groups(
         work, opts, overrides, wall_wall_decisions, marks, plate_joints,
         user_cuts, flex, mark_lines, ribs, columns,
+        adj_result=adj_result,
     )
     return work, wall_panels, floor_panels, plate_joints
 
