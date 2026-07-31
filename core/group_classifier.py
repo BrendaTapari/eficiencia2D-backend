@@ -16,7 +16,7 @@ from core.services.types import (
     sub,
     vlength,
 )
-from core.services.wall_pairing import are_thin_twins
+from core.services.wall_pairing import are_coplanar_sheet, are_thin_twins
 from core.services.topology import (
     connected_components as topo_connected_components,
     merge_coplanar_by_contact,
@@ -1016,6 +1016,12 @@ def classify_into_groups(
             if thickness is not None:
                 union(i, j)
                 twin_contrib.append({"idx": i, "thickness": thickness})
+            elif are_coplanar_sheet(sg_i, sg_j):
+                # Las dos caras de una chapa de espesor CERO. Sin esto salen como dos
+                # piezas idénticas en el mismo plano: se cortan dos veces y en la maqueta
+                # ocupan el mismo lugar. No aportan espesor (no hay dos pieles separadas),
+                # así que no entran en `twin_contrib`.
+                union(i, j)
 
     logger.debug(
         f"  -> thin twins: {(time.perf_counter()-t_step)*1000:.1f} ms, "
