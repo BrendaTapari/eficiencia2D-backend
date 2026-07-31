@@ -211,6 +211,63 @@ def _cancel_mp_preapproval(preapproval_id: str | None) -> None:
         log.exception("No se pudo cancelar preapproval MP %s", preapproval_id)
 
 
+def _plan_gratis(db: Session) -> Plan | None:
+    return (
+        db.query(Plan)
+        .filter(Plan.slug == "gratis", Plan.activo.is_(True))
+        .first()
+    )
+
+
+def _dar_de_baja_suscripcion(db: Session, user: Usuario) -> Suscripcion:
+    """
+    Cancela la suscripción activa/pendiente del usuario.
+    Si hay plan Gratis, deja al usuario en ese plan (activo).
+    Si no, marca la suscripción como cancelada.
+    """
+    sub = db.query(Suscripcion).filter(Suscripcion.usuario_id == user.id).first()
+    if not sub or sub.estado not in ("activa", "pendiente"):
+        raise HTTPException(
+            status_code=404,
+            detail="No hay un plan contratado para dar de baja",
+        )
+
+    gratis = _plan_gratis(db)
+    if gratis is not None and sub.plan_id == gratis.id and sub.estado == "activa":
+        raise HTTPException(
+            status_code=400,
+            detail="Ya estás en el plan Gratis; no hay un plan pago para dar de baja",
+        )
+
+    # Cancelar cobro recurrente en MP si había preapproval / id de proveedor.
+    if sub.proveedor == "mercadopago" and sub.proveedor_pago_id:
+        _cancel_mp_preapproval(str(sub.proveedor_pago_id))
+
+    now = datetime.now(timezone.utc)
+    sub.cancela_al_fin = True
+    sub.fecha_fin = now
+
+    if gratis is not None:
+        sub.plan_id = gratis.id
+        sub.estado = "activa"
+        sub.proveedor = None
+        sub.proveedor_pago_id = None
+        sub.fecha_inicio = now
+        sub.cancela_al_fin = False
+        log.info(
+            "Usuario %s dado de baja: pasó a plan Gratis (id=%s)",
+            user.id,
+            gratis.id,
+        )
+    else:
+        sub.estado = "cancelada"
+        log.info("Usuario %s dado de baja: suscripción cancelada (sin plan Gratis)", user.id)
+
+    db.commit()
+    db.refresh(sub)
+    return sub
+
+
 @router.get("/users/me/suscripcion")
 def get_suscripcion(
     user: Usuario = Depends(get_current_user),
@@ -348,23 +405,31 @@ def create_or_change_suscripcion(
     return {"checkout_url": mp["init_point"]}
 
 
+@router.post("/users/me/suscripcion/cancelar")
+def cancelar_suscripcion(
+    user: Usuario = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Da de baja el plan contratado del usuario autenticado.
+    Cancela cobros recurrentes en Mercado Pago (si aplica) y pasa al plan Gratis
+    cuando existe; si no, deja la suscripción en estado `cancelada`.
+    """
+    sub = _dar_de_baja_suscripcion(db, user)
+    return {
+        "message": "Plan dado de baja correctamente",
+        **serialize_suscripcion(sub),
+    }
+
+
 @router.delete("/users/me/suscripcion")
 def cancel_suscripcion(
     user: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    sub = db.query(Suscripcion).filter(Suscripcion.usuario_id == user.id).first()
-    if not sub or sub.estado not in ("activa", "pendiente"):
-        raise HTTPException(status_code=404, detail="No hay suscripción activa para cancelar")
-
-    if sub.proveedor == "mercadopago" and sub.proveedor_pago_id:
-        _cancel_mp_preapproval(str(sub.proveedor_pago_id))
-
-    now = datetime.now(timezone.utc)
-    sub.cancela_al_fin = True
-    if not sub.fecha_fin or sub.fecha_fin <= now:
-        sub.estado = "cancelada"
-
-    db.commit()
-    db.refresh(sub)
-    return serialize_suscripcion(sub)
+    """Alias de baja de plan (mismo comportamiento que POST .../cancelar)."""
+    sub = _dar_de_baja_suscripcion(db, user)
+    return {
+        "message": "Plan dado de baja correctamente",
+        **serialize_suscripcion(sub),
+    }
