@@ -645,10 +645,17 @@ def decompose_panels_from_groups(
             strip = min(recorte, width_m - 0.01)
             if strip <= 0.001:
                 continue
+            # El material se saca del extremo DONDE ESTÁ LA JUNTA. Las dos ramas estaban
+            # invertidas: con la junta en el extremo bajo se recortaba el alto y al revés.
+            # La pieza salía con el largo correcto pero desplazada el recorte entero, así
+            # que en la junta se metía dentro del vecino y en el extremo libre no llegaba
+            # — los dos síntomas reportados a la vez. `clip_panel_at_u(cut, keep_above)`:
+            # keep_above=True conserva u >= cut (quita el extremo BAJO); keep_above=False
+            # conserva u <= cut (quita el ALTO). Las ramas de altura ya lo hacían bien.
             clipped = (
-                clip_panel_at_u(edges, width_m - strip, False)
+                clip_panel_at_u(edges, strip, True)
                 if joint_on_left
-                else clip_panel_at_u(edges, strip, True)
+                else clip_panel_at_u(edges, width_m - strip, False)
             )
             if clipped:
                 width_m, height_m, edges = (
