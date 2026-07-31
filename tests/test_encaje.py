@@ -332,8 +332,24 @@ def test_ranura_tiene_el_ancho_de_la_placa(scale):
 
 
 @pytest.mark.parametrize("scale", ESCALAS)
-def test_muro_sobre_losa_se_acorta_el_espesor_de_placa(scale):
-    """El muro apoyado sobre una losa se acorta el espesor de la PLACA, no el de la losa."""
+def test_muro_sobre_losa_apoya_en_la_cara_de_la_placa(scale):
+    """La base del muro debe apoyar sobre la CARA de la placa de piso.
+
+    O sea a media placa del PLANO MEDIO de la losa, que es el mismo invariante
+    geométrico de la esquina en L. La versión anterior afirmaba "se acorta 1.5 mm en
+    toda escala", y eso era falso por la misma razón que ya se había corregido para los
+    muros: la losa del modelo tiene 25 cm de canto y su placa se centra en el plano
+    medio, así que la cara superior de la placa cae en 0.125 + media_placa, que se mueve
+    con la escala. Números reales de este modelo:
+
+        1:20  -> el muro llega 4.75 mm CORTO (habría que alargarlo: no se puede)
+        1:50  -> llega 1.00 mm corto
+        1:100 -> sobra 0.25 mm -> se recorta
+        1:200 -> sobra 0.87 mm -> se recorta
+
+    Cuando la pieza ya llega corta no se la extiende (puede haber aberturas junto al
+    borde): se deja como está, y eso es lo que se afirma en esa rama.
+    """
     # El muro va INSETADO respecto del borde de la losa. Si comparten plano lateral, el
     # clasificador fusiona la cara de la losa con la del muro en un solo grupo coplanar
     # que abarca toda la altura: ese grupo ATRAVIESA el entrepiso en vez de apoyarse en
@@ -360,16 +376,24 @@ def test_muro_sobre_losa_se_acorta_el_espesor_de_placa(scale):
         if res is None:
             continue
         recorte_m = res.height_m - panel.height_m
-        if recorte_m <= 1e-9:
+        media_placa_m = PLATE_THICKNESS_M * scale / 2.0
+        plano_medio_losa = 0.125          # losa y=0..0.25
+        base_bruta = 0.25                 # base del muro en el modelo
+        necesario = (plano_medio_losa + media_placa_m) - base_bruta
+
+        if necesario <= 0.0:
+            # El muro ya llega corto: no se lo puede alargar, así que no se toca.
+            assert recorte_m == pytest.approx(0.0, abs=1e-6), (
+                f"1:{scale:.0f} el muro llegaba {(-necesario)/scale*1000:.2f}mm corto y "
+                f"aun así se le recortaron {recorte_m/scale*1000:.2f}mm"
+            )
             continue
-        recorte_mm = recorte_m / scale * 1000.0
-        # El muro apoya sobre la CARA de la placa de piso: se acorta media placa. No hay
-        # voladizo, porque su base ya coincide con la cara superior de la losa.
-        # (La aserción anterior usaba `recorte_mm % 1.5`, que sobre un float no afirma
-        # nada útil; se reemplaza por el valor exacto esperado.)
-        assert recorte_mm == pytest.approx(1.5, abs=TOL_MM), (
-            f"1:{scale:.0f} el muro se acortó {recorte_mm:.2f}mm y debía acortarse "
-            f"1.50mm (media placa)"
+
+        base_final = base_bruta + recorte_m
+        distancia_mm = (base_final - plano_medio_losa) / scale * 1000.0
+        assert distancia_mm == pytest.approx(1.5, abs=TOL_MM), (
+            f"1:{scale:.0f} la base del muro quedó a {distancia_mm:.2f}mm del plano medio "
+            f"de la losa y debía quedar a 1.50mm (media placa)"
         )
 
 
@@ -624,6 +648,121 @@ def test_esquina_oblicua_a_45_grados(scale):
         f"1:{scale:.0f} en la esquina a 45° el borde quedó a {distancia_mm:.3f}mm del "
         f"plano medio vecino, y debía quedar a 1.500mm"
     )
+
+
+# ---------------------------------------------------------------------------
+# Losas
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("scale", ESCALAS)
+def test_entrepiso_entra_entre_muros_continuos(scale):
+    """Un entrepiso entre dos muros que siguen de largo debe ENTRAR entre las placas.
+
+    Los pisos no recibían NINGÚN recorte: salían con el ancho que tienen entre las pieles
+    del modelo y al armar la maqueta no entraban. En un modelo real el entrepiso sobraba
+    6.5 cm por lado (2.6 mm de plancha a 1:50) y se trababa. El muro acá no se puede
+    acortar: el encuentro cae en su mitad, sigue de largo por arriba y por abajo.
+    """
+    # Tabique de 5 cm. El espesor importa para poder construir el caso: la losa tiene que
+    # terminar contra la CARA interior del muro (si entrara en su cuerpo,
+    # `split_wall_groups_at_floors` partiría el muro en dos tramos y el caso pasaría a ser
+    # "la losa va entre dos tramos", que se resuelve recortando los muros). Con la losa
+    # apoyada en la cara, su borde queda a t/2 del plano medio, y para que haya recorte a
+    # TODA escala hace falta t/2 < media placa en la escala más gruesa: 1:20 da 3 cm, así
+    # que un muro de 20 cm no sirve para este caso y uno de 5 cm sí.
+    t = 0.05
+    b = _ObjBuilder()
+    b.box(0.0, t, 0.0, 6.0, 0.0, 5.0)            # muro oeste, entero de y=0 a y=6
+    b.box(8.0 - t, 8.0, 0.0, 6.0, 0.0, 5.0)      # muro este, idem
+    b.box(t, 8.0 - t, 3.0, 3.20, 0.5, 4.5)       # entrepiso a media altura
+    work, paneles, grupos, _ = _procesar(b.text(), scale)
+
+    losas = [p for p in paneles if grupos[p.source_group_id].category == "floor"
+             and grupos[p.source_group_id].min_y is not None
+             and abs(grupos[p.source_group_id].min_y - 3.0) < 0.05]
+    assert losas, "no se detectó el entrepiso"
+
+    media_placa_m = PLATE_THICKNESS_M * scale / 2.0
+    revisados = 0
+    for panel in losas:
+        g = grupos[panel.source_group_id]
+        marco = panel.frame
+        assert marco is not None, "el panel del entrepiso no trae marco 3D"
+        o, u, v = marco["origin"], marco["u_axis"], marco["v_axis"]
+
+        for w in work.groups:
+            if w.category != "wall" or w.min_y is None or w.max_y is None:
+                continue
+            # Sólo los muros que ATRAVIESAN el nivel de la losa.
+            if not (w.min_y < g.min_y - 0.05 and w.max_y > g.max_y + 0.05):
+                continue
+            n = normalize(w.representative_normal)
+            if abs(n.y) > 0.5:
+                continue
+            d_muro = mid_plane_offset(w, work.faces, n)
+            # Sólo los muros que la losa TOCA. Las tapas laterales de los cajones de muro
+            # también cruzan el nivel, pero la losa se queda a medio metro de ellas: ahí
+            # no hay encastre y recortar abriría una luz. Mismo criterio que el código.
+            bruto = [
+                dot(n, v)
+                for fi in g.face_indices
+                if 0 <= fi < len(work.faces)
+                for v in work.faces[fi].vertices
+            ]
+            if min(abs(min(bruto) - d_muro), abs(max(bruto) - d_muro)) > 0.30:
+                continue
+            # Borde de la pieza FINAL más cercano al plano de ese muro.
+            proy = [
+                n.x * (o["x"] + a * u["x"] + c * v["x"])
+                + n.y * (o["y"] + a * u["y"] + c * v["y"])
+                + n.z * (o["z"] + a * u["z"] + c * v["z"])
+                for a, c in ((0.0, 0.0), (marco["width_m"], 0.0),
+                             (marco["width_m"], marco["height_m"]), (0.0, marco["height_m"]))
+            ]
+            borde = min(proy, key=lambda p: abs(p - d_muro))
+            distancia_mm = abs(d_muro - borde) / scale * 1000.0
+            revisados += 1
+            assert distancia_mm == pytest.approx(1.5, abs=TOL_MM), (
+                f"1:{scale:.0f} el borde del entrepiso quedó a {distancia_mm:.2f}mm del "
+                f"plano medio del muro g{w.id} y debía quedar a 1.50mm: no entra"
+            )
+    assert revisados >= 2, f"sólo se midieron {revisados} muros continuos, debían ser 2"
+
+
+@pytest.mark.parametrize("scale", ESCALAS)
+def test_losa_de_base_no_se_recorta(scale):
+    """Sobre la losa de planta baja APOYAN los muros: no hay que achicarla.
+
+    Es la contraparte del caso anterior y lo que hace que la distinción importe: si se
+    recortara toda losa, la de base quedaría más chica que la huella del edificio.
+    """
+    t = 0.20
+    b = _ObjBuilder()
+    b.box(0.0, 8.0, 0.0, 0.20, 0.0, 5.0)         # losa de base
+    b.box(0.0, t, 0.20, 6.0, 0.0, 5.0)           # muros que NACEN sobre ella
+    b.box(8.0 - t, 8.0, 0.20, 6.0, 0.0, 5.0)
+    work, paneles, grupos, _ = _procesar(b.text(), scale)
+
+    base = [p for p in paneles if grupos[p.source_group_id].category == "floor"
+            and grupos[p.source_group_id].min_y is not None
+            and grupos[p.source_group_id].min_y < 0.05]
+    assert base, "no se detectó la losa de base"
+    for panel in base:
+        g = grupos[panel.source_group_id]
+        oriented = orient_group_normals_outward([g])
+        res = project_faces_to_2d(
+            [work.faces[i] for i in g.face_indices if i < len(work.faces)],
+            oriented.get(g.id, g.representative_normal),
+            "Y",
+        )
+        if res is None:
+            continue
+        recorte_mm = (res.width_m - panel.width_m) / scale * 1000.0
+        assert recorte_mm == pytest.approx(0.0, abs=1e-6), (
+            f"1:{scale:.0f} la losa de base se achicó {recorte_mm:.2f}mm, y los muros "
+            "apoyan sobre ella: no hay nada entre lo que entrar"
+        )
 
 
 @pytest.mark.parametrize("scale", ESCALAS)
