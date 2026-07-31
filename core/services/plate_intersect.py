@@ -55,12 +55,16 @@ def mid_plane_offset(group: GeometryGroup, faces: List[Face3D], n: Vec3) -> floa
     de 20 cm el promedio daba 0.0667 en vez de 0.100. Es la placa la que va en el plano
     medio, así que el punto medio geométrico es la referencia correcta.
     """
-    vals = [
-        dot(n, v)
-        for fi in group.face_indices
-        if 0 <= fi < len(faces)
-        for v in faces[fi].vertices
-    ]
+    return mid_plane_offset_faces(
+        [faces[fi] for fi in group.face_indices if 0 <= fi < len(faces)], n
+    )
+
+
+def mid_plane_offset_faces(group_faces: List[Face3D], n: Vec3) -> float:
+    """Igual que `mid_plane_offset` pero sobre una lista de caras ya resuelta, para los
+    consumidores que no tienen el GeometryGroup a mano (p. ej. el marco de proyección
+    que usa el instructivo)."""
+    vals = [dot(n, v) for f in group_faces for v in f.vertices]
     if not vals:
         return 0.0
     return (min(vals) + max(vals)) / 2.0
