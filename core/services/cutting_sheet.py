@@ -672,11 +672,27 @@ def shift_placement(placement: Dict, off_u: float, off_v: float,
     u = placement["u_axis"]
     v = placement["v_axis"]
     out = dict(placement)
+    # 1) Al marco crudo se le aplican los offsets de los recortes, que están en el marco
+    #    de la PROYECCIÓN (antes del espejado).
+    ox = o["x"] + off_u * u["x"] + off_v * v["x"]
+    oy = o["y"] + off_u * u["y"] + off_v * v["y"]
+    oz = o["z"] + off_u * u["z"] + off_v * v["z"]
+    # 2) El contorno del panel se ESPEJA antes de cortarse (mirror_edges_horizontal), para
+    #    que el quemado del láser quede del lado interior de la maqueta. O sea que las
+    #    coordenadas `u` de las aristas son `ancho - u_proyección`, y mapearlas al mundo
+    #    con `origin + u·u_axis` deja cada pieza asimétrica dada vuelta sobre su propio
+    #    eje: medido en un modelo real, hasta 2.49 m de desvío contra los 0.37 m de la
+    #    fórmula correcta. El espejado se hornea acá, en el marco: se corre el origen al
+    #    otro extremo y se invierte `u_axis`. Así `world = origin + u·u_axis + v·v_axis`
+    #    vale TAL CUAL para las coordenadas del panel, sin que el consumidor compense
+    #    nada — y por eso `mirrored` queda en False.
     out["origin"] = {
-        "x": o["x"] + off_u * u["x"] + off_v * v["x"],
-        "y": o["y"] + off_u * u["y"] + off_v * v["y"],
-        "z": o["z"] + off_u * u["z"] + off_v * v["z"],
+        "x": ox + width_m * u["x"],
+        "y": oy + width_m * u["y"],
+        "z": oz + width_m * u["z"],
     }
+    out["u_axis"] = {"x": -u["x"], "y": -u["y"], "z": -u["z"]}
+    out["mirrored"] = False
     out["width_m"] = width_m
     out["height_m"] = height_m
     # Área de la PIEZA que se corta (contorno menos aberturas). El front venía mostrando
