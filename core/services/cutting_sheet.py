@@ -712,14 +712,35 @@ def shift_placement(placement: Dict, off_u: float, off_v: float,
 def panel_cut_area_m2(edges: List[Edge2D], width_m: float, height_m: float) -> float:
     """Área de MATERIAL de la pieza (contorno menos aberturas), en m² de edificio.
 
-    Reusa `_edges_to_polygon`, que ya reconstruye exterior + huecos con shapely: sumar
-    las aristas a mano daría mal en cuanto el contorno no viniera ordenado, cosa que
-    después de los recortes y el espejado no está garantizada. Si el polígono no se
-    puede reconstruir se cae al bounding box, que es una cota superior honesta."""
-    poly = _edges_to_polygon([e for e in edges if not getattr(e, "flex", False)])
-    if poly is None or poly.area <= 1e-9:
+    Se polygoniza la sopa de aristas y se aplica la regla PAR-IMPAR: una región contenida
+    en un número par de otras es material, en un número impar es hueco. No sirve quedarse
+    con el polígono más grande y restarle lo de adentro (que es lo que hace
+    `_edges_to_polygon`, pensado para un contorno único): una pieza puede tener VARIAS
+    regiones sueltas, y así se perdían todas menos la mayor. Medido en un muro real de
+    7.74 m² de malla: se reportaban 1.87.
+
+    Si el polígono no se puede reconstruir se cae al bounding box, que es una cota
+    superior honesta."""
+    from shapely.geometry import LineString
+    from shapely.ops import polygonize, unary_union
+
+    segs = [
+        LineString([(e.a.x, e.a.y), (e.b.x, e.b.y)])
+        for e in edges
+        if not getattr(e, "flex", False) and not getattr(e, "score", False)
+    ]
+    if not segs:
         return width_m * height_m
-    return float(poly.area)
+    caras = sorted(polygonize(unary_union(segs)), key=lambda p: p.area, reverse=True)
+    if not caras:
+        return width_m * height_m
+    area = 0.0
+    for i, c in enumerate(caras):
+        p = c.representative_point()
+        contenida_en = sum(1 for j, o in enumerate(caras) if j != i and o.area > c.area and o.contains(p))
+        if contenida_en % 2 == 0:
+            area += c.area
+    return area if area > 1e-9 else width_m * height_m
 
 
 def build_placements(groups, faces: List[Face3D], up: UpAxis = "Y") -> Dict[str, Dict]:
