@@ -21,7 +21,11 @@ DEFAULT_MDF_THICKNESS_M = 0.003
 # Espesor físico de la placa de MDF, en metros de plancha. Fuente única de todo lo que
 # depende del MATERIAL. Se importa del mismo lugar que usa la ranura de encastre para que
 # tope y ranura no puedan desalinearse.
-from core.services.plate_intersect import PLATE_THICKNESS_M  # noqa: E402
+from core.services.plate_intersect import (  # noqa: E402
+    PLATE_THICKNESS_M,
+    mid_plane_offset,
+    pair_key,
+)
 
 # Ángulo mínimo entre dos muros para tratarlos como una unión real. Se importa del
 # detector (única definición) para que no quede una franja de uniones detectadas pero
@@ -84,6 +88,23 @@ class WallWallJoint:
 class AdjustmentsResult:
     adjustments: List[DimensionAdjustment]
     wall_wall_joints: List[WallWallJoint]
+
+
+def yield_by_pair(result: "AdjustmentsResult") -> Dict[Tuple[int, int], int]:
+    """`pair_key(a,b) -> id del grupo que cede`, para que la ranura use exactamente la
+    misma decisión que el recorte.
+
+    Se omiten las juntas sin resolver (cruces en medio de ambos muros): ahí no hay tope
+    que valga y `resolve_plate_joints` decide sola a quién le abre la ranura.
+    """
+    out: Dict[Tuple[int, int], int] = {}
+    for ww in result.wall_wall_joints:
+        if ww.yield_group_id is None:
+            continue
+        # Una misma pareja puede tener más de una junta detectada; la primera manda para
+        # que el resultado no dependa del orden de la lista.
+        out.setdefault(pair_key(ww.group_a, ww.group_b), ww.yield_group_id)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -337,24 +358,10 @@ def overshoot_past_plane_m(
 
 
 def _mid_plane_offset(group: GeometryGroup, faces: List[Face3D], n) -> float:
-    """Offset del plano MEDIO del grupo a lo largo de `n`: el punto medio entre sus dos
-    pieles, o sea (min + max) / 2 de las proyecciones.
-
-    NO es el promedio de los vértices: ese valor se sesga hacia la piel que tenga más
-    vértices (más teselada, o con aberturas) y da un plano que no es el medio. Con un muro
-    de 20 cm el promedio daba 0.0667 en vez de 0.100, y ese error de 3.3 cm se propagaba
-    al recorte del tope. Es la placa la que va en el plano medio, así que el punto medio
-    geométrico es la referencia correcta.
-    """
-    vals = [
-        n.x * v.x + n.y * v.y + n.z * v.z
-        for fi in group.face_indices
-        if 0 <= fi < len(faces)
-        for v in faces[fi].vertices
-    ]
-    if not vals:
-        return 0.0
-    return (min(vals) + max(vals)) / 2.0
+    """Plano medio del grupo a lo largo de `n`. Delega en la fuente única de
+    `plate_intersect` para que el tope y la ranura no puedan referirse a planos distintos
+    (ver `plate_intersect.mid_plane_offset`)."""
+    return mid_plane_offset(group, faces, n)
 
 
 def joint_position_frac(
