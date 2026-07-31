@@ -43,11 +43,11 @@ def validar_beneficio_cupon(
     has_discount = has_pct or has_amt
 
     if has_plan and has_discount:
-        raise ValueError("Indic? un plan o un descuento, no ambos")
+        raise ValueError("Indicó un plan o un descuento, no ambos")
     if not has_plan and not has_discount:
-        raise ValueError("Indic? plan_id o un descuento (porcentaje o monto)")
+        raise ValueError("Indicó plan_id o un descuento (porcentaje o monto)")
     if has_pct and has_amt:
-        raise ValueError("Indic? descuento_porcentaje o descuento_monto, no ambos")
+        raise ValueError("Indicó descuento_porcentaje o descuento_monto, no ambos")
 
 
 def resolve_fecha_inicio(fecha_inicio: datetime | None) -> datetime:
@@ -94,26 +94,26 @@ def assert_cupon_vigente(
     if not cupon.activo:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="El cup?n no est? activo",
+            detail="El cupón no está activo",
         )
 
     if cupon.fecha_inicio and moment < cupon.fecha_inicio:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="El cup?n a?n no est? vigente",
+            detail="El cupón aún no está vigente",
         )
 
     if cupon.fecha_expiracion and moment > cupon.fecha_expiracion:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="El cup?n expir?",
+            detail="El cupón expiró",
         )
 
     usos_totales = count_usos_totales(db, cupon.id)
     if usos_totales >= cupon.limite_usos:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="El cup?n alcanz? el l?mite de usos",
+            detail="El cupón alcanzó el límite de usos",
         )
 
     if usuario is not None:
@@ -121,7 +121,7 @@ def assert_cupon_vigente(
         if usos_usuario >= cupon.limite_usos_por_usuario:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Ya usaste este cup?n el m?ximo de veces permitido",
+                detail="Ya usaste este cupón el máximo de veces permitido",
             )
 
 
@@ -130,15 +130,42 @@ def get_cupon_por_codigo(db: Session, codigo: str) -> Cupon:
     if not normalized:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Ingres? un c?digo de cup?n",
+            detail="Ingresó un código de cupón",
         )
-    cupon = db.query(Cupon).filter(Cupon.codigo == normalized).first()
+    cupon = (
+        db.query(Cupon)
+        .filter(Cupon.codigo == normalized, Cupon.activo.is_(True))
+        .first()
+    )
+    if cupon is None:
+        cupon = db.query(Cupon).filter(Cupon.codigo == normalized).first()
     if cupon is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Cup?n no encontrado",
+            detail="Cupón no encontrado",
         )
     return cupon
+
+
+def assert_codigo_cupon_disponible(
+    db: Session,
+    codigo: str,
+    *,
+    excluir_cupon_id: uuid.UUID | None = None,
+) -> None:
+    """Impide crear/activar un cupón si ya hay otro activo con el mismo código."""
+    normalized = codigo.strip().upper()
+    query = db.query(Cupon).filter(
+        Cupon.codigo == normalized,
+        Cupon.activo.is_(True),
+    )
+    if excluir_cupon_id is not None:
+        query = query.filter(Cupon.id != excluir_cupon_id)
+    if query.first() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Ya existe un cupón activo con ese código",
+        )
 
 
 def calcular_precio_con_descuento(precio: float, cupon: Cupon) -> float:
@@ -181,9 +208,9 @@ def serialize_plan_brief(plan: Plan | None, db: Session | None = None) -> dict |
 
 def mensaje_cupon_valido(cupon: Cupon, plan: Plan | None) -> str:
     if cupon_tipo(cupon) == "plan" and plan is not None:
-        return f"Cup?n v?lido: acceso al plan {plan.nombre}"
+        return f"Cupón válido: acceso al plan {plan.nombre}"
     if cupon.descuento_porcentaje is not None:
-        return f"Cup?n v?lido: {float(cupon.descuento_porcentaje):g}% de descuento"
+        return f"Cupón válido: {float(cupon.descuento_porcentaje):g}% de descuento"
     if cupon.descuento_monto is not None:
-        return f"Cup?n v?lido: ${float(cupon.descuento_monto):g} de descuento"
-    return "Cup?n v?lido"
+        return f"Cupón válido: ${float(cupon.descuento_monto):g} de descuento"
+    return "Cupón válido"

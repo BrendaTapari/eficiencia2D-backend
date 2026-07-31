@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, joinedload
 from api.deps import get_admin_user, get_optional_current_user
 from api.services.plan_pricing import plan_tarifa
 from api.services.cupon_service import (
+    assert_codigo_cupon_disponible,
     assert_cupon_vigente,
     calcular_precio_con_descuento,
     count_usos_totales,
@@ -247,12 +248,7 @@ def crear_cupon(
     """Crea un cupón de plan o descuento. Solo admin."""
     plan = _validate_plan(db, body.plan_id)
 
-    existing = db.query(Cupon).filter(Cupon.codigo == body.codigo).first()
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Ya existe un cupón con ese código",
-        )
+    assert_codigo_cupon_disponible(db, body.codigo)
 
     fecha_inicio = resolve_fecha_inicio(body.fecha_inicio)
     is_plan_cupon = body.plan_id is not None
@@ -280,7 +276,7 @@ def crear_cupon(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="No se pudo crear el cupón (código duplicado o plan inválido)",
+            detail="Ya existe un cupón activo con ese código",
         ) from None
     except SQLAlchemyError:
         db.rollback()
@@ -447,10 +443,19 @@ def actualizar_cupon(
             db=db,
         )
 
+    if body.activo:
+        assert_codigo_cupon_disponible(db, cupon.codigo, excluir_cupon_id=cupon.id)
+
     cupon.activo = body.activo
 
     try:
         db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Ya existe un cupón activo con ese código",
+        ) from None
     except SQLAlchemyError:
         db.rollback()
         logger.exception("Error al actualizar cupón %s", cupon_id)

@@ -6,7 +6,7 @@ from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
 from dotenv import load_dotenv
-from sqlalchemy import Boolean, Column, Integer, String, Numeric, BigInteger, ForeignKey, DateTime, create_engine, text
+from sqlalchemy import Boolean, Column, Index, Integer, String, Numeric, BigInteger, ForeignKey, DateTime, create_engine, text
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from sqlalchemy.sql import func
@@ -177,6 +177,7 @@ def init_db() -> None:
     _migrate_usuario_google_schema()
     _migrate_proyectos_ultima_edicion_schema()
     _migrate_cupones_schema()
+    _migrate_cupones_codigo_activo_unico()
     _migrate_planes_contract_schema()
     _migrate_precios_plan_schema()
     _migrate_suscripciones_contract_schema()
@@ -476,7 +477,7 @@ def _migrate_cupones_schema() -> None:
         """
         CREATE TABLE IF NOT EXISTS cupones (
             id UUID PRIMARY KEY,
-            codigo VARCHAR NOT NULL UNIQUE,
+            codigo VARCHAR NOT NULL,
             descripcion VARCHAR,
             limite_usos INTEGER NOT NULL DEFAULT 1,
             limite_usos_por_usuario INTEGER NOT NULL DEFAULT 1,
@@ -510,6 +511,66 @@ def _migrate_cupones_schema() -> None:
         for sql in statements:
             conn.execute(text(sql))
     logger.info("Esquema de cupones verificado")
+
+
+def _migrate_cupones_codigo_activo_unico() -> None:
+    """Único solo entre cupones activos: permite reutilizar códigos inactivos."""
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'cupones_codigo_key'
+                    ) THEN
+                        ALTER TABLE cupones DROP CONSTRAINT cupones_codigo_key;
+                    END IF;
+                END $$
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                DO $$
+                DECLARE
+                    r RECORD;
+                BEGIN
+                    FOR r IN
+                        SELECT i.relname AS index_name
+                        FROM pg_index idx
+                        JOIN pg_class i ON i.oid = idx.indexrelid
+                        JOIN pg_class t ON t.oid = idx.indrelid
+                        WHERE t.relname = 'cupones'
+                          AND idx.indisunique
+                          AND NOT idx.indisprimary
+                          AND i.relname <> 'ix_cupones_codigo_activo'
+                          AND EXISTS (
+                              SELECT 1
+                              FROM pg_attribute a
+                              WHERE a.attrelid = t.oid
+                                AND a.attnum = ANY (idx.indkey)
+                                AND a.attname = 'codigo'
+                          )
+                    LOOP
+                        EXECUTE format('DROP INDEX IF EXISTS %I', r.index_name);
+                    END LOOP;
+                END $$
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS ix_cupones_codigo_activo
+                ON cupones (codigo)
+                WHERE activo IS TRUE
+                """
+            )
+        )
+    logger.info("Índice único de cupones activos (codigo) verificado")
 
 
 def _migrate_planes_contract_schema() -> None:
@@ -900,9 +961,17 @@ class ConfiguracionUsuario(Base):
 
 class Cupon(Base):
     __tablename__ = 'cupones'
+    __table_args__ = (
+        Index(
+            "ix_cupones_codigo_activo",
+            "codigo",
+            unique=True,
+            postgresql_where=text("activo IS TRUE"),
+        ),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    codigo = Column(String, unique=True, nullable=False)
+    codigo = Column(String, nullable=False)
     descripcion = Column(String, nullable=True)
     limite_usos = Column(Integer, nullable=False, default=1)
     limite_usos_por_usuario = Column(Integer, nullable=False, default=1)

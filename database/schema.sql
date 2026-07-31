@@ -77,7 +77,7 @@ CREATE TABLE configuraciones_usuario (
 
 CREATE TABLE cupones (
     id UUID PRIMARY KEY,
-    codigo VARCHAR NOT NULL UNIQUE,
+    codigo VARCHAR NOT NULL,
     descripcion VARCHAR,
     limite_usos INTEGER NOT NULL DEFAULT 1,
     limite_usos_por_usuario INTEGER NOT NULL DEFAULT 1,
@@ -91,6 +91,8 @@ CREATE TABLE cupones (
     fecha_creacion TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT fk_cupones_plan FOREIGN KEY (plan_id) REFERENCES planes (id)
 );
+
+CREATE UNIQUE INDEX ix_cupones_codigo_activo ON cupones (codigo) WHERE activo IS TRUE;
 
 CREATE TABLE usos_cupon (
     id UUID PRIMARY KEY,
