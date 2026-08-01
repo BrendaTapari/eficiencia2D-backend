@@ -434,10 +434,10 @@ def _render_sheets_page(
             cs.append("0.3 w")
             cur_color = None
             for edge in edges:
-                # Los encastres (joint) NO se dibujan en la lámina de corte (van al visor
-                # 3D vía plate_joints). Evita el verde/negro espurio en la plancha.
-                if getattr(edge, "joint", False):
-                    continue
+                # Las aristas de encastre SE CORTAN: una ranura es un corte interior, un
+                # rectángulo cerrado dentro de la pieza, y es lo que sostiene el encastre.
+                # Acá había un `continue` que las descartaba —igual que en el DXF— así que
+                # el taller recibía las piezas sin ninguna ranura.
                 if getattr(edge, "flex", False):
                     color = "0 0 0 RG"            # negro: patrón de flexión (kerf/auxético) — corte
                 elif getattr(edge, "score", False):
