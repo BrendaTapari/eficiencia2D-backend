@@ -1,6 +1,6 @@
 import math
 from typing import List, Dict, Optional, Literal, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Importamos nuestros tipos y servicios
 from core.services.types import Face3D, normalize
@@ -94,6 +94,9 @@ class WallWallJoint:
 class AdjustmentsResult:
     adjustments: List[DimensionAdjustment]
     wall_wall_joints: List[WallWallJoint]
+    # Decisiones del usuario que llegaron apuntando a una junta que no es la suya.
+    # Texto listo para mostrar; vacío = todas las decisiones se aplicaron.
+    decisiones_ignoradas: List[str] = field(default_factory=list)
 
 
 def yield_by_pair(result: "AdjustmentsResult") -> Dict[Tuple[int, int], int]:
@@ -133,6 +136,7 @@ def compute_adjustments(
 
     adjustments: List[DimensionAdjustment] = []
     wall_wall_joints: List[WallWallJoint] = []
+    decisiones_ignoradas: List[str] = []
 
     for ji, joint in enumerate(joints):
         # Muro-muro admite uniones OBLICUAS (ver MIN_JOINT_ANGLE_DEG); muro-losa sigue
@@ -271,6 +275,28 @@ def compute_adjustments(
             # cortar y la maqueta no se pueda armar si el usuario no repasa cada cruce.
             # Su elección manual, cuando existe, tiene prioridad.
             decision = wall_wall_decisions_map.get(ji)
+            if decision is not None and decision not in (g_a.id, g_b.id):
+                # La decisión llegó apuntando a esta junta pero nombra un grupo que no
+                # participa de ella. Pasa porque el índice de junta es POSICIONAL y
+                # `detect_joints` reconstruye la lista entera en cada edición (fusión,
+                # división, cambio de eje o de área mínima): una decisión guardada como
+                # {índice → grupo} queda apuntando a OTRA junta.
+                #
+                # Sin este corte el daño era doble y silencioso: `other_group_id` caía en
+                # la rama `else` y se recortaba un muro ajeno contra un vecino que no le
+                # corresponde, mientras la junta que el usuario sí resolvió se quedaba
+                # sin recorte. O sea: aparecía un recorte donde nadie lo pidió y faltaba
+                # donde sí. Se descarta y se avisa.
+                decisiones_ignoradas.append(
+                    f"La decisión sobre {group_by_id[decision].label or decision} "
+                    f"no corresponde a la junta {g_a.label or g_a.id} / "
+                    f"{g_b.label or g_b.id}: se resolvió automáticamente. "
+                    "Volvé a elegir quién cede en esa unión."
+                    if decision in group_by_id else
+                    f"Una decisión apunta al grupo {decision}, que ya no existe: la junta "
+                    f"{g_a.label or g_a.id} / {g_b.label or g_b.id} se resolvió sola."
+                )
+                decision = None
             if decision is None:
                 decision = suggested_yield_group_id
             if decision is None and (a_at_end or b_at_end):
@@ -358,7 +384,9 @@ def compute_adjustments(
         list(seen_height.values()) + list(seen_height_top.values()) + kept_width
     )
     return AdjustmentsResult(
-        adjustments=final_adjustments, wall_wall_joints=wall_wall_joints
+        adjustments=final_adjustments,
+        wall_wall_joints=wall_wall_joints,
+        decisiones_ignoradas=decisiones_ignoradas,
     )
 
 
