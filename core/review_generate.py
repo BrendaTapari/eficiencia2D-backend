@@ -274,6 +274,70 @@ def apply_merges(
     )
 
 
+def _aplicar_muescas(edges, width_m, height_m, muescas):
+    """Resta del material de la pieza una franja por cada vecino, acotada a su banda.
+
+    Devuelve `(edges, width_m, height_m, offset_u, offset_v)` o None si no cambia nada.
+
+    Cuando una muesca abarca toda la altura, el resultado es el recorte de borde de
+    siempre y el ancho baja. Cuando abarca sólo una banda, la pieza conserva su ancho y
+    queda con una entrada: es lo que hace falta cuando dos vecinos distintos llegan al
+    mismo extremo a alturas distintas.
+    """
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+
+    material = _material_de_la_pieza(edges)
+    if material is None or material.is_empty:
+        return None
+
+    quitar = []
+    for izquierda, prof, v_lo, v_hi in muescas:
+        prof = min(prof, width_m - 0.01)
+        if prof <= 0.001 or v_hi - v_lo <= 0.001:
+            continue
+        # Se extiende un pelo fuera del panel en v para que la resta no deje una película
+        # de material en los bordes por redondeo.
+        lo = v_lo - 1e-6 if v_lo <= 1e-6 else v_lo
+        hi = v_hi + 1e-6 if v_hi >= height_m - 1e-6 else v_hi
+        if izquierda:
+            quitar.append(Polygon([(-1e-6, lo), (prof, lo), (prof, hi), (-1e-6, hi)]))
+        else:
+            quitar.append(
+                Polygon([(width_m - prof, lo), (width_m + 1e-6, lo),
+                         (width_m + 1e-6, hi), (width_m - prof, hi)])
+            )
+    if not quitar:
+        return None
+
+    resto = material.difference(unary_union(quitar))
+    if resto.is_empty or resto.area <= 1e-9:
+        return None
+
+    geoms = [g for g in getattr(resto, "geoms", [resto]) if getattr(g, "area", 0.0) > 1e-9]
+    if not geoms:
+        return None
+    minx = min(g.bounds[0] for g in geoms)
+    miny = min(g.bounds[1] for g in geoms)
+    maxx = max(g.bounds[2] for g in geoms)
+    maxy = max(g.bounds[3] for g in geoms)
+
+    nuevas: List[Edge2D] = []
+    for g in geoms:
+        anillos = [(list(g.exterior.coords), False)]
+        anillos += [(list(h.coords), True) for h in g.interiors]
+        for coords, es_hueco in anillos:
+            for i in range(len(coords) - 1):
+                (ax, ay), (bx, by) = coords[i], coords[i + 1]
+                nuevas.append(
+                    Edge2D(a=Vec2(ax - minx, ay - miny),
+                           b=Vec2(bx - minx, by - miny), hole=es_hueco)
+                )
+    if not nuevas:
+        return None
+    return nuevas, maxx - minx, maxy - miny, minx, miny
+
+
 def _material_de_la_pieza(edges: List[Edge2D]):
     """Polígono del MATERIAL de la pieza a partir de sus aristas (contorno menos huecos).
 
@@ -705,12 +769,20 @@ def decompose_panels_from_groups(
                     clip_off_u += clipped.get("offset_u", 0.0)
                     clip_off_v += clipped.get("offset_v", 0.0)
 
-        # Un mismo BORDE se recorta UNA sola vez, con el ajuste mayor. Antes se aplicaba
-        # un recorte por junta: un muro que cede en varias juntas del mismo lado perdía
-        # la suma de todas (p. ej. 10.3mm en vez de 5.2mm), y la pieza quedaba corta.
-        # El lado se decide en el marco ORIGINAL del panel, antes de cualquier clip, para
-        # que todas las juntas se comparen entre sí de forma coherente.
-        por_borde: Dict[bool, float] = {}
+        # El recorte lateral es una MUESCA acotada a la banda donde el vecino existe, no
+        # un recorte del borde entero.
+        #
+        # Antes se guardaba un solo recorte por borde, el mayor. Cuando dos vecinos
+        # distintos llegan al MISMO extremo pero a alturas distintas —una fachada que
+        # arriba topa con un muro y abajo con otro, separados 20 cm— ganaba el recorte
+        # mayor y se aplicaba a toda la altura: la pieza perdía 4.00 mm de material donde
+        # el vecino de abajo sí necesitaba que llegara. Medido: 9 de 22 bordes con varios
+        # vecinos salían mal, contra 6 de 68 con uno solo.
+        #
+        # Restar rectángulos también resuelve de raíz la acumulación que motivó aquel
+        # "un recorte por borde": restar dos veces la misma zona no acumula, y restar dos
+        # zonas distintas es justamente lo que hace falta.
+        muescas: List[Tuple[bool, float, float, float]] = []
         for w_adj in width_adjs.get(group.id, []):
             if w_adj.delta >= 0 and w_adj.delta_plate >= 0:
                 continue
@@ -722,33 +794,33 @@ def decompose_panels_from_groups(
             j = phase1.joints[w_adj.joint_index]
             u_j = dot(j.edge_mid, result.u_axis) - result.origin_u
             izquierda = u_j < result.width_m / 2
-            if recorte > por_borde.get(izquierda, 0.0):
-                por_borde[izquierda] = recorte
+            # Banda que ocupa el VECINO sobre el eje v del panel. Se mide proyectando sus
+            # vértices, no tomando su altura en el mundo: así vale para paneles
+            # inclinados, donde v no es la vertical.
+            otro = group_by_id.get(w_adj.against_group_id)
+            v_lo, v_hi = 0.0, height_m
+            if otro is not None:
+                proy = [
+                    dot(v, result.v_axis) - result.origin_v - clip_off_v
+                    for fi in otro.face_indices
+                    if 0 <= fi < len(phase1.faces)
+                    for v in phase1.faces[fi].vertices
+                ]
+                if proy:
+                    v_lo, v_hi = max(min(proy), 0.0), min(max(proy), height_m)
+            if v_hi - v_lo > 0.001:
+                muescas.append((izquierda, recorte, v_lo, v_hi))
 
-        for joint_on_left, recorte in por_borde.items():
-            strip = min(recorte, width_m - 0.01)
-            if strip <= 0.001:
-                continue
-            # El material se saca del extremo DONDE ESTÁ LA JUNTA. Las dos ramas estaban
-            # invertidas: con la junta en el extremo bajo se recortaba el alto y al revés.
-            # La pieza salía con el largo correcto pero desplazada el recorte entero, así
-            # que en la junta se metía dentro del vecino y en el extremo libre no llegaba
-            # — los dos síntomas reportados a la vez. `clip_panel_at_u(cut, keep_above)`:
-            # keep_above=True conserva u >= cut (quita el extremo BAJO); keep_above=False
-            # conserva u <= cut (quita el ALTO). Las ramas de altura ya lo hacían bien.
-            clipped = (
-                clip_panel_at_u(edges, strip, True)
-                if joint_on_left
-                else clip_panel_at_u(edges, width_m - strip, False)
-            )
-            if clipped:
-                width_m, height_m, edges = (
-                    clipped["width_m"],
-                    clipped["height_m"],
-                    clipped["edges"],
-                )
-                clip_off_u += clipped.get("offset_u", 0.0)
-                clip_off_v += clipped.get("offset_v", 0.0)
+        if muescas:
+            # El material se saca del extremo DONDE ESTÁ LA JUNTA. Las dos ramas del clip
+            # estaban invertidas en su momento: la pieza salía con el largo correcto pero
+            # desplazada el recorte entero, así que en la junta se metía dentro del vecino
+            # y en el extremo libre no llegaba.
+            recortado = _aplicar_muescas(edges, width_m, height_m, muescas)
+            if recortado:
+                edges, width_m, height_m, off_u, off_v = recortado
+                clip_off_u += off_u
+                clip_off_v += off_v
 
         # Recorte EN EL PLANO de la pieza contra un grupo continuo (axis="plane"): el caso
         # del entrepiso que tiene que ENTRAR entre dos muros que siguen de largo por
