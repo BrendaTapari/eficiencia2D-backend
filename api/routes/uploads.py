@@ -160,7 +160,24 @@ def serialize_topology(
     result: Phase1Result,
     panel_id_by_group: Optional[Dict] = None,
     overrides: Optional[Dict[int, str]] = None,
+    *,
+    scale_denom: Optional[float] = None,
+    wall_wall_decisions: Optional[Dict[int, int]] = None,
 ) -> Dict:
+    """Topología para el front. Con `scale_denom`, `placements` son las piezas RECORTADAS.
+
+    Por qué depende de la escala
+    ----------------------------
+    Un instructivo fiel no puede ser independiente de la escala. Los recortes de encaje
+    valen 3 mm de MDF siempre, y esos 3 mm son 15 cm de edificio a 1:50 y 60 cm a 1:200.
+    `build_placements` proyecta el modelo crudo y por eso NO conoce ninguno de esos
+    recortes: medido sobre un modelo real, dibujaba 19 de 28 piezas más grandes de lo que
+    se cortaba a 1:50, y 21 de 28 a 1:100, con excesos de hasta 17.8 mm de plancha.
+
+    El campo se llama igual en los dos casos a propósito —el front no tiene que cambiar
+    de nombre— pero `placements_fieles` dice cuál es cuál. Sin ese flag las dos respuestas
+    son indistinguibles y dibujar la equivocada no falla: sólo miente.
+    """
     # `groups` viaja con la categoría original (el front lleva su propio estado de
     # overrides para la lista de componentes); placements y assembly_steps, en cambio,
     # deben respetarlos, porque de ahí sale el instructivo de armado.
@@ -181,12 +198,35 @@ def serialize_topology(
         # Marco de proyección 3D por pieza (instructivo de armado): group_id -> {origin,
         # u_axis, v_axis, normal, width_m, height_m, mirrored}. world = origin + u·u_axis
         # + v·v_axis. Caras en el mismo espacio que faces_packed (eje Y).
+        # Se reemplaza más abajo por las piezas recortadas si vino `scale_denom`.
         "placements": build_placements(groups_eff, result.faces, "Y"),
+        # false = son la proyección CRUDA del modelo y las piezas salen más grandes de lo
+        # que se corta. No sirven para decidir si algo encaja. Ver el docstring.
+        "placements_fieles": False,
         "assembly_steps": compute_assembly_steps(groups_eff),
         # Curvatura por grupo (contrato §2.1): el front marca componentes curvos y
         # sugiere método kerf (simple) / auxético (doble) + spacing inicial.
         "curvature": build_curvature_map(result.groups, result.faces),
     }
+    if scale_denom:
+        # Se descompone a la escala pedida y se devuelven los marcos de las piezas tal
+        # como se van a cortar. Es el MISMO dato que `/nesting-preview.placements`; vive
+        # también acá para que el instructivo no tenga que pedir el nesting entero sólo
+        # para poder dibujar bien.
+        from core.review_generate import placements_fieles
+
+        try:
+            topo["placements"] = placements_fieles(
+                result, scale_denom, overrides, wall_wall_decisions
+            )
+            topo["placements_fieles"] = True
+            # Espesor de la placa en metros de EDIFICIO: 3 mm de MDF son 0.15 m a 1:50 y
+            # 0.60 m a 1:200. Dibujar las piezas sin espesor esconde justo los choques
+            # que el espesor provoca.
+            topo["plate_thickness_m"] = PLATE_THICKNESS_M * scale_denom
+        except Exception:
+            logger.exception("[topology] no se pudieron calcular placements fieles")
+
     if panel_id_by_group is not None:
         topo["panel_id_by_group"] = {str(k): v for k, v in panel_id_by_group.items()}
     return topo
@@ -502,6 +542,11 @@ class RecomputeRequest(BaseModel):
     # Recategorizaciones del usuario (id de grupo -> "wall"/"floor"/"discard"). Sin
     # esto, el instructivo seguía mostrando los componentes descartados en el visor.
     overrides: Optional[Dict[int, str]] = None
+    # Escala a la que se va a cortar. Con ella, `placements` sale con las medidas de las
+    # piezas YA RECORTADAS y `placements_fieles` viene en true; sin ella no hay respuesta
+    # fiel posible y se devuelve la proyección cruda del modelo (ver serialize_topology).
+    scale_denom: Optional[float] = None
+    wall_wall_decisions: Optional[Dict[int, int]] = None
 
 
 class NestingPreviewRequest(BaseModel):
@@ -862,7 +907,11 @@ async def recompute_endpoint(
         return JSONResponse(
             content={
                 "topology": serialize_topology(
-                    merged, pid_by_group, request.overrides
+                    merged,
+                    pid_by_group,
+                    request.overrides,
+                    scale_denom=request.scale_denom,
+                    wall_wall_decisions=request.wall_wall_decisions,
                 )
             }
         )
