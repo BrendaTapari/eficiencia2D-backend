@@ -48,7 +48,12 @@ ESCALAS = (50.0, 100.0)
 # test falla y hay que decir por qué. Bajar los choques es una mejora y se actualiza el
 # número en el mismo commit que la produce; subirlos es una regresión.
 LINEA_BASE = {
-    "demo.obj": {"piezas": 43, "choques": {50.0: 4, 100.0: 2}},
+    # 1:100 pasó de 2 a 4 al cerrar las esquinas con las dos piezas: el muro pasante
+    # crece hasta la cara exterior de su vecina, y al crecer toca piezas cuya junta el
+    # detector NO ve (causa "no_detectada": A1/A4, A1/A5, A19/A20). No es la matemática
+    # del recorte: es el hueco de detección, que sigue abierto. A cambio, el invariante
+    # de esquina pasó de 25 a 33 bordes correctos en este mismo archivo y escala.
+    "demo.obj": {"piezas": 43, "choques": {50.0: 4, 100.0: 4}},
 }
 
 
@@ -273,3 +278,118 @@ def test_el_instructivo_dibuja_la_pieza_que_se_corta(path, scale):
         "recortadas en TODAS. O el modelo no tiene ni una junta, o alguien igualó las "
         "dos funciones y este test dejó de comprobar algo."
     )
+
+
+@pytest.mark.skipif(not MODELOS, reason="no hay modelos disponibles")
+@pytest.mark.parametrize("path", MODELOS, ids=lambda p: p.name)
+@pytest.mark.parametrize("scale", ESCALAS)
+def test_ninguna_pieza_lleva_aristas_de_largo_cero(path, scale):
+    """Una arista de largo cero es un artefacto: no corta nada y rompe el contorno.
+
+    Salían de los cierres de recorte cuando la línea de corte caía sobre una arista que
+    ya existía. En `31232804-casa.obj` a 1:100 eran 10 de 116 aristas.
+    """
+    _work, walls, floors, _pjs = _procesar(path, scale)
+    for p in walls + floors:
+        for e in p.edges:
+            assert (abs(e.a.x - e.b.x) > 1e-9 or abs(e.a.y - e.b.y) > 1e-9), (
+                f"{p.id}: arista de largo cero en ({e.a.x:.4f}, {e.a.y:.4f})"
+            )
+
+
+# Bordes de esquina que NO caen a media placa del plano medio de su vecina, por modelo
+# y escala: (correctos, mal). Ver el test de abajo.
+LINEA_BASE_ENCAJE = {
+    "demo.obj": {50.0: (32, 44), 100.0: (33, 43)},
+}
+
+
+def _bordes_de_esquina(path, scale, tol_mm=0.2):
+    """Mide el invariante de esquina en cada junta muro-muro resuelta.
+
+    Una esquina la cierran las DOS piezas: la que cede va a la cara interior de su vecina
+    y la que pasa a la cara exterior de la que cede. En los dos casos el borde queda a
+    MEDIA PLACA del plano medio del vecino, así que el invariante no depende de quién
+    ceda — que es lo que hace falta, porque eso lo elige el usuario en el visor y puede
+    invertirse en cualquier cruce.
+
+    Devuelve (correctos, [(pieza, error_mm)]).
+    """
+    from core.services.assembly_adjuster import compute_adjustments
+    from core.services.plate_intersect import mid_plane_offset
+    from core.services.types import Vec3, dot, normalize
+
+    work, walls, _floors, _pjs = _procesar(path, scale)
+    pan = {p.source_group_id: p for p in walls}
+    gby = {g.id: g for g in work.groups}
+    res = compute_adjustments(work.joints, work.groups, None, work.faces)
+    media = PLATE_THICKNESS_M * scale / 2.0
+    bien, mal = 0, []
+
+    for ww in res.wall_wall_joints:
+        if ww.yield_group_id is None:
+            continue
+        for gid in (ww.group_a, ww.group_b):
+            otro = gby.get(ww.group_b if gid == ww.group_a else ww.group_a)
+            p = pan.get(gid)
+            if p is None or not p.frame or otro is None:
+                continue
+            m = p.frame
+            u = Vec3(m["u_axis"]["x"], m["u_axis"]["y"], m["u_axis"]["z"])
+            n = normalize(otro.representative_normal)
+            if abs(dot(u, n)) < 0.7:      # no se encuentran de punta
+                continue
+            o = Vec3(m["origin"]["x"], m["origin"]["y"], m["origin"]["z"])
+            d = mid_plane_offset(otro, work.faces, n)
+            cerca = min(
+                (dot(Vec3(o.x + u.x * uu, o.y + u.y * uu, o.z + u.z * uu), n) - d
+                 for uu in (0.0, m["width_m"])),
+                key=abs,
+            )
+            err = (abs(cerca) - media) / scale * 1000.0
+            if abs(err) <= tol_mm:
+                bien += 1
+            else:
+                mal.append((p.id, err))
+    return bien, mal
+
+
+@pytest.mark.skipif(not MODELOS, reason="no hay modelos disponibles")
+@pytest.mark.parametrize("path", MODELOS, ids=lambda p: p.name)
+@pytest.mark.parametrize("scale", ESCALAS)
+def test_las_esquinas_las_cierran_las_dos_piezas(path, scale):
+    """Cada borde de esquina a media placa del plano medio de su vecina.
+
+    Reemplaza a un test que medía si la pieza era igual al hueco LIBRE entre sus dos
+    vecinas. Ese criterio da por sentada una convención —"la pieza entra entre las
+    otras"— y no se puede dar por sentada: el front le pregunta al usuario en cada cruce
+    cuál se acorta, y puede elegir la pasante o la vecina. Éste vale para las dos, porque
+    mide la distancia al plano medio, que es media placa en los dos roles.
+
+    Origen: el usuario midió con la regla sobre el DXF que una pieza que debía medir
+    69 mm medía 72. La causa era que sólo se ajustaba el muro que CEDE; el que pasa se
+    quedaba con el largo del modelo, que llega hasta la piel del muro macizo, y a escalas
+    gruesas eso queda corto (a 1:100 media placa son 15 cm de edificio y el muro asoma 1).
+    La pieza salía de eje a eje de sus vecinas: le sobraban 3 mm para entrar entre ellas y
+    le faltaban 2.8 para pasarles por encima.
+
+    Es una LÍNEA BASE del estado real, no un objetivo cumplido. Bajarla es el trabajo.
+    """
+    base = LINEA_BASE_ENCAJE.get(path.name)
+    if base is None or scale not in base:
+        pytest.skip(f"{path.name} 1:{scale:.0f} no tiene línea base de encaje")
+
+    bien, mal = _bordes_de_esquina(path, scale)
+    esp_bien, esp_mal = base[scale]
+
+    assert len(mal) <= esp_mal and bien >= esp_bien, (
+        f"{path.name} 1:{scale:.0f}: {bien} bordes correctos y {len(mal)} mal; la línea "
+        f"base dice {esp_bien} y {esp_mal}. REGRESIÓN. Peores: "
+        + str(sorted(mal, key=lambda x: -abs(x[1]))[:5])
+    )
+    if len(mal) < esp_mal or bien > esp_bien:
+        pytest.fail(
+            f"{path.name} 1:{scale:.0f}: {bien} correctos / {len(mal)} mal contra "
+            f"{esp_bien} / {esp_mal} de la línea base. Es una MEJORA: actualizá "
+            "LINEA_BASE_ENCAJE en este mismo commit."
+        )
