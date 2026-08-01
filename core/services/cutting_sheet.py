@@ -1377,11 +1377,14 @@ def emit_panel_entities(
     label_dims: Optional[Tuple[float, float]] = None,
 ):
     for edge in edges:
-        # Los encastres (joint) NO se dibujan en la lámina de corte: son geometría de
-        # ensamble (van en el array plate_joints para el visor 3D), no en el corte del
-        # taller. Evita el "verde" espurio en la plancha.
-        if getattr(edge, "joint", False):
-            continue
+        # NOTA HISTÓRICA: acá había un `continue` que descartaba las aristas de encastre,
+        # con el argumento de que eran "geometría de ensamble, no del corte". Era falso y
+        # grave: una ranura es un CORTE INTERIOR —un rectángulo cerrado dentro de la
+        # pieza— y es lo único que sostiene, por ejemplo, un entrepiso metido entre dos
+        # muros continuos. Con ese `continue`, las ranuras se calculaban, se reportaban al
+        # visor y hasta se usaban para excusar interpenetraciones en la verificación...
+        # y no llegaban a la plancha. Medido en un modelo real: 16 aristas de ranura
+        # calculadas, 0 en el DXF. La rama `elif joint` de más abajo quedaba muerta.
         if getattr(edge, "flex", False):
             # Patrón de flexión (kerf/auxético): SE CORTA. Capa propia FLEX_CUT en negro
             # (color de corte) para que el láser lo corte y el material pueda plegarse.
