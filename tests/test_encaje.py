@@ -485,61 +485,33 @@ def _modelo_cruce_en_extremo(t=0.20, largo=8.0, alto=3.0, fondo=3.0):
 
 
 @pytest.mark.parametrize("scale", ESCALAS)
-def test_recorte_y_ranura_eligen_la_misma_placa(scale):
-    """La placa que se acorta y la que recibe la ranura son la misma.
+def test_una_junta_nunca_lleva_tope_Y_ranura(scale):
+    """Los dos mecanismos son EXCLUYENTES: si un tope resolvió la junta, no va ranura.
 
-    GUARDA, no reproducción: sobre dos muros sintéticos este caso también pasaba ANTES
-    del arreglo, porque la regla de posición (quién tiene un extremo en la junta) decide
-    sola y las reglas de `choose_wall_wall_yielder` donde las dos rutas discrepaban ni
-    siquiera llegan a correr. El desacuerdo real (7 de 15 pares) aparece con topologías de
-    3+ muros. Lo que sí queda cerrado acá es que un cambio futuro no pueda volver a
-    separar las dos decisiones sin que el banco se entere.
-    """
-    work, _, _, plate_joints = _procesar(_modelo_cruce_en_extremo(), scale)
-    ceden = _decisiones(work)
+    Es la forma fuerte de la garantía que antes se pedía más débil ("que el recorte y la
+    ranura elijan la misma placa"). Podían contradecirse porque cada uno decidía por su
+    cuenta; se contradecían en 7 de 15 pares de un modelo real, y ése era el fallo del par
+    255/261. Ahora directamente no pueden coexistir sobre la misma junta: acortar una
+    placa alcanza, y abrir además una ranura sólo debilita la pieza y deja un agujero.
 
-    comparables = 0
-    for pj in plate_joints:
-        k = pair_key(pj.cutter_id, pj.cut_id)
-        if k not in ceden:
-            # Cruce en medio de AMBOS muros: no hay tope, sólo ranura. Sin decisión que
-            # respetar, y así debe ser.
-            continue
-        comparables += 1
-        assert pj.cut_id == ceden[k], (
-            f"1:{scale:.0f} par {k}: se acorta g{ceden[k]} pero la ranura va a "
-            f"g{pj.cut_id}. Se saca material de una placa y se abre la ranura en la otra."
-        )
-    assert comparables, "el modelo de cruce en extremo no generó ninguna ranura comparable"
-
-
-@pytest.mark.parametrize("scale", ESCALAS)
-def test_la_decision_del_usuario_llega_a_la_ranura(scale):
-    """Si el usuario cambia quién cede en el visor, la ranura tiene que seguirlo.
-
-    `resolve_plate_joints` ni siquiera recibía `wall_wall_decisions`: la elección movía
-    el recorte y dejaba la ranura donde estaba. Es el síntoma de "la intersección entre
-    A10 y A3 no está resuelta pese a que en el selector hay una decisión tomada".
+    Se prueba también con el usuario forzando la decisión contraria, porque la ranura
+    ignoraba `wall_wall_decisions` por completo: la elección movía el recorte y dejaba la
+    ranura donde estaba.
     """
     obj = _modelo_cruce_en_extremo()
     work_auto, _, _, _ = _procesar(obj, scale)
-    forzado = _forzar_lo_contrario(work_auto)
-    assert forzado, "el modelo de cruce en extremo no ofreció ninguna junta para elegir"
 
-    work, _, _, plate_joints = _procesar(obj, scale, wall_wall_decisions=forzado)
-    ceden = _decisiones(work, forzado)
-
-    comparables = 0
-    for pj in plate_joints:
-        k = pair_key(pj.cutter_id, pj.cut_id)
-        if k not in ceden:
-            continue
-        comparables += 1
-        assert pj.cut_id == ceden[k], (
-            f"1:{scale:.0f} par {k}: el usuario eligió acortar g{ceden[k]}, pero la "
-            f"ranura se abrió en g{pj.cut_id}"
-        )
-    assert comparables, "ninguna ranura quedó ligada a la decisión del usuario"
+    for etiqueta, decisiones in (("automático", None),
+                                 ("usuario elige lo contrario", _forzar_lo_contrario(work_auto))):
+        work, _, _, plate_joints = _procesar(obj, scale, wall_wall_decisions=decisiones)
+        ceden = _decisiones(work, decisiones)
+        for pj in plate_joints:
+            k = pair_key(pj.cutter_id, pj.cut_id)
+            assert k not in ceden, (
+                f"1:{scale:.0f} ({etiqueta}) el par {k} tiene tope —cede g{ceden.get(k)}— "
+                f"y además ranura en g{pj.cut_id}: se le quita material dos veces"
+            )
+        assert ceden, f"1:{scale:.0f} ({etiqueta}) el modelo no resolvió ninguna junta"
 
 
 def test_el_plano_de_la_ranura_es_el_mismo_que_el_del_recorte():
