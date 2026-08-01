@@ -821,6 +821,36 @@ def decompose_panels_from_groups(
                 edges, width_m, height_m, off_u, off_v = recortado
                 clip_off_u += off_u
                 clip_off_v += off_v
+            else:
+                # La muesca necesita el POLÍGONO del material y hay piezas cuyo contorno no
+                # cierra: cuando una abertura llega al borde (una puerta que baja hasta el
+                # piso) las jambas salen colapsadas y no hay cara que recortar. Ahí se cae
+                # al recorte de borde entero de siempre, que sólo mira las aristas.
+                #
+                # Perder el recorte NO es una opción: al introducir la muesca, 4 piezas de
+                # un modelo del corpus se quedaron sin ningún recorte —8.00 m en vez de
+                # 7.40— y aparecieron 3 choques donde no había ninguno. Una muesca que no
+                # se puede calcular tiene que degradar al comportamiento anterior, nunca a
+                # no recortar.
+                por_borde: Dict[bool, float] = {}
+                for izquierda, prof, _v_lo, _v_hi in muescas:
+                    if prof > por_borde.get(izquierda, 0.0):
+                        por_borde[izquierda] = prof
+                for izquierda, prof in por_borde.items():
+                    strip = min(prof, width_m - 0.01)
+                    if strip <= 0.001:
+                        continue
+                    clipped = (
+                        clip_panel_at_u(edges, strip, True)
+                        if izquierda
+                        else clip_panel_at_u(edges, width_m - strip, False)
+                    )
+                    if clipped:
+                        width_m = clipped["width_m"]
+                        height_m = clipped["height_m"]
+                        edges = clipped["edges"]
+                        clip_off_u += clipped.get("offset_u", 0.0)
+                        clip_off_v += clipped.get("offset_v", 0.0)
 
         # Recorte EN EL PLANO de la pieza contra un grupo continuo (axis="plane"): el caso
         # del entrepiso que tiene que ENTRAR entre dos muros que siguen de largo por
@@ -1083,6 +1113,14 @@ def _decompose(
     adj_result = compute_adjustments(
         work.joints, work.groups, wall_wall_decisions, work.faces
     )
+    # Una decisión que no se pudo aplicar tiene que llegar al usuario. Es su elección
+    # sobre quién cede en una esquina; si se descarta en silencio, la pieza sale sin el
+    # recorte que pidió y no hay forma de enterarse antes de cortar el MDF.
+    if adj_result.decisiones_ignoradas:
+        work = replace(
+            work,
+            warnings=list(work.warnings or []) + adj_result.decisiones_ignoradas,
+        )
 
     # Misión 1: resolver intersecciones placa-placa en 3D (encastres) sobre la
     # topología final (post-merges), antes de proyectar.
@@ -1290,6 +1328,32 @@ def final_placements(
         if p.frame and p.source_group_id is not None and p.source_group_id >= 0:
             out[str(p.source_group_id)] = dict(p.frame, panel_id=p.id)
     return out
+
+
+def placements_fieles(
+    phase1: Phase1Result,
+    scale_denom: float,
+    overrides: Optional[Dict[int, str]] = None,
+    wall_wall_decisions: Optional[Dict[int, int]] = None,
+) -> Dict[str, Dict]:
+    """Marco 3D de cada pieza YA RECORTADA, a la escala a la que se va a cortar.
+
+    Es lo que el instructivo tiene que dibujar. `build_placements` proyecta el modelo
+    crudo y por eso no conoce ningún recorte de encaje: sobre un modelo real dibujaba 19
+    de 28 piezas más grandes de lo que se cortaba a 1:50, y 21 de 28 a 1:100, con excesos
+    de hasta 17.8 mm de plancha. Con esa diferencia el instructivo no sirve para decidir
+    si algo encaja, que es para lo único que existe.
+
+    Depende de la escala y no puede no depender: los recortes valen 3 mm de MDF siempre,
+    y esos 3 mm son 15 cm de edificio a 1:50 y 60 cm a 1:200.
+    """
+    opts = PipelineOptions(
+        scale_denom=scale_denom, paper="A4", min_area_m2=1.0, sheet_config=None
+    )
+    _work, walls, floors, _pjs = _decompose(
+        phase1, opts, overrides, wall_wall_decisions, None, None
+    )
+    return final_placements(walls, floors)
 
 
 def generate_from_review(
