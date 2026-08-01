@@ -36,6 +36,8 @@ from core.review_generate import _decompose
 from core.services.assembly_adjuster import compute_adjustments, yield_by_pair
 from core.services.assembly_verify import verificar_ensamble
 from core.services.cutting_sheet import (
+    Edge2D,
+    Vec2,
     orient_group_normals_outward,
     project_faces_to_2d,
 )
@@ -1092,6 +1094,83 @@ def test_la_ranura_llega_a_la_plancha(scale):
                 f"1:{scale:.0f} {panel.id}: la arista de ranura en x={e.a.x:.4f} no se "
                 "emitió al corte"
             )
+
+
+def test_dos_vecinos_a_alturas_distintas_no_se_comen_el_borde_entero():
+    """Dos vecinos en el MISMO extremo pero a alturas distintas piden recortes distintos.
+
+    Antes se guardaba un solo recorte por borde —el mayor— y se aplicaba a toda la altura:
+    la pieza perdía material donde el vecino de abajo sí necesitaba que llegara. Medido en
+    un modelo real: 4.00 mm de menos, que son los 20 cm que separan los dos planos.
+
+    Se prueba la función directamente porque el caso es difícil de construir con un OBJ
+    sintético sin que el clasificador lo transforme en otra cosa (fusiona la tapa del
+    extremo con el vecino, o toma sus caras horizontales como un nivel y parte la
+    fachada). La evidencia de punta a punta está en los modelos reales: con el recorte de
+    borde entero, 75 topes laterales correctos y 7 mal; con la muesca, 80 y 2.
+    """
+    from core.review_generate import _aplicar_muescas
+
+    ancho, alto = 10.0, 6.0
+    esq = [(0.0, 0.0), (ancho, 0.0), (ancho, alto), (0.0, alto)]
+    edges = [
+        Edge2D(a=Vec2(*esq[i]), b=Vec2(*esq[(i + 1) % 4])) for i in range(4)
+    ]
+    # Mismo extremo (el bajo), bandas distintas, profundidades distintas.
+    muescas = [(True, 1.0, 0.0, 3.0), (True, 3.0, 3.0, 6.0)]
+    res = _aplicar_muescas(edges, ancho, alto, muescas)
+    assert res is not None, "la muesca no produjo nada"
+    nuevas, w, h, off_u, off_v = res
+
+    # El bounding box se achica sólo lo que se lleva la muesca MENOS profunda: la banda de
+    # abajo sigue teniendo material hasta u=1.0, así que el borde de la pieza está ahí y no
+    # en el 3.0 de la muesca profunda. Ésta es la diferencia con el recorte de borde entero,
+    # que se llevaba los 3.0 en toda la altura.
+    assert w == pytest.approx(ancho - 1.0, abs=1e-6), (
+        f"el ancho quedó en {w:.3f} y debía quedar en {ancho - 1.0:.3f}"
+    )
+    # ...pero el material de la banda de abajo tiene que seguir llegando 2 m más adentro
+    # que el de la banda de arriba. Con un recorte de borde entero, las dos empezarían en
+    # el mismo lugar y la de abajo perdería esos 2 m.
+    poly = _material_de_la_pieza_test(nuevas)
+    assert poly is not None
+    from shapely.geometry import box as _box
+
+    abajo = poly.intersection(_box(-1, 0.1, w + 1, 2.9))
+    arriba = poly.intersection(_box(-1, 3.1, w + 1, 5.9))
+    assert abajo.bounds[0] == pytest.approx(0.0, abs=1e-6), (
+        f"la banda de abajo empieza en {abajo.bounds[0]:.3f} y debía empezar en 0.000: "
+        "se le comió material que su vecino necesitaba"
+    )
+    assert arriba.bounds[0] == pytest.approx(2.0, abs=1e-6), (
+        f"la banda de arriba empieza en {arriba.bounds[0]:.3f} y debía empezar en 2.000"
+    )
+
+
+def _material_de_la_pieza_test(edges):
+    from core.review_generate import _material_de_la_pieza
+    return _material_de_la_pieza(edges)
+
+
+def test_dos_muescas_iguales_no_acumulan():
+    """Restar dos veces la misma zona no puede quitar el doble de material.
+
+    Era el motivo del "un solo recorte por borde": aplicar un clip por junta hacía que un
+    muro que cede en varias juntas del mismo lado perdiera la suma de todas (10.3 mm en
+    vez de 5.2). Restar rectángulos lo resuelve de raíz.
+    """
+    from core.review_generate import _aplicar_muescas
+
+    ancho, alto = 10.0, 6.0
+    esq = [(0.0, 0.0), (ancho, 0.0), (ancho, alto), (0.0, alto)]
+    edges = [Edge2D(a=Vec2(*esq[i]), b=Vec2(*esq[(i + 1) % 4])) for i in range(4)]
+    res = _aplicar_muescas(edges, ancho, alto,
+                           [(True, 2.0, 0.0, alto), (True, 2.0, 0.0, alto)])
+    assert res is not None
+    _, w, _, _, _ = res
+    assert w == pytest.approx(ancho - 2.0, abs=1e-6), (
+        f"dos muescas iguales dejaron el ancho en {w:.3f}: se acumularon"
+    )
 
 
 @pytest.mark.parametrize("scale", ESCALAS)
