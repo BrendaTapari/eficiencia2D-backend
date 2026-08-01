@@ -264,6 +264,7 @@ def resolve_plate_joints(
     faces: List[Face3D],
     eps: float = EPS,
     yield_by_pair: Optional[Dict[Tuple[int, int], int]] = None,
+    sin_resolver: Optional[set] = None,
 ) -> List[PlateJoint]:
     """
     Encuentra placas (paredes) que se cruzan en 3D y devuelve las juntas de encastre.
@@ -321,13 +322,28 @@ def resolve_plate_joints(
             if not (a_spans_b or b_spans_a):
                 continue
 
-            # Jerarquía: el yielder es la placa CORTADA (recibe la ranura). La decisión
-            # de compute_adjustments manda; sólo se recalcula si ese par no tiene una.
-            yid = yield_by_pair.get(pair_key(ga.id, gb.id))
-            if yid is None:
-                t_a = ga.thickness or 0.0
-                t_b = gb.thickness or 0.0
-                yid = choose_wall_wall_yielder(ga, gb, t_a, t_b, None, faces)
+            # Si un TOPE ya resolvió la junta, no lleva ranura: acortar una de las dos
+            # placas alcanza, y abrir además una ranura sólo debilita la pieza y deja un
+            # agujero a la vista.
+            #
+            # Antes esto no se decidía en ningún lado: se generaba la ranura para todo par
+            # que se atravesara y se descartaba más tarde, por accidente, porque tras el
+            # recorte la recta caía fuera del panel. En cuanto se corrigió ese recorte
+            # —que acortaba la ranura 4 mm y no la dejaba encastrar— las ranuras espurias
+            # empezaron a dibujarse. La decisión ahora es explícita.
+            #
+            # NO se exige que la junta esté DETECTADA: el caso que la ranura resuelve por
+            # excelencia —dos muros que se cruzan por el medio de ambos— suele no compartir
+            # vértices, así que `detect_joints` no lo ve y `wall_wall_joints` ni lo lista.
+            # Exigir junta detectada mataba justamente ese caso.
+            if pair_key(ga.id, gb.id) in yield_by_pair:
+                continue
+
+            # Sin tope que la resuelva: hace falta ranura. Quién la recibe se decide con
+            # la misma jerarquía que usa el recorte.
+            t_a = ga.thickness or 0.0
+            t_b = gb.thickness or 0.0
+            yid = choose_wall_wall_yielder(ga, gb, t_a, t_b, None, faces)
             cut = by_id.get(yid, gb)
             cutter = ga if cut is gb else gb
             # Ancho físico: la placa que atraviesa, más la holgura del kerf para que
