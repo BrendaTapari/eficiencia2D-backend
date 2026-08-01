@@ -355,6 +355,51 @@ def compute_adjustments(
                         )
                     )
 
+                    # La CONTRAPARTE. Una esquina la cierran las dos piezas, no una:
+                    #   - la que cede va a la cara INTERIOR de la vecina  (plano − t/2)
+                    #   - la que pasa va a la cara EXTERIOR de la que cede (plano + t/2)
+                    # Es el mismo invariante con la media placa cambiada de signo, y quién
+                    # hace cuál sale de `decision` — o sea, del usuario cuando eligió en el
+                    # visor. Acá no hay convención fija: si la decisión se invierte, los
+                    # dos ajustes se invierten con ella.
+                    #
+                    # Sin este ajuste el muro pasante se quedaba con el largo que le dio el
+                    # modelo, que llega hasta la piel del muro macizo. A escalas gruesas eso
+                    # queda CORTO: a 1:100 media placa son 15 cm de edificio y el muro asoma
+                    # 1 cm, así que faltan 14. La pieza salía de eje a eje de sus vecinas,
+                    # que es el único largo que no arma de ninguna de las dos formas: le
+                    # sobran 3 mm para entrar entre ellas y le faltan 2.8 para pasarles por
+                    # encima. Medido sobre bfe62e18 a 1:100: A3 sale de 7.0000 m cuando el
+                    # hueco libre es 6.68 y el largo pasante es 7.28.
+                    #
+                    # `delta` puede quedar negativo: entonces la pieza se ALARGA. Ver
+                    # `_aplicar_muescas`.
+                    #
+                    # LA GUARDA IMPORTA: sólo si el pasante TERMINA en esta junta. Si la
+                    # cruza por el medio no tiene extremo que mover, y
+                    # `overshoot_past_plane_m` —que mide el vuelo del grupo ENTERO más allá
+                    # del plano— devuelve media casa. Sin esta condición, una pieza de
+                    # 57 mm salía de 15 mm.
+                    pasante_al_extremo = b_at_end if decision == g_a.id else a_at_end
+                    eje_p = eje_b if decision == g_a.id else eje_a
+                    if pasante_al_extremo and eje_p is not None:
+                        vol_p = overshoot_past_plane_m(other_group, yield_group, faces)
+                        if vol_p is not None:
+                            adjustments.append(
+                                DimensionAdjustment(
+                                    group_id=other_group.id,
+                                    delta=-vol_p * factor,
+                                    delta_plate=+media_placa * factor,
+                                    axis=eje_p,
+                                    reason=(
+                                        f"Pasa por {yield_group.label} "
+                                        f"(voladizo {vol_p * 1000:.0f}mm − media placa)"
+                                    ),
+                                    joint_index=ji,
+                                    against_group_id=yield_group.id,
+                                )
+                            )
+
     # Encuentros muro-losa: se calculan por geometría, no por juntas (ver las funciones).
     # La losa entra entre los muros que la atraviesan; el extremo del muro apoya sobre la
     # cara de la placa de losa. Los duplicados con lo que ya emitió el bucle de juntas los
