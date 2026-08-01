@@ -516,6 +516,62 @@ def test_una_junta_nunca_lleva_tope_Y_ranura(scale):
         assert ceden, f"1:{scale:.0f} ({etiqueta}) el modelo no resolvió ninguna junta"
 
 
+def test_una_decision_que_apunta_a_otra_junta_no_recorta_un_muro_ajeno():
+    """El índice de junta es POSICIONAL: si se desfasa, la decisión no puede aplicarse.
+
+    `detect_joints` reconstruye la lista entera de juntas en cada edición (fusión,
+    división, cambio de eje o de área mínima), y las decisiones del usuario viajan como
+    `{índice de junta -> grupo que cede}`. Si el usuario elige y después edita, el índice
+    guardado pasa a nombrar OTRA junta.
+
+    El daño era doble y mudo. `other_group_id` se calculaba con
+    `g_b.id if decision == g_a.id else g_a.id`: cuando la decisión nombraba un grupo que
+    no participa de la junta, caía en la rama `else` y se recortaba ESE muro ajeno contra
+    `g_a`, mientras la junta que el usuario había resuelto se quedaba sin recorte. O sea,
+    aparecía un recorte donde nadie lo pidió y faltaba donde sí.
+
+    Acá se simula el desfasaje nombrando un grupo real del modelo que no pertenece a la
+    junta apuntada. La decisión tiene que descartarse y avisarse, no aplicarse torcida.
+    """
+    obj = _modelo_cruce_en_extremo()
+    work, _, grupos, _ = _procesar(obj, 50.0)
+
+    base = compute_adjustments(work.joints, work.groups, None, work.faces)
+    juntas = [ww for ww in base.wall_wall_joints if ww.suggested_yield_group_id is not None]
+    assert juntas, "el modelo no produjo ninguna junta pared-pared resuelta"
+    ww = juntas[0]
+
+    ajeno = next(
+        (gid for gid in grupos if gid not in (ww.group_a, ww.group_b)), None
+    )
+    assert ajeno is not None, "el modelo no tiene un tercer grupo con el que probar"
+
+    res = compute_adjustments(
+        work.joints, work.groups, {ww.joint_index: ajeno}, work.faces
+    )
+
+    assert res.decisiones_ignoradas, (
+        "la decisión apuntaba a un grupo que no participa de la junta y se aplicó igual, "
+        "sin avisar"
+    )
+    # Y sobre todo: no se recortó el muro ajeno por culpa de esa decisión.
+    culpables = [
+        a for a in res.adjustments
+        if a.group_id == ajeno and a.joint_index == ww.joint_index
+    ]
+    assert not culpables, (
+        f"se recortó el grupo {ajeno}, que no participa de la junta {ww.joint_index} "
+        f"({ww.group_a}/{ww.group_b}), por una decisión desfasada"
+    )
+    # La junta sigue resuelta: se cae en la sugerencia automática, no queda en el aire.
+    resuelta = next(
+        w for w in res.wall_wall_joints if w.joint_index == ww.joint_index
+    )
+    assert resuelta.yield_group_id in (ww.group_a, ww.group_b), (
+        "al descartar la decisión la junta quedó sin resolver"
+    )
+
+
 def test_el_plano_de_la_ranura_es_el_mismo_que_el_del_recorte():
     """`group_plane` (ranura) y `_mid_plane_offset` (recorte) deben dar el MISMO plano.
 
@@ -1198,4 +1254,39 @@ def test_un_borde_no_se_recorta_dos_veces(scale):
         assert recorte_mm < 8.0, (
             f"1:{scale:.0f} la pieza {panel.id} perdió {recorte_mm:.2f}mm de largo: "
             "hay recortes acumulados sobre el mismo borde"
+        )
+
+
+def test_si_la_muesca_no_se_puede_calcular_el_recorte_no_se_pierde(monkeypatch):
+    """Una muesca que no se puede calcular degrada al recorte de borde, nunca a nada.
+
+    La muesca necesita el POLÍGONO del material, y hay piezas cuyo contorno no cierra:
+    cuando una abertura llega al borde (una puerta que baja hasta el piso) las jambas
+    salen colapsadas y `polygonize` no arma ninguna cara. Ahí `_aplicar_muescas` devuelve
+    None.
+
+    Al introducir la muesca ese None se traducía en no recortar: en un modelo del corpus,
+    4 piezas pasaron a salir de 8.00 m en vez de 7.40 y aparecieron 3 choques donde no
+    había ninguno. El corpus lo detectó, pero recién dos commits después.
+
+    Acá se fuerza el None sobre una esquina en L, donde el recorte se conoce a mano.
+    """
+    import core.review_generate as rg
+
+    obj = _modelo_esquina_L()
+    _work, con_muesca, _g, _pj = _procesar(obj, 50.0)
+
+    monkeypatch.setattr(rg, "_aplicar_muescas", lambda *a, **k: None)
+    _work2, con_fallback, _g2, _pj2 = _procesar(obj, 50.0)
+
+    por_id = {p.id: p for p in con_muesca}
+    assert por_id, "el modelo no produjo piezas"
+    for p in con_fallback:
+        ref = por_id.get(p.id)
+        assert ref is not None, f"la pieza {p.id} desapareció al caer al fallback"
+        assert p.width_m == pytest.approx(ref.width_m, abs=1e-6), (
+            f"{p.id}: con muesca sale {ref.width_m:.4f} m y por el camino de respaldo "
+            f"{p.width_m:.4f} m. En una esquina en L la muesca abarca toda la altura, "
+            "así que los dos caminos tienen que dar lo mismo: si difieren, el respaldo "
+            "está perdiendo el recorte."
         )
