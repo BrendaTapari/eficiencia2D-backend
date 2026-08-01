@@ -1070,6 +1070,59 @@ def test_contacto_horizontal_se_resuelve_recortando_la_altura(scale):
 
 
 @pytest.mark.parametrize("scale", ESCALAS)
+def test_la_ranura_llega_a_la_plancha(scale):
+    """Una ranura calculada tiene que salir CORTADA en el DXF y en el PDF.
+
+    Es la última milla y estuvo rota todo este tiempo: los dos emisores tenían un
+    `continue` que descartaba las aristas de encastre, con el argumento de que eran
+    "geometría de ensamble, no del corte". Falso: una ranura es un corte interior —un
+    rectángulo cerrado dentro de la pieza— y es lo único que sostiene un entrepiso metido
+    entre dos muros continuos. Se calculaban, se reportaban al visor y hasta se usaban
+    para excusar interpenetraciones en la verificación, y no llegaban al taller. Medido en
+    un modelo real: 16 aristas de ranura calculadas, 0 en el DXF.
+    """
+    from core.services.cutting_sheet import emit_panel_entities
+
+    b = _ObjBuilder()
+    t = 0.20
+    b.box(-4.0, 4.0, 0.0, 3.0, 0.0, t)        # muro que corre en X
+    b.box(-0.1, 0.1, 0.0, 3.0, -3.0, 3.0)     # muro que lo cruza al medio -> ranura
+    work, paneles, grupos, pjs = _procesar(b.text(), scale)
+    assert pjs, "el cruce en X no generó ninguna ranura"
+
+    con_ranura = [p for p in paneles if any(getattr(e, "joint", False) for e in p.edges)]
+    assert con_ranura, "ninguna pieza recibió aristas de ranura"
+
+    for panel in con_ranura:
+        aristas = [e for e in panel.edges if getattr(e, "joint", False)]
+        lineas: list = []
+        emit_panel_entities(
+            lineas, panel.edges, panel.width_m, panel.height_m, panel.id,
+            0.0, 0.0, scale, include_text=False,
+        )
+        # Cada arista dibujada aporta una entidad LINE. Si las de ranura se descartan,
+        # el total baja justo en esa cantidad.
+        dibujadas = lineas.count("LINE")
+        esperadas = sum(
+            1 for e in panel.edges if not getattr(e, "score", False) or True
+        )
+        assert dibujadas >= len(aristas), (
+            f"1:{scale:.0f} {panel.id}: {len(aristas)} aristas de ranura y sólo "
+            f"{dibujadas} líneas emitidas; la ranura no llega a la plancha"
+        )
+        # Y que las coordenadas de la ranura estén realmente entre las emitidas.
+        emitidas = set()
+        for i, x in enumerate(lineas):
+            if x == "10" and i + 1 < len(lineas):
+                emitidas.add(lineas[i + 1])
+        for e in aristas:
+            assert any(abs(float(v) - e.a.x) < 1e-6 for v in emitidas), (
+                f"1:{scale:.0f} {panel.id}: la arista de ranura en x={e.a.x:.4f} no se "
+                "emitió al corte"
+            )
+
+
+@pytest.mark.parametrize("scale", ESCALAS)
 def test_un_borde_no_se_recorta_dos_veces(scale):
     """Dos juntas del mismo lado no deben acumular dos recortes sobre el mismo borde."""
     b = _ObjBuilder()
