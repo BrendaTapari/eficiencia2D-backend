@@ -32,7 +32,7 @@ from core.services.cutting_sheet import (
     project_faces_to_2d,
     shift_placement,
 )
-from core.services.plate_intersect import resolve_plate_joints
+from core.services.plate_intersect import pair_key, resolve_plate_joints
 from core.services.flex_bending import (
     apply_flex_to_panel,
     apply_mark_lines_to_panel,
@@ -272,6 +272,90 @@ def apply_merges(
         # juntas nuevas, no se arrastra la del modelo sin fusionar.
         group_adjacency=build_group_adjacency(joints),
     )
+
+
+def _material_de_la_pieza(edges: List[Edge2D]):
+    """Polígono del MATERIAL de la pieza a partir de sus aristas (contorno menos huecos).
+
+    Regla par-impar: una región contenida en un número par de otras es material, en un
+    número impar es hueco. Vale para piezas con varias regiones sueltas y con aberturas
+    anidadas, que es lo que aparece en cuanto el muro tiene ventanas.
+    """
+    from shapely.geometry import LineString, Point
+    from shapely.ops import polygonize, unary_union
+
+    segs = [
+        LineString([(e.a.x, e.a.y), (e.b.x, e.b.y)])
+        for e in edges
+        if not getattr(e, "score", False) and not getattr(e, "flex", False)
+    ]
+    if not segs:
+        return None
+    caras = sorted(polygonize(unary_union(segs)), key=lambda p: p.area, reverse=True)
+    if not caras:
+        return None
+    material = []
+    for i, c in enumerate(caras):
+        p = c.representative_point()
+        dentro = sum(
+            1 for j, o in enumerate(caras) if j != i and o.area > c.area and o.contains(p)
+        )
+        if dentro % 2 == 0:
+            material.append(c)
+    if not material:
+        return None
+    u = unary_union(material)
+    return u if not u.is_empty else None
+
+
+def _slot_dentro_del_material(edges, ax, ay, bx, by, ancho):
+    """Anillos de la ranura, recortada al material de la pieza. Vacío si no la toca."""
+    import math as _math
+
+    from shapely.geometry import Polygon
+
+    dx, dy = bx - ax, by - ay
+    largo = _math.hypot(dx, dy)
+    if largo < 1e-9 or ancho <= 0:
+        return []
+    ux, uy = dx / largo, dy / largo
+    nx, ny = -uy, ux
+    h = ancho / 2.0
+    rect = Polygon([
+        (ax + nx * h, ay + ny * h), (bx + nx * h, by + ny * h),
+        (bx - nx * h, by - ny * h), (ax - nx * h, ay - ny * h),
+    ])
+    material = _material_de_la_pieza(edges)
+    if material is None or not rect.is_valid or rect.is_empty:
+        return []
+    corte = rect.intersection(material)
+    if corte.is_empty:
+        return []
+    geoms = list(getattr(corte, "geoms", [corte]))
+    out = []
+    for g in geoms:
+        if getattr(g, "area", 0.0) <= 1e-12:
+            continue
+        x0, y0, x1, y1 = g.bounds
+        # Una ranura más corta que ancha no sostiene nada: sale de un contacto rasante
+        # entre dos piezas que apenas se rozan (segmentos de 0.15 mm en un modelo real) y
+        # lo único que hace es debilitar la placa con un agujero inútil.
+        if max(x1 - x0, y1 - y0) < ancho:
+            continue
+        out.append([(x, y) for x, y in g.exterior.coords])
+    return out
+
+
+def _anillo_a_edges(anillo, mark: bool) -> List[Edge2D]:
+    """Anillo cerrado -> aristas de encastre (se cortan) o de apoyo (se graban)."""
+    out: List[Edge2D] = []
+    for i in range(len(anillo) - 1):
+        a, b = anillo[i], anillo[i + 1]
+        out.append(
+            Edge2D(a=Vec2(a[0], a[1]), b=Vec2(b[0], b[1]),
+                   score=mark, joint=not mark)
+        )
+    return out
 
 
 def _effective_category(
@@ -737,24 +821,29 @@ def decompose_panels_from_groups(
             # scale_denom para que tras el 1/scale_denom del nesting la ranura mida
             # exactamente lo que la placa que la atraviesa, en cualquier escala.
             slot_w_m = slot_w * (opts.scale_denom or 1.0)
-            # La recta se recorta contra el panel ACHICADO media ranura: _slot_edges
-            # construye un rectángulo de ±slot_w/2 alrededor de ella, y sin este margen
-            # ese rectángulo asomaba del contorno. _fit_panel_bbox lo absorbía agrandando
-            # la pieza (7.8250 -> 7.8358 m, o sea +0.217mm en plancha a 1:50), y el
-            # error crecía con la escala. Una ranura es un corte INTERIOR: no puede
-            # cambiar el tamaño de la pieza.
-            m = slot_w_m / 2.0
-            seg = _clip_segment_to_rect(
-                width_m - ua - m, va - m, width_m - ub - m, vb - m,
-                max(width_m - slot_w_m, 0.0), max(height_m - slot_w_m, 0.0),
+            # La ranura es el RECTÁNGULO intersecado con el MATERIAL de la pieza.
+            #
+            # Antes se recortaba la RECTA contra el bounding box del panel achicado media
+            # ranura. Eso tenía dos defectos, los dos visibles midiendo el DXF:
+            #   - acortaba la ranura TAMBIÉN a lo largo: media ranura en cada punta. En un
+            #     modelo real la ranura salía de 65.65mm donde la placa que tiene que
+            #     entrar mide 70.00mm, o sea 4.35mm de menos, y no encastraba;
+            #   - recortaba contra el BOUNDING BOX y no contra el contorno, así que en una
+            #     pieza en L o con aberturas la ranura se dibujaba al aire, donde la pieza
+            #     no tiene material.
+            # Intersecar con el material resuelve las dos: conserva el largo donde hay
+            # placa, no dibuja nada donde no la hay, y nunca asoma del contorno (así que
+            # tampoco puede agrandar la pieza vía _fit_panel_bbox).
+            trozos = _slot_dentro_del_material(
+                edges, width_m - ua, va, width_m - ub, vb, slot_w_m
             )
-            if seg is None:
+            if not trozos:
                 continue
-            seg = (seg[0] + m, seg[1] + m, seg[2] + m, seg[3] + m)
-            edges.extend(_slot_edges(*seg, slot_w_m, mark=(kind == "surface")))
-            # La ranura SOBREVIVIÓ al recorte: recién ahora es material que se quita de
-            # verdad. Las que caen fuera del panel ya trimado no se registran, porque el
-            # tope ya resolvió esa junta y la ranura sobraba.
+            for anillo in trozos:
+                edges.extend(_anillo_a_edges(anillo, mark=(kind == "surface")))
+            # La ranura SOBREVIVIÓ: recién ahora es material que se quita de verdad. Las
+            # que caen fuera de la pieza ya recortada no se registran, porque el tope ya
+            # resolvió esa junta y la ranura sobraba.
             if kind != "surface":
                 slots_cortadas.append(cutter_id)
 
@@ -925,8 +1014,18 @@ def _decompose(
 
     # Misión 1: resolver intersecciones placa-placa en 3D (encastres) sobre la
     # topología final (post-merges), antes de proyectar.
+    # Sólo llevan ranura las juntas DETECTADAS que ningún tope resolvió. Las demás ya
+    # están resueltas acortando una placa, y abrirles además una ranura sólo debilita la
+    # pieza. El encaje losa-muro va por su propio camino (`_floor_slots`), porque ahí la
+    # ranura no reemplaza a un tope: es lo único que sostiene la losa.
+    sin_resolver = {
+        pair_key(j.group_a, j.group_b)
+        for j in adj_result.wall_wall_joints
+        if j.yield_group_id is None
+    }
     plate_joints = resolve_plate_joints(
-        work.groups, work.faces, yield_by_pair=yield_by_pair(adj_result)
+        work.groups, work.faces,
+        yield_by_pair=yield_by_pair(adj_result), sin_resolver=sin_resolver,
     )
     wall_panels, floor_panels = decompose_panels_from_groups(
         work, opts, overrides, wall_wall_decisions, marks, plate_joints,
