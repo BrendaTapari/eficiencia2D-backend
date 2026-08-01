@@ -318,6 +318,14 @@ def compute_adjustments(
                             axis=eje or "width",
                             reason=f"Junta con {other_group.label} ({detalle})",
                             joint_index=ji,
+                            # Contra QUIÉN se recorta. Un recorte lateral no debe comerse
+                            # el borde entero: la junta suele existir sólo en una franja
+                            # de la altura, y quien descompone necesita al vecino para
+                            # saber cuál. Sin esto, dos vecinos distintos en el mismo
+                            # extremo pero a alturas distintas competían por el mismo
+                            # borde, ganaba el recorte mayor y se aplicaba a toda la
+                            # pieza: 4.00 mm de material de menos en un modelo real.
+                            against_group_id=other_group.id,
                         )
                     )
 
