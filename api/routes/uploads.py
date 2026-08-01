@@ -32,6 +32,7 @@ from core.services.curvature import build_curvature_map
 from core.services.assembly_check import compute_assembly_warnings
 from core.group_classifier import compute_assembly_steps
 from core.services.assembly_verify import MENSAJES as MENSAJES_INTERFERENCIA
+from core.services.plate_intersect import PLATE_THICKNESS_M
 from core.services.assembly_adjuster import DEFAULT_MDF_THICKNESS_M
 from core.services.types import PipelineOptions, SheetConfig
 
@@ -943,6 +944,15 @@ async def nesting_preview_endpoint(
 
         # Chequeo automático de ensamble: huecos/solapes/piezas sin apoyo (world coords),
         # para avisar ANTES de mandar a cortar. Vacío = ensamble verificado.
+        #
+        # `compute_assembly_warnings` mide sobre los GRUPOS del modelo, no sobre las piezas
+        # que se van a cortar. Por axioma del usuario el modelo 3D está bien hecho, así que
+        # ese chequeo devuelve 0 casi siempre: medido sobre un modelo real, 0 avisos a 1:50
+        # y a 1:100 mientras el chequeo de PIEZAS encontraba 2 interferencias reales. Un
+        # cartel verde que no puede ponerse rojo por un problema de encaje no informa nada
+        # y ya nos costó un "Ensamble verificado" con las piezas chocando a la vista. Las
+        # interferencias entre piezas recortadas entran acá para que "vacío = verificado"
+        # signifique lo que dice.
         with timer.step("assembly_check"):
             try:
                 assembly_warnings = compute_assembly_warnings(
@@ -951,6 +961,14 @@ async def nesting_preview_endpoint(
             except Exception:
                 logger.exception("[nesting-preview] assembly_check falló")
                 assembly_warnings = []
+            for i in interferencias:
+                assembly_warnings.append({
+                    "pieces": [i.pieza_a, i.pieza_b],
+                    "type": "interference",
+                    "measure_mm": round(i.penetracion_mm, 2),
+                    "cause": i.causa,
+                    "message": MENSAJES_INTERFERENCIA.get(i.causa, ""),
+                })
 
         timer.report()
         return JSONResponse(content={
@@ -968,6 +986,13 @@ async def nesting_preview_endpoint(
             # instructivo debe dibujar ESTO. topology.placements es la proyección cruda
             # del modelo y muestra las piezas sin recortar, pisándose entre sí.
             "placements": final_places,
+            # Espesor de la placa en metros de EDIFICIO, para que el instructivo pueda
+            # EXTRUIR cada pieza y mostrar el volumen que realmente ocupa. La placa mide
+            # 3 mm siempre, pero en el edificio eso son 0.15 m a 1:50 y 0.60 m a 1:200:
+            # dibujar las piezas sin espesor esconde justamente los choques que el
+            # espesor provoca. Se manda calculado para que el front no tenga que saber ni
+            # el espesor del material ni la escala.
+            "plate_thickness_m": PLATE_THICKNESS_M * (opts.scale_denom or 1.0),
             # Chequeo de ensamble: [] = verificado; si no, gap/overlap/unsupported.
             "assembly_warnings": assembly_warnings,
             # Fase D: pares de piezas que ocupan el mismo material. `causa` dice de quién
