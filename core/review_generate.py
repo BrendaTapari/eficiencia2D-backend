@@ -292,9 +292,34 @@ def _aplicar_muescas(edges, width_m, height_m, muescas):
         return None
 
     quitar = []
+    agregar = []
     for izquierda, prof, v_lo, v_hi in muescas:
+        if v_hi - v_lo <= 0.001:
+            continue
+        if prof < -0.001:
+            # AGRANDAR. Una esquina la cierran las dos piezas: la que cede va a la cara
+            # interior de su vecina y la que pasa a la cara EXTERIOR de la que cede. Esa
+            # segunda casi siempre exige crecer, porque en el modelo el muro llega hasta
+            # la piel del macizo y a escalas gruesas eso queda corto: a 1:100 media placa
+            # son 15 cm de edificio y el muro asoma 1 cm, faltan 14.
+            #
+            # Sin esto el ajuste salía negativo y se descartaba en silencio: la pieza
+            # quedaba de eje a eje de sus vecinas, el único largo que no arma de ninguna
+            # de las dos formas (sobran 3 mm para entrar entre ellas, faltan 2.8 para
+            # pasarles por encima).
+            ext = -prof
+            lo = v_lo - 1e-6 if v_lo <= 1e-6 else v_lo
+            hi = v_hi + 1e-6 if v_hi >= height_m - 1e-6 else v_hi
+            if izquierda:
+                agregar.append(Polygon([(-ext, lo), (1e-6, lo), (1e-6, hi), (-ext, hi)]))
+            else:
+                agregar.append(Polygon([
+                    (width_m - 1e-6, lo), (width_m + ext, lo),
+                    (width_m + ext, hi), (width_m - 1e-6, hi),
+                ]))
+            continue
         prof = min(prof, width_m - 0.01)
-        if prof <= 0.001 or v_hi - v_lo <= 0.001:
+        if prof <= 0.001:
             continue
         # Se extiende un pelo fuera del panel en v para que la resta no deje una película
         # de material en los bordes por redondeo.
@@ -307,10 +332,19 @@ def _aplicar_muescas(edges, width_m, height_m, muescas):
                 Polygon([(width_m - prof, lo), (width_m + 1e-6, lo),
                          (width_m + 1e-6, hi), (width_m - prof, hi)])
             )
-    if not quitar:
+    if not quitar and not agregar:
         return None
 
-    resto = material.difference(unary_union(quitar))
+    resto = material
+    if agregar:
+        # El agregado se pega sólo si NO deja la pieza en más trozos de los que tenía: un
+        # rectángulo que no toca el material sería una isla suelta en la plancha.
+        pegado = unary_union([material] + agregar)
+        antes = len(getattr(material, "geoms", [material]))
+        if len(getattr(pegado, "geoms", [pegado])) <= antes:
+            resto = pegado
+    if quitar:
+        resto = resto.difference(unary_union(quitar))
     if resto.is_empty or resto.area <= 1e-9:
         return None
 
@@ -789,7 +823,9 @@ def decompose_panels_from_groups(
             if is_floor:
                 continue
             recorte = -_delta_m(w_adj)
-            if recorte <= 0.001:
+            # NEGATIVO = la pieza tiene que CRECER para llegar a la cara de su vecina.
+            # Antes se descartaba acá y la pieza quedaba con el largo crudo del modelo.
+            if abs(recorte) <= 0.001:
                 continue
             j = phase1.joints[w_adj.joint_index]
             u_j = dot(j.edge_mid, result.u_axis) - result.origin_u
@@ -832,6 +868,9 @@ def decompose_panels_from_groups(
                 # 7.40— y aparecieron 3 choques donde no había ninguno. Una muesca que no
                 # se puede calcular tiene que degradar al comportamiento anterior, nunca a
                 # no recortar.
+                # Sólo los recortes: `clip_panel_at_u` corta, no agranda. Un ajuste
+                # negativo se pierde acá, y por eso este camino es el respaldo y no el
+                # principal.
                 por_borde: Dict[bool, float] = {}
                 for izquierda, prof, _v_lo, _v_hi in muescas:
                     if prof > por_borde.get(izquierda, 0.0):
