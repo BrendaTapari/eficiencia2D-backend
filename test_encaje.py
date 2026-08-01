@@ -43,7 +43,7 @@ from core.services.cutting_sheet import (
 )
 from core.services.obj_parser import parse_obj
 from core.services.plate_intersect import group_plane, mid_plane_offset, pair_key
-from core.services.types import PipelineOptions, dot, normalize
+from core.services.types import PipelineOptions, Vec3, dot, normalize
 
 # Espesor físico de la placa de MDF, en metros de plancha.
 PLATE_THICKNESS_M = 0.003
@@ -351,25 +351,66 @@ def test_esquina_L_borde_cae_sobre_la_cara_vecina(scale):
 
 
 @pytest.mark.parametrize("scale", ESCALAS)
-def test_esquina_L_solo_cede_uno(scale):
-    """Sólo una de las dos placas se acorta: si se acortan las dos, queda luz."""
+def test_esquina_L_la_cierran_las_dos_piezas(scale):
+    """Los DOS bordes de una esquina caen a media placa del plano medio del vecino.
+
+    Una esquina la cierran las dos piezas, no una:
+      - la que CEDE va a la cara INTERIOR de su vecina   (plano medio − media placa)
+      - la que PASA va a la cara EXTERIOR de la que cede (plano medio + media placa)
+
+    Antes sólo se ajustaba la que cede, y este test afirmaba justamente eso ("sólo una se
+    acorta"). Era el contrato equivocado: el muro pasante se quedaba con el largo que le
+    dio el modelo, que llega hasta la piel del muro macizo. A escalas gruesas eso queda
+    CORTO —a 1:100 media placa son 15 cm de edificio y el muro asoma 1 cm— y la pieza
+    salía de eje a eje de su vecina. Ése es el único largo que no arma de ninguna de las
+    dos formas: le sobran 3 mm para entrar ENTRE las vecinas y le faltan 2.8 para pasarles
+    POR ENCIMA. Medido con la regla sobre el DXF de un modelo real: una pieza que debía
+    medir 69 mm medía 72.
+
+    Que la que pasa tenga que CRECER no es un caso raro: es lo normal apenas la escala se
+    hace gruesa. En este mismo modelo el muro pasante mide 5.93 m a 1:20 y 6.20 m a 1:200.
+
+    Quién hace cuál sale de la decisión de la junta —del usuario cuando eligió en el
+    visor—, no de una convención fija. Si la decisión se invierte, los dos ajustes se
+    invierten con ella; eso lo cubre
+    `test_la_decision_del_usuario_invierte_los_dos_ajustes`.
+    """
     work, paneles, grupos, _ = _procesar(_modelo_esquina_L(), scale)
     ww = work.wall_wall_joints[0]
-    recortados = []
+    assert ww.yield_group_id is not None, "la junta quedó sin resolver"
+    media_mm = PLATE_THICKNESS_M * scale / 2.0 / scale * 1000.0   # = 1.5 mm de plancha
+
     for gid in (ww.group_a, ww.group_b):
-        g = grupos[gid]
-        panel = next((p for p in paneles if p.source_group_id == gid), None)
-        if panel is None:
-            continue
-        oriented = orient_group_normals_outward([g])
-        res = project_faces_to_2d(
-            [work.faces[i] for i in g.face_indices if i < len(work.faces)],
-            oriented.get(gid, g.representative_normal),
-            "Y",
+        d_mm = _borde_mas_cercano_al_plano(
+            work, paneles, grupos, gid, ww.group_b if gid == ww.group_a else ww.group_a
         )
-        if res and (res.width_m - panel.width_m) > 1e-6:
-            recortados.append(gid)
-    assert len(recortados) == 1, f"se acortaron {len(recortados)} placas, debía ser 1"
+        assert d_mm is not None, f"no se pudo medir el grupo {gid}"
+        rol = "cede" if gid == ww.yield_group_id else "pasa"
+        assert abs(abs(d_mm) / scale * 1000.0 - media_mm) <= TOL_MM, (
+            f"1:{scale:.0f} el muro que {rol} (grupo {gid}) tiene el borde a "
+            f"{abs(d_mm) / scale * 1000.0:.2f} mm de plancha del plano medio de su vecina "
+            f"y debía estar a {media_mm:.2f} (media placa). La esquina no cierra."
+        )
+
+
+def _borde_mas_cercano_al_plano(work, paneles, grupos, gid, otro_gid):
+    """Distancia con signo del borde más cercano de `gid` al plano medio de `otro_gid`."""
+    from core.services.plate_intersect import mid_plane_offset
+
+    p = next((x for x in paneles if x.source_group_id == gid), None)
+    if p is None or not p.frame:
+        return None
+    otro = grupos[otro_gid]
+    n = normalize(otro.representative_normal)
+    d = mid_plane_offset(otro, work.faces, n)
+    m = p.frame
+    o = Vec3(m["origin"]["x"], m["origin"]["y"], m["origin"]["z"])
+    u = Vec3(m["u_axis"]["x"], m["u_axis"]["y"], m["u_axis"]["z"])
+    ds = [
+        dot(Vec3(o.x + u.x * uu, o.y + u.y * uu, o.z + u.z * uu), n) - d
+        for uu in (0.0, m["width_m"])
+    ]
+    return min(ds, key=abs)
 
 
 @pytest.mark.parametrize("scale", ESCALAS)
@@ -1290,3 +1331,112 @@ def test_si_la_muesca_no_se_puede_calcular_el_recorte_no_se_pierde(monkeypatch):
             "así que los dos caminos tienen que dar lo mismo: si difieren, el respaldo "
             "está perdiendo el recorte."
         )
+
+
+def test_un_recorte_no_emite_aristas_repetidas_ni_de_largo_cero():
+    """Cortar justo sobre una arista existente duplicaba el contorno.
+
+    Los cierres del recorte se generan pareando los cruces ordenados. Cuando la línea de
+    corte cae EXACTAMENTE sobre una arista que ya estaba —pasa siempre que el recorte
+    coincide con un borde del modelo, como el canto de 0.30 m de un muro recortado
+    0.30 m— esos cierres repiten aristas presentes, y los cruces repetidos generan
+    segmentos de largo cero.
+
+    El contorno dejaba de cerrar y el material de la pieza se leía mal: un marco real de
+    7.74 m² daba 3.24 m². De ahí salen el área que se le informa al usuario, el recorte
+    de las ranuras contra el material y la muesca lateral. Y en la plancha, una arista
+    repetida es una línea que el láser corta dos veces.
+
+    El contorno de acá es el de una pieza real del corpus (`31232804-casa.obj`): un marco
+    de 0.30 m de banda alrededor de un hueco de 8x6, con una puerta abajo. Se recorta
+    justo en y=0.30, que es donde cae su borde interior.
+    """
+    from core.services.cutting_sheet import clip_panel_at_v
+
+    ring = [
+        (0.0, 0.3), (0.0, 5.7), (0.0, 6.0), (8.0, 6.0), (8.0, 5.7), (8.0, 0.3),
+        (8.0, 0.0), (4.5, 0.0), (4.5, 0.3), (7.7, 0.3), (7.7, 5.7), (0.3, 5.7),
+        (0.3, 0.3), (3.5, 0.3), (3.5, 0.0), (0.0, 0.0), (0.0, 0.3),
+    ]
+    edges = [
+        Edge2D(a=Vec2(*ring[i]), b=Vec2(*ring[i + 1])) for i in range(len(ring) - 1)
+    ]
+
+    res = clip_panel_at_v(edges, 0.3, True)
+    assert res is not None, "el recorte no produjo nada"
+
+    vistas = set()
+    for e in res["edges"]:
+        a = (round(e.a.x, 9), round(e.a.y, 9))
+        b = (round(e.b.x, 9), round(e.b.y, 9))
+        assert a != b, f"el recorte emitió un segmento de largo cero en {a}"
+        k = (a, b) if a <= b else (b, a)
+        assert k not in vistas, (
+            f"el recorte emitió dos veces la arista {k}: el láser la corta dos veces y "
+            "el contorno deja de cerrar"
+        )
+        vistas.add(k)
+
+
+@pytest.mark.parametrize("scale", ESCALAS)
+def test_la_decision_del_usuario_invierte_los_dos_ajustes(scale):
+    """No hay convención fija: quién se acorta y quién se alarga sale de la decisión.
+
+    El front le pregunta al usuario en cada cruce cuál se acorta, y puede elegir la
+    pasante o la vecina. Así que el mecanismo tiene que ser simétrico: al invertir la
+    decisión, los DOS ajustes se dan vuelta. La que antes se acortaba ahora se alarga y
+    viceversa, y la esquina cierra igual.
+
+    Si esto falla, el selector del visor no manda: el backend estaría imponiendo su
+    criterio y la elección del usuario sería decorativa.
+    """
+    obj = _modelo_esquina_L()
+    work_auto, paneles_auto, grupos_auto, _ = _procesar(obj, scale)
+    ww = work_auto.wall_wall_joints[0]
+    assert ww.yield_group_id is not None
+
+    forzado = {ww.joint_index: (
+        ww.group_b if ww.yield_group_id == ww.group_a else ww.group_a
+    )}
+    work_inv, paneles_inv, grupos_inv, _ = _procesar(
+        obj, scale, wall_wall_decisions=forzado
+    )
+    # `work.wall_wall_joints` conserva la resolución automática (no se reescribe con las
+    # decisiones), así que la decisión se comprueba donde sí se aplica: en los ajustes.
+    res_inv = compute_adjustments(
+        work_inv.joints, work_inv.groups, forzado, work_inv.faces
+    )
+    ww_inv = next(w for w in res_inv.wall_wall_joints if w.joint_index == ww.joint_index)
+    assert ww_inv.yield_group_id == forzado[ww.joint_index], (
+        "la decisión del usuario no llegó a la junta"
+    )
+
+    media_mm = PLATE_THICKNESS_M / 2.0 * 1000.0    # 1.5 mm de plancha
+
+    # El invariante se cumple en las dos configuraciones...
+    for work, paneles, grupos in ((work_auto, paneles_auto, grupos_auto),
+                                  (work_inv, paneles_inv, grupos_inv)):
+        for gid in (ww.group_a, ww.group_b):
+            d = _borde_mas_cercano_al_plano(
+                work, paneles, grupos, gid,
+                ww.group_b if gid == ww.group_a else ww.group_a,
+            )
+            assert d is not None
+            assert abs(abs(d) / scale * 1000.0 - media_mm) <= TOL_MM, (
+                f"1:{scale:.0f} grupo {gid} quedó a {abs(d) / scale * 1000.0:.2f} mm de "
+                f"plancha del plano medio del vecino, debía ser {media_mm:.2f}"
+            )
+
+    # ...y los largos se intercambian: el que se acortaba ahora se alarga.
+    def ancho(paneles, gid):
+        p = next((x for x in paneles if x.source_group_id == gid), None)
+        return None if p is None else p.width_m
+
+    a_auto, a_inv = ancho(paneles_auto, ww.group_a), ancho(paneles_inv, ww.group_a)
+    b_auto, b_inv = ancho(paneles_auto, ww.group_b), ancho(paneles_inv, ww.group_b)
+    assert None not in (a_auto, a_inv, b_auto, b_inv)
+    assert (a_inv - a_auto) * (b_inv - b_auto) < 0, (
+        f"1:{scale:.0f} al invertir la decisión los dos muros se movieron para el mismo "
+        f"lado (A: {a_auto:.4f}→{a_inv:.4f}, B: {b_auto:.4f}→{b_inv:.4f}). Uno tiene que "
+        "acortarse y el otro alargarse."
+    )
