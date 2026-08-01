@@ -431,6 +431,13 @@ MIN_SPLIT_AREA = 0.01  # m^2 — fragmentos muy diminutos
 # ATRAVIESA (y por tanto partirlo). Por debajo, la losa sólo apoya contra su cara y el
 # muro se deja como pieza continua, que es lo que el modelo expresa.
 SLAB_PENETRATION_TOL = 0.005  # 5 mm
+# Cuánto del LARGO del muro tiene que abarcar la losa para que valga la pena partirlo en
+# vez de abrirle una ranura. Por debajo de esto la ranura no llega a los bordes y el muro
+# sigue siendo una pieza entera.
+FULL_SPAN_FRAC = 0.9
+# Separación máxima entre la losa y la cara del muro para considerar que se tocan. Cubre
+# la holgura de modelado, no un hueco de diseño.
+SLAB_CONTACT_TOL = 0.02  # 2 cm
 
 
 @dataclass
@@ -579,11 +586,23 @@ def split_wall_groups_at_floors(
             if overlap_a < -tol or overlap_b < -tol:
                 continue
 
-            # El muro se parte sólo si la losa PENETRA su plano. Si la losa termina
-            # contra la cara interior (penetración ~0), el autor la modeló apoyada y el
-            # muro es una pieza continua: partirlo obliga a un encastre que el modelo no
-            # pide, y al armar la maqueta el entrepiso queda apoyado por encima.
-            # Antes bastaba la cercanía de las cajas (±10cm), que no distingue ambos casos.
+            # ¿Hay que partir el muro a este nivel, o alcanza con una ranura?
+            #
+            # La regla anterior era "sólo se parte si la losa PENETRA el plano del muro;
+            # si termina contra su cara, el autor la modeló apoyada y el muro es continuo".
+            # Eso respeta el modelo 3D pero ignora en qué se va a cortar. En un edificio
+            # una losa apoya contra un muro continuo y se sostiene sola; en una placa de
+            # 3 mm no hay nada donde apoyarse. Y cuando la losa cruza el muro DE LADO A
+            # LADO, la ranura que lo resolvería corre de borde a borde: el láser la recorre
+            # y el muro cae en dos pedazos igual. Medido en un modelo real: pieza de
+            # 140.0 mm de ancho con una ranura de 140.0 mm. O sea que "ranura pasante" y
+            # "dos piezas" son lo MISMO físicamente, sólo que la ranura lo entrega peor:
+            # dos fragmentos sin etiqueta, sin lugar propio en la plancha y sin paso en el
+            # instructivo.
+            #
+            # Entonces: si la losa abarca el largo del muro y lo toca, se parte. Si sólo
+            # lo cruza en una porción (un balcón contra un muro largo), la ranura sigue
+            # siendo la respuesta y el muro queda entero.
             if n_a is not None:
                 corners = (
                     (sp.min_a, sp.min_b), (sp.max_a, sp.min_b),
@@ -592,7 +611,19 @@ def split_wall_groups_at_floors(
                 projs = [ca * n_a + cb * n_b for ca, cb in corners]
                 penetration = min(w_off_max, max(projs)) - max(w_off_min, min(projs))
                 if penetration <= SLAB_PENETRATION_TOL:
-                    continue
+                    # El solape se mide a lo LARGO del muro. Un muro es fino en el otro
+                    # eje por definición, así que comparar el solape menor daría siempre
+                    # ~0 y no partiría nunca.
+                    largo_a, largo_b = w_max_a - w_min_a, w_max_b - w_min_b
+                    if largo_a >= largo_b:
+                        largo_muro, solape = largo_a, overlap_a
+                    else:
+                        largo_muro, solape = largo_b, overlap_b
+                    cruza_todo = (
+                        largo_muro > 1e-6 and solape >= largo_muro * FULL_SPAN_FRAC
+                    )
+                    if not (cruza_todo and penetration >= -SLAB_CONTACT_TOL):
+                        continue
 
             candidate_elevs.append(sp.elevation)
 
