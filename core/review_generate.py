@@ -32,7 +32,17 @@ from core.services.cutting_sheet import (
     project_faces_to_2d,
     shift_placement,
 )
-from core.services.plate_intersect import pair_key, resolve_plate_joints
+from core.services.plate_intersect import (
+    PLATE_THICKNESS_M,
+    pair_key,
+    resolve_plate_joints,
+)
+from core.services.recorte_csg import (
+    aplicar_destinos,
+    construir_placa,
+    destinos_de_ajustes,
+    usar_caras,
+)
 from core.services.flex_bending import (
     apply_flex_to_panel,
     apply_mark_lines_to_panel,
@@ -377,6 +387,32 @@ def _aplicar_muescas(edges, width_m, height_m, muescas):
     return nuevas, maxx - minx, maxy - miny, minx, miny
 
 
+def _poly_a_edges(poly, off_u: float, off_v: float) -> List[Edge2D]:
+    """Aristas del polígono resultante, renormalizadas a su propio origen.
+
+    Conserva la semántica de hueco: los anillos interiores salen con `hole=True` para que
+    el emisor los mande a CUT_INTERIOR y no al contorno exterior.
+    """
+    out: List[Edge2D] = []
+    for g in getattr(poly, "geoms", [poly]):
+        if getattr(g, "area", 0.0) <= 1e-12:
+            continue
+        anillos = [(list(g.exterior.coords), False)]
+        anillos += [(list(h.coords), True) for h in g.interiors]
+        for coords, es_hueco in anillos:
+            for i in range(len(coords) - 1):
+                (ax, ay), (bx, by) = coords[i], coords[i + 1]
+                # Los booleanos de shapely dejan puntos repetidos donde el rectángulo toca
+                # el contorno: una arista de largo cero no corta nada y rompe el cierre.
+                if abs(ax - bx) <= 1e-9 and abs(ay - by) <= 1e-9:
+                    continue
+                out.append(
+                    Edge2D(a=Vec2(ax - off_u, ay - off_v),
+                           b=Vec2(bx - off_u, by - off_v), hole=es_hueco)
+                )
+    return out
+
+
 def _material_de_la_pieza(edges: List[Edge2D]):
     """Polígono del MATERIAL de la pieza a partir de sus aristas (contorno menos huecos).
 
@@ -675,6 +711,20 @@ def decompose_panels_from_groups(
     # del láser del lado interior aunque el archivo traiga normales invertidas.
     oriented_normals = orient_group_normals_outward(phase1.groups)
 
+    # Placas para el motor booleano: marco 3D + contorno 2D de cada grupo, una sola vez.
+    usar_caras(phase1.faces)
+    placas_csg: Dict[int, object] = {}
+    for _g in phase1.groups:
+        if _effective_category(_g, overrides) == "discard":
+            continue
+        _pl = construir_placa(
+            _g, phase1.faces,
+            oriented_normals.get(_g.id, _g.representative_normal),
+        )
+        if _pl is not None:
+            placas_csg[_g.id] = _pl
+
+
     for group in phase1.groups:
         cat = _effective_category(group, overrides)
         if cat == "discard":
@@ -769,189 +819,39 @@ def decompose_panels_from_groups(
                     )
             continue
 
-        height_delta = height_adj.get(group.id, 0.0)
-        if height_delta < 0 and not is_floor:
-            strip = min(-height_delta, height_m - 0.01)
-            if strip > 0.001:
-                base_at_min_v = result.v_up >= 0
-                clipped = (
-                    clip_panel_at_v(edges, strip, True)
-                    if base_at_min_v
-                    else clip_panel_at_v(edges, height_m - strip, False)
-                )
-                if clipped:
-                    width_m, height_m, edges = (
-                        clipped["width_m"],
-                        clipped["height_m"],
-                        clipped["edges"],
-                    )
-                    clip_off_u += clipped.get("offset_u", 0.0)
-                    clip_off_v += clipped.get("offset_v", 0.0)
-
-        # Techo/losa encima del muro → recortar la CIMA del panel (borde opuesto a la base).
-        top_delta = height_top_adj.get(group.id, 0.0)
-        if top_delta < 0 and not is_floor:
-            strip = min(-top_delta, height_m - 0.01)
-            if strip > 0.001:
-                base_at_min_v = result.v_up >= 0
-                clipped = (
-                    clip_panel_at_v(edges, height_m - strip, False)
-                    if base_at_min_v
-                    else clip_panel_at_v(edges, strip, True)
-                )
-                if clipped:
-                    width_m, height_m, edges = (
-                        clipped["width_m"],
-                        clipped["height_m"],
-                        clipped["edges"],
-                    )
-                    clip_off_u += clipped.get("offset_u", 0.0)
-                    clip_off_v += clipped.get("offset_v", 0.0)
-
-        # El recorte lateral es una MUESCA acotada a la banda donde el vecino existe, no
-        # un recorte del borde entero.
+        # ---------------------------------------------------------------
+        # DESTINOS + BOOLEANO. Una sola pasada, sin análisis de casos.
         #
-        # Antes se guardaba un solo recorte por borde, el mayor. Cuando dos vecinos
-        # distintos llegan al MISMO extremo pero a alturas distintas —una fachada que
-        # arriba topa con un muro y abajo con otro, separados 20 cm— ganaba el recorte
-        # mayor y se aplicaba a toda la altura: la pieza perdía 4.00 mm de material donde
-        # el vecino de abajo sí necesitaba que llegara. Medido: 9 de 22 bordes con varios
-        # vecinos salían mal, contra 6 de 68 con uno solo.
+        # Reemplaza la cadena procedural que aplicaba en secuencia el recorte de base, el
+        # de cima, las muescas laterales y el recorte en el plano — cada uno con su propio
+        # criterio de lado y arrastrando `clip_off_u/v` entre pasos. Esa cadena fue la
+        # causa directa de tres defectos medidos: la decisión izquierda/derecha se tomaba
+        # en un marco desactualizado, el respaldo por recorte de borde perdía todo ajuste
+        # que pidiera ALARGAR (porque `clip_panel_at_u` sólo sabe cortar), y había que
+        # distinguir a mano si la junta caía en el extremo o en la panza.
         #
-        # Restar rectángulos también resuelve de raíz la acumulación que motivó aquel
-        # "un recorte por borde": restar dos veces la misma zona no acumula, y restar dos
-        # zonas distintas es justamente lo que hace falta.
-        muescas: List[Tuple[bool, float, float, float]] = []
-        for w_adj in width_adjs.get(group.id, []):
-            # No hay guarda de signo. La había —`delta >= 0 and delta_plate >= 0`— de
-            # cuando un ajuste sólo podía achicar: si no achicaba, no servía. Desde que
-            # una pieza puede ALARGARSE, esa condición tira justo los casos en que la
-            # pieza queda más corta que media placa y hay que estirarla hasta la cara de
-            # su vecina. Medido: descartaba 30 ajustes del muro pasante sobre los tres
-            # modelos (20 en demo, 6 en bfe62e18, 4 en casa simple), el 100% de lo que
-            # filtraba. El único descarte legítimo es el ajuste NULO, y ése lo hace el
-            # `abs(recorte) <= 0.001` de abajo.
-            if is_floor:
-                continue
-            recorte = -_delta_m(w_adj)
-            # NEGATIVO = la pieza tiene que CRECER para llegar a la cara de su vecina.
-            # Antes se descartaba acá y la pieza quedaba con el largo crudo del modelo.
-            if abs(recorte) <= 0.001:
-                continue
-            j = phase1.joints[w_adj.joint_index]
-            u_j = dot(j.edge_mid, result.u_axis) - result.origin_u
-            izquierda = u_j < result.width_m / 2
-            # Banda que ocupa el VECINO sobre el eje v del panel. Se mide proyectando sus
-            # vértices, no tomando su altura en el mundo: así vale para paneles
-            # inclinados, donde v no es la vertical.
-            otro = group_by_id.get(w_adj.against_group_id)
-            v_lo, v_hi = 0.0, height_m
-            if otro is not None:
-                proy = [
-                    dot(v, result.v_axis) - result.origin_v - clip_off_v
-                    for fi in otro.face_indices
-                    if 0 <= fi < len(phase1.faces)
-                    for v in phase1.faces[fi].vertices
-                ]
-                if proy:
-                    v_lo, v_hi = max(min(proy), 0.0), min(max(proy), height_m)
-            if v_hi - v_lo > 0.001:
-                muescas.append((izquierda, recorte, v_lo, v_hi))
-
-        if muescas:
-            # El material se saca del extremo DONDE ESTÁ LA JUNTA. Las dos ramas del clip
-            # estaban invertidas en su momento: la pieza salía con el largo correcto pero
-            # desplazada el recorte entero, así que en la junta se metía dentro del vecino
-            # y en el extremo libre no llegaba.
-            recortado = _aplicar_muescas(edges, width_m, height_m, muescas)
-            if recortado:
-                edges, width_m, height_m, off_u, off_v = recortado
-                clip_off_u += off_u
-                clip_off_v += off_v
-            else:
-                # La muesca necesita el POLÍGONO del material y hay piezas cuyo contorno no
-                # cierra: cuando una abertura llega al borde (una puerta que baja hasta el
-                # piso) las jambas salen colapsadas y no hay cara que recortar. Ahí se cae
-                # al recorte de borde entero de siempre, que sólo mira las aristas.
-                #
-                # Perder el recorte NO es una opción: al introducir la muesca, 4 piezas de
-                # un modelo del corpus se quedaron sin ningún recorte —8.00 m en vez de
-                # 7.40— y aparecieron 3 choques donde no había ninguno. Una muesca que no
-                # se puede calcular tiene que degradar al comportamiento anterior, nunca a
-                # no recortar.
-                # Sólo los recortes: `clip_panel_at_u` corta, no agranda. Un ajuste
-                # negativo se pierde acá, y por eso este camino es el respaldo y no el
-                # principal.
-                por_borde: Dict[bool, float] = {}
-                for izquierda, prof, _v_lo, _v_hi in muescas:
-                    if prof > por_borde.get(izquierda, 0.0):
-                        por_borde[izquierda] = prof
-                for izquierda, prof in por_borde.items():
-                    strip = min(prof, width_m - 0.01)
-                    if strip <= 0.001:
-                        continue
-                    clipped = (
-                        clip_panel_at_u(edges, strip, True)
-                        if izquierda
-                        else clip_panel_at_u(edges, width_m - strip, False)
-                    )
-                    if clipped:
-                        width_m = clipped["width_m"]
-                        height_m = clipped["height_m"]
-                        edges = clipped["edges"]
-                        clip_off_u += clipped.get("offset_u", 0.0)
-                        clip_off_v += clipped.get("offset_v", 0.0)
-
-        # Recorte EN EL PLANO de la pieza contra un grupo continuo (axis="plane"): el caso
-        # del entrepiso que tiene que ENTRAR entre dos muros que siguen de largo por
-        # arriba y por abajo. El eje (u o v) y el lado salen de la normal de ese muro, no
-        # de `v_up`, que en una losa no significa nada. Los pisos no recibían ningún
-        # recorte, así que el entrepiso salía con el ancho que tiene entre las pieles del
-        # modelo y al armar la maqueta no entraba.
-        por_lado: Dict[Tuple[str, bool], float] = {}
-        for p_adj in plane_adjs.get(group.id, []):
-            recorte = -_delta_m(p_adj)
-            if recorte <= 0.001:
-                continue
-            otro = group_by_id.get(p_adj.against_group_id)
-            if otro is None:
-                continue
-            n_otro = normalize(otro.representative_normal)
-            du = dot(n_otro, result.u_axis)
-            dv = dot(n_otro, result.v_axis)
-            eje = "u" if abs(du) >= abs(dv) else "v"
-            # La normal del muro apunta hacia afuera: si va en el sentido creciente del
-            # eje, el borde que toca ese muro es el ALTO.
-            alto = (du if eje == "u" else dv) > 0
-            clave = (eje, alto)
-            if recorte > por_lado.get(clave, 0.0):
-                por_lado[clave] = recorte
-
-        for (eje, alto), recorte in sorted(por_lado.items()):
-            limite = (width_m if eje == "u" else height_m) - 0.01
-            strip = min(recorte, limite)
-            if strip <= 0.001:
-                continue
-            if eje == "u":
-                clipped = (
-                    clip_panel_at_u(edges, width_m - strip, False)
-                    if alto
-                    else clip_panel_at_u(edges, strip, True)
+        # Ahora cada ajuste se traduce UNA vez a una coordenada objetivo en el marco crudo,
+        # y el motor booleano la ejecuta: resta lo que sobra, une lo que falta. Las dos
+        # operaciones se hacen siempre y la que no corresponde queda vacía sola.
+        ajustes_pieza = (
+            [a for a in adj_result.adjustments if a.group_id == group.id]
+        )
+        if ajustes_pieza:
+            placa = placas_csg.get(group.id)
+            if placa is not None:
+                destinos = destinos_de_ajustes(
+                    ajustes_pieza, placa, opts.scale_denom or 1.0, group_by_id
                 )
-            else:
-                clipped = (
-                    clip_panel_at_v(edges, height_m - strip, False)
-                    if alto
-                    else clip_panel_at_v(edges, strip, True)
+                res_csg = aplicar_destinos(
+                    placa, destinos,
+                    obstaculos=list(placas_csg.values()),
+                    espesor_m=PLATE_THICKNESS_M * (opts.scale_denom or 1.0),
                 )
-            if clipped:
-                width_m, height_m, edges = (
-                    clipped["width_m"],
-                    clipped["height_m"],
-                    clipped["edges"],
-                )
-                clip_off_u += clipped.get("offset_u", 0.0)
-                clip_off_v += clipped.get("offset_v", 0.0)
+                if res_csg is not None:
+                    poly_csg, width_m, height_m, off_u, off_v = res_csg
+                    edges = _poly_a_edges(poly_csg, off_u, off_v)
+                    clip_off_u += off_u
+                    clip_off_v += off_v
 
         edges = mirror_edges_horizontal(edges, width_m)
 
