@@ -448,13 +448,16 @@ def test_muro_sobre_losa_apoya_en_la_cara_de_la_placa(scale):
     medio, así que la cara superior de la placa cae en 0.125 + media_placa, que se mueve
     con la escala. Números reales de este modelo:
 
-        1:20  -> el muro llega 4.75 mm CORTO (habría que alargarlo: no se puede)
-        1:50  -> llega 1.00 mm corto
-        1:100 -> sobra 0.25 mm -> se recorta
-        1:200 -> sobra 0.87 mm -> se recorta
+        1:20  -> el muro llega 4.75 mm CORTO  -> se ALARGA hasta la cara
+        1:50  -> llega 1.00 mm corto           -> se alarga
+        1:100 -> sobra 0.25 mm                 -> se recorta
+        1:200 -> sobra 0.87 mm                 -> se recorta
 
-    Cuando la pieza ya llega corta no se la extiende (puede haber aberturas junto al
-    borde): se deja como está, y eso es lo que se afirma en esa rama.
+    Los cuatro casos se afirman igual, y ésa es la novedad. Antes, cuando la pieza ya
+    llegaba corta se la dejaba como estaba —`clip_panel_at_u` sabe cortar y no agrandar—
+    y quedaba una luz del tamaño de lo que le faltaba. Desde que el recorte lo ejecuta el
+    motor booleano, alargar es la misma operación con el objetivo del otro lado del borde:
+    resta si sobra, unión si falta. No hay dos ramas que afirmar.
     """
     # El muro va INSETADO respecto del borde de la losa. Si comparten plano lateral, el
     # clasificador fusiona la cara de la losa con la del muro en un solo grupo coplanar
@@ -486,14 +489,6 @@ def test_muro_sobre_losa_apoya_en_la_cara_de_la_placa(scale):
         plano_medio_losa = 0.125          # losa y=0..0.25
         base_bruta = 0.25                 # base del muro en el modelo
         necesario = (plano_medio_losa + media_placa_m) - base_bruta
-
-        if necesario <= 0.0:
-            # El muro ya llega corto: no se lo puede alargar, así que no se toca.
-            assert recorte_m == pytest.approx(0.0, abs=1e-6), (
-                f"1:{scale:.0f} el muro llegaba {(-necesario)/scale*1000:.2f}mm corto y "
-                f"aun así se le recortaron {recorte_m/scale*1000:.2f}mm"
-            )
-            continue
 
         base_final = base_bruta + recorte_m
         distancia_mm = (base_final - plano_medio_losa) / scale * 1000.0
