@@ -387,7 +387,10 @@ def _floor_slots(
     la atraviesa (`cutter_id` = losa). El par sale de `floor_wall_encounters`, la misma
     función que decide el recorte de la losa: una sola decisión, dos consumidores.
     """
-    from core.services.assembly_adjuster import floor_wall_encounters
+    from core.services.assembly_adjuster import (
+        floor_wall_encounters,
+        walls_born_on_floors,
+    )
 
     out: List[PlateJoint] = []
     width = PLATE_THICKNESS_M + KERF_CLEARANCE_M
@@ -397,6 +400,27 @@ def _floor_slots(
             continue
         out.append(
             PlateJoint(cutter_id=f.id, cut_id=w.id, a=seg[0], b=seg[1],
+                       width=width, kind="slot")
+        )
+
+    # Y la mitad que faltaba: la ranura EN LA LOSA para el muro que NACE sobre ella.
+    #
+    # En el edificio ese muro simplemente apoya, y el pipeline lo trataba así: le
+    # recortaba media placa la base para que se apoyara sobre la cara de la losa. Pero
+    # apoyar no sujeta nada. Medido sobre los tres modelos: 27 ranuras y NINGUNA en un
+    # piso. Los muros de planta baja llegaban a la plancha sin ningún encastre con su
+    # base — se paran a tope sobre una placa de 3 mm y se caen.
+    #
+    # Acá la losa recibe la ranura (`cut_id` = losa) y el muro la atraviesa
+    # (`cutter_id` = muro). La otra mitad —que el muro baje hasta la cara inferior de la
+    # losa en vez de apoyarse arriba— la hace `compute_adjustments` a partir de la misma
+    # lista, para que las dos no puedan discrepar.
+    for f, w in walls_born_on_floors(groups, faces):
+        seg = plate_joint_segment(f, w, faces, eps)
+        if seg is None:
+            continue
+        out.append(
+            PlateJoint(cutter_id=w.id, cut_id=f.id, a=seg[0], b=seg[1],
                        width=width, kind="slot")
         )
     return out
