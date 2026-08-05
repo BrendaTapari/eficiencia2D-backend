@@ -137,6 +137,11 @@ def compute_adjustments(
     adjustments: List[DimensionAdjustment] = []
     wall_wall_joints: List[WallWallJoint] = []
     decisiones_ignoradas: List[str] = []
+    # Muros que NACEN sobre una losa. La losa les abre una ranura pasante
+    # (`plate_intersect._floor_slots`), así que el muro tiene que BAJAR hasta la cara
+    # inferior de la losa en vez de apoyarse sobre la superior. Misma lista para las dos
+    # mitades: si discrepan, la ranura queda donde el muro no llega.
+    nacen_sobre = {(f.id, w.id) for f, w in walls_born_on_floors(groups, faces)}
 
     for ji, joint in enumerate(joints):
         # Muro-muro admite uniones OBLICUAS (ver MIN_JOINT_ANGLE_DEG); muro-losa sigue
@@ -180,15 +185,32 @@ def compute_adjustments(
             label = floor.label if floor.label else f"Grupo {floor.id}"
 
             if is_wall_on_top(wall, floor, joint):
-                # Muro encima de la losa → recortar BASE del muro
+                # Muro que arranca en el nivel de la losa. Dos casos, y el signo de la
+                # media placa es lo único que los separa:
+                #
+                #   - ATRAVIESA la losa por su ranura → el pie baja hasta la cara
+                #     INFERIOR (+media placa): la ranura lo sujeta y el pie queda a ras.
+                #   - sólo apoya                     → el pie topa contra la cara
+                #     SUPERIOR (−media placa).
+                #
+                # Antes todos caían en el segundo caso, y como ninguna losa recibía
+                # ranura, los muros de planta baja llegaban a la plancha sin ningún
+                # encastre con su base: se paran a tope sobre una placa de 3 mm.
+                atraviesa = (floor.id, wall.id) in nacen_sobre
                 adjustments.append(
                     DimensionAdjustment(
                         group_id=wall.id,
                         delta=-voladizo,
-                        delta_plate=-media_placa,
+                        delta_plate=+media_placa if atraviesa else -media_placa,
                         axis="height",
-                        reason=f"Apoyo en {label} (voladizo {voladizo * 1000:.0f}mm + media placa)",
+                        reason=(
+                            f"Entra en la ranura de {label} "
+                            f"(voladizo {voladizo * 1000:.0f}mm − media placa)"
+                            if atraviesa else
+                            f"Apoyo en {label} (voladizo {voladizo * 1000:.0f}mm + media placa)"
+                        ),
                         joint_index=ji,
+                        against_group_id=floor.id,
                     )
                 )
             elif is_roof_above_wall(floor, wall, joint):
@@ -651,6 +673,70 @@ def wall_end_fit_adjustments(
                     against_group_id=f.id,
                 )
             )
+    return out
+
+
+def wall_is_born_on(wall: GeometryGroup, floor: GeometryGroup) -> bool:
+    """El muro NACE en la losa: su pie está al nivel de ella y no la atraviesa.
+
+    Es el complemento de `wall_crosses_level`. En el edificio ese muro simplemente apoya
+    sobre la losa, pero en la maqueta apoyar no alcanza: son dos placas de 3 mm a tope y
+    nada las sujeta. Medido sobre los tres modelos: 27 ranuras y NINGUNA en un piso, así
+    que los muros de planta baja no tenían ningún encastre con su base.
+    """
+    if None in (wall.min_y, floor.min_y, floor.max_y):
+        return False
+    if wall_crosses_level(wall, floor):
+        return False
+    nivel = (floor.min_y + floor.max_y) / 2.0
+    return abs(wall.min_y - nivel) <= FLOOR_CROSS_TOL_M
+
+
+def walls_born_on_floors(
+    groups: List[GeometryGroup], faces: Optional[List[Face3D]]
+) -> List[Tuple[GeometryGroup, GeometryGroup]]:
+    """`(losa, muro)` de cada muro que nace sobre una losa y coincide con ella en planta.
+
+    FUENTE ÚNICA del encuentro, igual que `floor_wall_encounters`: la consumen la ranura
+    de la losa (`plate_intersect._floor_slots`) y el ajuste de la base del muro. Las dos
+    mitades de la misma junta salen de la misma lista, para que no puedan discrepar.
+    """
+    out: List[Tuple[GeometryGroup, GeometryGroup]] = []
+    if not faces:
+        return out
+    floors = [
+        g for g in groups
+        if g.category == "floor" and abs(normalize(g.representative_normal).y) > 0.5
+    ]
+    walls = [
+        g for g in groups
+        if g.category == "wall" and abs(normalize(g.representative_normal).y) <= 0.5
+    ]
+    if not floors or not walls:
+        return out
+
+    def caja(g: GeometryGroup):
+        xs = []; zs = []
+        for fi in g.face_indices:
+            if 0 <= fi < len(faces):
+                for v in faces[fi].vertices:
+                    xs.append(v.x); zs.append(v.z)
+        return (min(xs), max(xs), min(zs), max(zs)) if xs else None
+
+    cajas = {g.id: caja(g) for g in floors + walls}
+    for f in floors:
+        cf = cajas.get(f.id)
+        if cf is None:
+            continue
+        for w in walls:
+            cw = cajas.get(w.id)
+            if cw is None or not wall_is_born_on(w, f):
+                continue
+            tol = FLOOR_CROSS_TOL_M
+            if (min(cf[1], cw[1]) - max(cf[0], cw[0]) < -tol
+                    or min(cf[3], cw[3]) - max(cf[2], cw[2]) < -tol):
+                continue
+            out.append((f, w))
     return out
 
 
