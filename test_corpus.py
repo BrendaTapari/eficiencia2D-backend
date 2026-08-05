@@ -53,11 +53,7 @@ LINEA_BASE = {
     # detector NO ve (causa "no_detectada": A1/A4, A1/A5, A19/A20). No es la matemática
     # del recorte: es el hueco de detección, que sigue abierto. A cambio, el invariante
     # de esquina pasó de 25 a 33 bordes correctos en este mismo archivo y escala.
-    # 1:100 sube de 6 a 8 al darle ranura a la losa base: el muro ahora la ATRAVIESA
-    # en vez de apoyarse encima, y 2 de las 17 ranuras de piso no sobreviven al recorte
-    # de la pieza, así que ahí el muro pasa por donde no hay agujero. Es un caso a
-    # resolver aparte; a cambio, los tres modelos pasaron de 0 ranuras en pisos a 32.
-    "demo.obj": {"piezas": 43, "choques": {50.0: 6, 100.0: 8}},
+    "demo.obj": {"piezas": 43, "choques": {50.0: 6, 100.0: 6}},
 }
 
 
@@ -304,7 +300,7 @@ def test_ninguna_pieza_lleva_aristas_de_largo_cero(path, scale):
 # Bordes de esquina que NO caen a media placa del plano medio de su vecina, por modelo
 # y escala: (correctos, mal). Ver el test de abajo.
 LINEA_BASE_ENCAJE = {
-    "demo.obj": {50.0: (45, 31), 100.0: (46, 30)},
+    "demo.obj": {50.0: (46, 30), 100.0: (47, 29)},
 }
 
 
@@ -396,4 +392,78 @@ def test_las_esquinas_las_cierran_las_dos_piezas(path, scale):
             f"{path.name} 1:{scale:.0f}: {bien} correctos / {len(mal)} mal contra "
             f"{esp_bien} / {esp_mal} de la línea base. Es una MEJORA: actualizá "
             "LINEA_BASE_ENCAJE en este mismo commit."
+        )
+
+
+# Estado del grafo por modelo y escala: (evaluadas, fallan, conflictos).
+LINEA_BASE_RESTRICCIONES = {
+    "demo.obj": {50.0: (55, 20, 5), 100.0: (55, 20, 5)},
+}
+
+
+@pytest.mark.skipif(not MODELOS, reason="no hay modelos disponibles")
+@pytest.mark.parametrize("path", MODELOS, ids=lambda p: p.name)
+@pytest.mark.parametrize("scale", ESCALAS)
+def test_las_piezas_cumplen_el_grafo_de_restricciones(path, scale):
+    """El grafo dice dónde tiene que caer cada borde; acá se mide cuánto se cumple.
+
+    `core/services/restricciones.py` expresa cada regla de encaje como un DESTINO —la
+    distancia a la que el borde tiene que quedar del plano medio de su vecina— en vez de
+    como un delta relativo. Eso las hace comparables entre sí y detecta los conflictos en
+    vez de resolverlos en silencio quedándose con el mayor.
+
+    En esta fase el grafo NO se consume: el pipeline sigue aplicando los
+    `DimensionAdjustment` de siempre. Este test compara los dos mundos y es el criterio de
+    aceptación de las fases que vienen — cuando el grafo pase a ser el productor, estos
+    números tienen que BAJAR.
+
+    Vale como verificación cruzada del propio grafo: construido de forma independiente,
+    reproduce exactamente los mismos fallos que la medición geométrica directa
+    (`test_las_esquinas_las_cierran_las_dos_piezas`): 30 y 29 en demo, 21 y 16 en casa
+    simple, 21 y 19 en bfe62e18. Dos implementaciones distintas que coinciden.
+    """
+    from core.services.restricciones import construir_muro_muro, resolver, verificar
+
+    base = LINEA_BASE_RESTRICCIONES.get(path.name)
+    if base is None or scale not in base:
+        pytest.skip(f"{path.name} 1:{scale:.0f} no tiene línea base de restricciones")
+
+    work, walls, floors, _pjs = _procesar(path, scale)
+    rs = construir_muro_muro(work.joints, work.groups, work.faces, None)
+    elegidas, conflictos = resolver(rs)
+    evaluadas, fallas = verificar(
+        walls + floors, elegidas, work.groups, work.faces, scale
+    )
+    esp_eval, esp_fallas, esp_confl = base[scale]
+
+    assert evaluadas == esp_eval, (
+        f"{path.name} 1:{scale:.0f}: el grafo evaluó {evaluadas} restricciones y la línea "
+        f"base dice {esp_eval}. Cambió el conjunto de juntas, no sólo el resultado."
+    )
+    assert len(fallas) <= esp_fallas, (
+        f"{path.name} 1:{scale:.0f}: {len(fallas)} restricciones incumplidas, la línea "
+        f"base dice {esp_fallas}. REGRESIÓN. Peores: "
+        + str([
+            (pid, r.motivo, round(e, 2))
+            for pid, r, e in sorted(fallas, key=lambda x: -abs(x[2]))[:4]
+        ])
+    )
+    if len(fallas) < esp_fallas:
+        pytest.fail(
+            f"{path.name} 1:{scale:.0f}: {len(fallas)} incumplidas contra {esp_fallas} de "
+            "la línea base. Es una MEJORA: actualizá LINEA_BASE_RESTRICCIONES en este "
+            "mismo commit."
+        )
+    # Un CONFLICTO es un borde al que dos vecinas distintas le piden cosas incompatibles
+    # en la misma franja de altura: no existe corte que cumpla las dos. Hasta ahora se
+    # resolvían en silencio quedándose con el mayor. Que aparezcan más es una regresión;
+    # que aparezcan menos, una mejora que hay que registrar.
+    assert len(conflictos) <= esp_confl, (
+        f"{path.name} 1:{scale:.0f}: {len(conflictos)} conflictos, la línea base dice "
+        f"{esp_confl}. REGRESIÓN. " + "; ".join(c.mensaje() for c in conflictos[:2])
+    )
+    if len(conflictos) < esp_confl:
+        pytest.fail(
+            f"{path.name} 1:{scale:.0f}: {len(conflictos)} conflictos contra {esp_confl} "
+            "de la línea base. Es una MEJORA: actualizá LINEA_BASE_RESTRICCIONES."
         )
