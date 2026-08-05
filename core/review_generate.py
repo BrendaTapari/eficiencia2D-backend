@@ -363,6 +363,11 @@ def _aplicar_muescas(edges, width_m, height_m, muescas):
         for coords, es_hueco in anillos:
             for i in range(len(coords) - 1):
                 (ax, ay), (bx, by) = coords[i], coords[i + 1]
+                # Los booleanos de shapely dejan puntos repetidos donde el rectángulo que
+                # se une o se resta toca el contorno. Una arista de largo cero no corta
+                # nada y rompe el cierre del polígono cuando se vuelve a leer.
+                if abs(ax - bx) <= 1e-9 and abs(ay - by) <= 1e-9:
+                    continue
                 nuevas.append(
                     Edge2D(a=Vec2(ax - minx, ay - miny),
                            b=Vec2(bx - minx, by - miny), hole=es_hueco)
@@ -818,8 +823,14 @@ def decompose_panels_from_groups(
         # zonas distintas es justamente lo que hace falta.
         muescas: List[Tuple[bool, float, float, float]] = []
         for w_adj in width_adjs.get(group.id, []):
-            if w_adj.delta >= 0 and w_adj.delta_plate >= 0:
-                continue
+            # No hay guarda de signo. La había —`delta >= 0 and delta_plate >= 0`— de
+            # cuando un ajuste sólo podía achicar: si no achicaba, no servía. Desde que
+            # una pieza puede ALARGARSE, esa condición tira justo los casos en que la
+            # pieza queda más corta que media placa y hay que estirarla hasta la cara de
+            # su vecina. Medido: descartaba 30 ajustes del muro pasante sobre los tres
+            # modelos (20 en demo, 6 en bfe62e18, 4 en casa simple), el 100% de lo que
+            # filtraba. El único descarte legítimo es el ajuste NULO, y ése lo hace el
+            # `abs(recorte) <= 0.001` de abajo.
             if is_floor:
                 continue
             recorte = -_delta_m(w_adj)
