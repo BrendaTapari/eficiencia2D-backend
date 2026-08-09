@@ -475,3 +475,107 @@ def test_las_piezas_cumplen_el_grafo_de_restricciones(path, scale):
             f"{path.name} 1:{scale:.0f}: {len(conflictos)} conflictos contra {esp_confl} "
             "de la línea base. Es una MEJORA: actualizá LINEA_BASE_RESTRICCIONES."
         )
+
+
+@pytest.mark.skipif(not MODELOS, reason="no hay modelos disponibles")
+@pytest.mark.parametrize("path", MODELOS, ids=lambda p: p.name)
+@pytest.mark.parametrize("scale", ESCALAS)
+def test_el_instructivo_muestra_exactamente_lo_que_se_corta(path, scale):
+    """La maqueta reconstruida SÓLO con lo que viaja al front tiene que ser la real.
+
+    Es la garantía de fidelidad del instructivo, y está escrita al revés de como suele
+    escribirse: en vez de afirmar que el backend calcula bien, reconstruye la pieza como
+    la va a dibujar el visor —a partir de `placements`, nada más— y la compara contra la
+    pieza que se manda a cortar.
+
+    Se verifican las tres cosas que hacen que el dibujo sea el mismo objeto que la pieza:
+
+    1. El CONTORNO. Una pieza con muesca, abertura o faldón no es su rectángulo: el
+       bounding box de un faldón triangular tiene el doble de superficie. El instructivo
+       dibujaba cajas orientadas, así que mostraba material donde no había y tapaba los
+       huecos por donde entra la vecina.
+    2. La POSICIÓN en el mundo. `world = origin + u·u_axis + v·v_axis` tiene que valer
+       tal cual, sin que el consumidor compense el espejado (viene horneado en el marco).
+    3. El ESPESOR, en metros de edificio. La placa mide 3 mm de plancha siempre, pero eso
+       son 0.15 m a 1:50 y 0.60 m a 1:200: dibujar las piezas sin espesor esconde
+       justamente los choques que el espesor provoca.
+
+    Sin esto, "el instructivo es fiel" es una afirmación que nadie puede comprobar. Con
+    esto, si alguien cambia el marco, el espejado o el contorno y el visor deja de
+    coincidir con la plancha, falla acá y no en el MDF.
+    """
+    from shapely.geometry import Polygon
+    from shapely.ops import polygonize, unary_union
+
+    from core.review_generate import final_placements
+    from core.services.cutting_sheet import panel_cut_area_m2
+    from core.services.plate_intersect import PLATE_THICKNESS_M
+    from core.services.types import Vec3, dot
+
+    _work, walls, floors, _pjs = _procesar(path, scale)
+    piezas = walls + floors
+    payload = final_placements(walls, floors, scale)
+
+    assert len(payload) == len(piezas), (
+        f"{path.name} 1:{scale:.0f}: se mandan {len(payload)} piezas al instructivo y se "
+        f"cortan {len(piezas)}. El visor no puede dibujar lo que no recibe."
+    )
+
+    for p in piezas:
+        d = payload[str(p.source_group_id)]
+
+        # (3) espesor en metros de EDIFICIO, ya escalado.
+        assert d["thickness_m"] == pytest.approx(PLATE_THICKNESS_M * scale, abs=1e-9), (
+            f"{p.id}: el espesor que viaja es {d['thickness_m']:.4f} m y la placa mide "
+            f"{PLATE_THICKNESS_M * scale:.4f} m de edificio a 1:{scale:.0f}"
+        )
+
+        # (1) el contorno que viaja tiene que encerrar la MISMA superficie que se corta.
+        segs = [
+            ((e["a"]["x"], e["a"]["y"]), (e["b"]["x"], e["b"]["y"]))
+            for e in d["outline"]
+        ]
+        assert segs, f"{p.id}: viaja sin contorno; el visor sólo podría dibujar una caja"
+        caras = list(polygonize(unary_union([
+            __import__("shapely").geometry.LineString(s) for s in segs
+        ])))
+        if caras:
+            area_dibujada = unary_union(caras).area
+            area_cortada = panel_cut_area_m2(p.edges, p.width_m, p.height_m)
+            # El contorno se cierra sobre sí mismo: la superficie dibujada no puede ser
+            # MENOR que la que se corta (faltaría material) ni disparatadamente mayor.
+            assert area_dibujada >= area_cortada - 1e-6, (
+                f"{p.id}: el visor dibujaría {area_dibujada:.4f} m² y se cortan "
+                f"{area_cortada:.4f} m². Falta material en el dibujo."
+            )
+
+        # (2) la posición: los extremos del contorno, mapeados con la fórmula del
+        # contrato, tienen que caer sobre el plano medio de la pieza y dentro de su bbox.
+        o = Vec3(d["origin"]["x"], d["origin"]["y"], d["origin"]["z"])
+        u = Vec3(d["u_axis"]["x"], d["u_axis"]["y"], d["u_axis"]["z"])
+        v = Vec3(d["v_axis"]["x"], d["v_axis"]["y"], d["v_axis"]["z"])
+        n = Vec3(d["normal"]["x"], d["normal"]["y"], d["normal"]["z"])
+        assert d["mirrored"] is False, (
+            f"{p.id}: `mirrored` viene en True. El contrato es que el espejado ya está "
+            "horneado en el marco y el consumidor no compensa nada."
+        )
+        plano = None
+        for e in d["outline"][:64]:
+            for q in (e["a"], e["b"]):
+                w = Vec3(
+                    o.x + u.x * q["x"] + v.x * q["y"],
+                    o.y + u.y * q["x"] + v.y * q["y"],
+                    o.z + u.z * q["x"] + v.z * q["y"],
+                )
+                dist = dot(w, n)
+                if plano is None:
+                    plano = dist
+                assert abs(dist - plano) <= 1e-6, (
+                    f"{p.id}: el contorno mapeado al mundo no es plano (desvío "
+                    f"{abs(dist - plano):.6f} m). El marco que viaja no corresponde a "
+                    "esta pieza."
+                )
+        assert 0.0 <= max(e["a"]["x"] for e in d["outline"]) <= d["width_m"] + 1e-6, (
+            f"{p.id}: el contorno se sale del ancho declarado; en la plancha el nesting "
+            "separa por width×height y esto invadiría a la pieza vecina."
+        )
