@@ -1227,7 +1227,7 @@ def compute_nesting(
         sheet_cfg,
         panel_ids_by_group(wall_panels, floor_panels),
         plate_joints,
-        final_placements(wall_panels, floor_panels),
+        final_placements(wall_panels, floor_panels, opts.scale_denom or 1.0),
         # Fase D: ¿las piezas que se van a cortar arman el edificio? Se calcula acá, sobre
         # los paneles FINALES y con la escala ya elegida, porque la respuesta depende de
         # ambas cosas: a escalas gruesas la placa ocupa más edificio y aparecen choques
@@ -1264,19 +1264,49 @@ def _verificar(work, wall_panels, floor_panels, plate_joints, scale_denom):
 
 
 def final_placements(
-    wall_panels: List[Panel], floor_panels: List[Panel]
+    wall_panels: List[Panel],
+    floor_panels: List[Panel],
+    scale_denom: float = 1.0,
 ) -> Dict[str, Dict]:
-    """`group_id (str) -> marco de la pieza YA RECORTADA`, para el instructivo.
+    """Todo lo que hace falta para dibujar la maqueta EXACTAMENTE como se va a cortar.
 
-    Misma forma que `topology.placements` (origin / u_axis / v_axis / normal / width_m /
-    height_m / mirrored) más `area_m2` y `panel_id`. La diferencia es que estas medidas
-    son las que se van a cortar: `topology.placements` es la proyección cruda del modelo
-    y en un modelo real 20 de 28 piezas salían más grandes ahí que en la plancha.
+    `group_id (str) -> pieza`, con el marco 3D de la pieza YA RECORTADA más su CONTORNO
+    de corte. Con eso el visor no tiene que juntar datos de dos endpoints ni deducir nada:
+
+        world = origin + u·u_axis + v·v_axis
+
+    vale tal cual para cada punto de `outline`, sin compensar el espejado (viene horneado
+    en el marco, por eso `mirrored` es False).
+
+    Por qué el CONTORNO y no sólo el bounding box: una pieza con una muesca lateral, una
+    abertura o un faldón inclinado NO es su rectángulo. Dibujarla como caja orientada
+    —que es lo que hacía el instructivo— muestra material donde no lo hay y esconde los
+    huecos por donde entra la pieza vecina. El bounding box de un faldón triangular tiene
+    el doble de superficie que el faldón.
+
+    `thickness_m` viene en metros de EDIFICIO, ya multiplicado por la escala: la placa
+    mide 3 mm de plancha siempre, pero eso son 0.15 m a 1:50 y 0.30 m a 1:200. Extruir la
+    pieza por ese espesor es lo que hace visibles los choques que el espesor provoca.
     """
     out: Dict[str, Dict] = {}
     for p in list(wall_panels) + list(floor_panels):
-        if p.frame and p.source_group_id is not None and p.source_group_id >= 0:
-            out[str(p.source_group_id)] = dict(p.frame, panel_id=p.id)
+        if not p.frame or p.source_group_id is None or p.source_group_id < 0:
+            continue
+        out[str(p.source_group_id)] = dict(
+            p.frame,
+            panel_id=p.id,
+            category=p.category,
+            thickness_m=PLATE_THICKNESS_M * (scale_denom or 1.0),
+            outline=[
+                {
+                    "a": {"x": e.a.x, "y": e.a.y},
+                    "b": {"x": e.b.x, "y": e.b.y},
+                    "hole": bool(e.hole),
+                }
+                for e in p.edges
+                if not getattr(e, "score", False)
+            ],
+        )
     return out
 
 
@@ -1303,7 +1333,7 @@ def placements_fieles(
     _work, walls, floors, _pjs = _decompose(
         phase1, opts, overrides, wall_wall_decisions, None, None
     )
-    return final_placements(walls, floors)
+    return final_placements(walls, floors, scale_denom)
 
 
 def generate_from_review(
