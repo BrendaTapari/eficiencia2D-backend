@@ -744,7 +744,19 @@ def panel_cut_area_m2(edges: List[Edge2D], width_m: float, height_m: float) -> f
 
 
 def build_placements(groups, faces: List[Face3D], up: UpAxis = "Y") -> Dict[str, Dict]:
-    """Marco de proyección 3D por grupo (no-discard). group_id (str) -> placement."""
+    """Marco de proyección 3D por grupo (no-discard). group_id (str) -> placement.
+
+    Son la proyección CRUDA del modelo: no llevan ninguno de los recortes de encaje y no
+    traen contorno de corte. Quien dibuje la maqueta tiene que usar `final_placements`.
+
+    `mirrored` sale en False, distinto de lo que devuelve `compute_group_placement`. Ahí
+    el True significa "el contorno de corte de esta pieza viene espejado respecto de este
+    marco", y acá NO HAY contorno adjunto, así que el aviso no aplica y sólo confunde:
+    estos placements y los fieles viajan al front bajo la MISMA clave `placements` y con
+    valores opuestos en el mismo campo. El front reportó justamente esa contradicción.
+    Con los dos en False, el campo significa siempre lo mismo — "las coordenadas que uses
+    con este marco ya están en su sistema, no compenses nada" — y para saber cuál de los
+    dos datos llegó está `placements_fieles`, que es el flag que corresponde."""
     out: Dict[str, Dict] = {}
     # Misma normal canónica (hacia afuera) que usa la plancha → el instructivo y el
     # corte comparten marco aunque el archivo traiga normales invertidas.
@@ -759,7 +771,7 @@ def build_placements(groups, faces: List[Face3D], up: UpAxis = "Y") -> Dict[str,
             gfaces, oriented.get(g.id, g.representative_normal), up
         )
         if pl:
-            out[str(g.id)] = pl
+            out[str(g.id)] = dict(pl, mirrored=False)
     return out
 
 
@@ -799,6 +811,7 @@ def clip_panel_at_v(
     for i in range(0, len(crossings) - 1, 2):
         out.append(Edge2D(a=Vec2(crossings[i], cut), b=Vec2(crossings[i + 1], cut)))
 
+    out = _limpiar_recorte(out)
     if len(out) < 3:
         return None
 
@@ -834,6 +847,35 @@ def clip_panel_at_v(
     }
 
 
+def _limpiar_recorte(out: List[Edge2D]) -> List[Edge2D]:
+    """Saca segmentos de largo cero y repetidos del resultado de un recorte.
+
+    Los cierres del corte se generan pareando los cruces ordenados. Cuando la línea de
+    corte cae EXACTAMENTE sobre una arista que ya existía —pasa siempre que el recorte
+    coincide con un borde del modelo, p. ej. el canto de un muro de 0.30 m recortado
+    0.30 m— esos cierres repiten aristas que ya estaban, y los cruces repetidos generan
+    segmentos de largo cero.
+
+    Consecuencias medidas: el contorno deja de cerrar, `polygonize` no arma la cara y el
+    material de la pieza se lee mal (un marco de 7.74 m² daba 3.24 m²), lo que arrastra
+    el área informada, el recorte de las ranuras contra el material y la muesca lateral.
+    Y en la plancha, una arista repetida es una línea que el láser corta dos veces.
+    """
+    vistos = set()
+    limpio: List[Edge2D] = []
+    for e in out:
+        a = (round(e.a.x, 9), round(e.a.y, 9))
+        b = (round(e.b.x, 9), round(e.b.y, 9))
+        if a == b:
+            continue
+        k = ((a, b) if a <= b else (b, a), bool(e.hole), bool(getattr(e, "score", False)))
+        if k in vistos:
+            continue
+        vistos.add(k)
+        limpio.append(e)
+    return limpio
+
+
 def clip_panel_at_u(
     edges: List[Edge2D], cut: float, keep_right: bool
 ) -> Optional[Dict]:
@@ -865,6 +907,7 @@ def clip_panel_at_u(
     for i in range(0, len(crossings) - 1, 2):
         out.append(Edge2D(a=Vec2(cut, crossings[i]), b=Vec2(cut, crossings[i + 1])))
 
+    out = _limpiar_recorte(out)
     if len(out) < 3:
         return None
 
