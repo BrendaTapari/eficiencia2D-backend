@@ -895,7 +895,16 @@ def test_extremo_del_muro_apoya_en_la_cara_de_la_losa_sin_junta_detectada(scale)
             continue
         if abs(g.min_y - 2.20) > 0.02:      # sólo el muro que este caso construye
             continue
-        base_final = g.min_y + (_altura_bruta(g, work.faces) - panel.height_m)
+        bruta = _altura_bruta(g, work.faces)
+        # Y sólo si la pieza es MÁS ALTA que la placa. A 1:200 media placa son 0.30 m de
+        # edificio, así que el canto de la losa —una banda de 0.20 m que el splitter deja
+        # como grupo propio— necesitaría un recorte más grande que la pieza entera: el
+        # destino la borraría, no se aplica nada y sale sin recortar. Ése es otro problema
+        # —una pieza que a esa escala no se puede representar y habría que avisar— y no el
+        # que mide este caso.
+        if bruta <= PLATE_THICKNESS_M * scale:
+            continue
+        base_final = g.min_y + (bruta - panel.height_m)
         distancia_mm = abs(base_final - 2.20) / scale * 1000.0
         revisados += 1
         assert distancia_mm == pytest.approx(objetivo_mm, abs=TOL_MM), (
