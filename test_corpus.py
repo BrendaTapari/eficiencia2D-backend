@@ -59,7 +59,13 @@ LINEA_BASE = {
     # problema de encaje sino de clasificación, y ya está anotado aparte. A cambio, el
     # invariante de esquina sube de 192/136 a 196/132 sobre los tres modelos, y bfe62e18
     # a 1:100 —el archivo y la escala donde el usuario mide— salta de 33/19 a 37/15.
-    "demo.obj": {"piezas": 43, "choques": {50.0: 7, 100.0: 11}},
+    # 50 piezas (antes 43): `mesh_splitter` parte los muros al nivel de cada losa, así
+    # que un muro que cruza un entrepiso llega como dos tramos y el piso entra entre
+    # ellos. Ese cambio se había revertido el 1/8 porque con el motor de recorte viejo
+    # regresaba las mediciones; con el motor booleano cambió de signo y hoy es una mejora
+    # clara: el invariante de esquina pasa de 46/30 a 72/21 a 1:50 y de 47/29 a 71/22 a
+    # 1:100, con los choques igual o mejor.
+    "demo.obj": {"piezas": 50, "choques": {50.0: 7, 100.0: 10}},
 }
 
 
@@ -306,7 +312,7 @@ def test_ninguna_pieza_lleva_aristas_de_largo_cero(path, scale):
 # Bordes de esquina que NO caen a media placa del plano medio de su vecina, por modelo
 # y escala: (correctos, mal). Ver el test de abajo.
 LINEA_BASE_ENCAJE = {
-    "demo.obj": {50.0: (46, 30), 100.0: (47, 29)},
+    "demo.obj": {50.0: (72, 21), 100.0: (71, 22)},
 }
 
 
@@ -405,7 +411,7 @@ def test_las_esquinas_las_cierran_las_dos_piezas(path, scale):
 LINEA_BASE_RESTRICCIONES = {
     # Baja de 20 a 16 incumplidas al pasar el recorte al motor booleano: el crecimiento
     # hacia la cara exterior de la vecina, que antes se descartaba entero, ahora se aplica.
-    "demo.obj": {50.0: (55, 16, 5), 100.0: (55, 16, 5)},
+    "demo.obj": {50.0: (72, 11, 5), 100.0: (72, 12, 5)},
 }
 
 
