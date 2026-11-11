@@ -1219,6 +1219,240 @@ def polish_groups(groups: List[GeometryGroup], min_real_area: float) -> None:
     groups.sort(key=lambda g: (ORDER[g.category], -g.total_area))
 
 
+# Tolerancia vertical para decidir que un grupo vertical cabe ENTERO dentro del espesor
+# de una losa, y horizontal para decidir que cae sobre su huella.
+RIM_Y_TOL = 0.02
+RIM_FOOTPRINT_TOL = 0.05
+# Una "losa" más gruesa que esto no es una losa (son dos niveles fundidos): no se le
+# buscan cantos, porque un muro bajo entre ambos sí sería una pieza.
+RIM_MAX_SLAB_THICKNESS = 0.6
+
+
+def _islas_por_vertice(indices: List[int], faces: List[Face3D]) -> List[List[int]]:
+    """Parte un conjunto de caras en islas: dos caras van juntas si comparten un vértice."""
+    padre = {fi: fi for fi in indices}
+
+    def raiz(x: int) -> int:
+        while padre[x] != x:
+            padre[x] = padre[padre[x]]
+            x = padre[x]
+        return x
+
+    visto: Dict[Tuple[int, int, int], int] = {}
+    for fi in indices:
+        for v in faces[fi].vertices:
+            k = (round(v.x * 1000), round(v.y * 1000), round(v.z * 1000))
+            otro = visto.setdefault(k, fi)
+            if otro != fi:
+                padre[raiz(fi)] = raiz(otro)
+    islas: Dict[int, List[int]] = {}
+    for fi in indices:
+        islas.setdefault(raiz(fi), []).append(fi)
+    return list(islas.values())
+
+
+def discard_slab_rims(
+    groups: List[GeometryGroup],
+    faces: List[Face3D],
+    out_warnings: Optional[List[str]] = None,
+    min_real_area: float = DEFAULT_MIN_REAL_AREA,
+) -> int:
+    """Descarta los CANTOS de losa que quedaron clasificados como pared.
+
+    Una losa modelada como sólido trae, además de su cara de arriba y la de abajo, las
+    caras verticales del borde. Son verticales, así que el clasificador las llama "pared",
+    y si el borde es largo superan el área mínima: una losa de 17 m con 26 cm de espesor
+    da un "muro" de 4.3 m². Se cortaba como una tira de 17 cm × 0.5 mm de plancha —una
+    pieza que no existe— y además entraba al cálculo de juntas como vecino de los muros
+    de verdad.
+
+    No es una pieza: es el espesor de la losa, y en la maqueta ese canto ya lo da la
+    placa de la losa. El criterio es geométrico y no depende de la escala: el grupo es
+    vertical, cabe ENTERO dentro del rango de alturas de una losa y cae sobre su huella.
+
+    Vale igual para el tramo de fachada que `split_wall_groups_at_floors` deja justo
+    frente al canto del entrepiso: el muro de abajo termina bajo la losa, el de arriba
+    apoya encima y la losa llega hasta el plano de la fachada, así que esa franja queda
+    cubierta por el canto de la placa.
+
+    Se marca como descartado, no se borra: el usuario lo ve en la lista y lo puede
+    rescatar con un override, como cualquier otro descartado. Devuelve cuántos descartó.
+    """
+    try:
+        from shapely.geometry import MultiPoint, Polygon
+        from shapely.ops import unary_union
+    except Exception:
+        return 0
+
+    def _huella(g):
+        polys = []
+        for fi in g.face_indices:
+            if not (0 <= fi < len(faces)):
+                continue
+            f = faces[fi]
+            if abs(f.normal.y) < HORIZONTAL_THRESHOLD or len(f.vertices) < 3:
+                continue
+            try:
+                p = Polygon([(v.x, v.z) for v in f.vertices])
+                if not p.is_valid:
+                    p = p.buffer(0)
+                if not p.is_empty and p.area > 1e-9:
+                    polys.append(p)
+            except Exception:
+                continue
+        if not polys:
+            return None
+        try:
+            return unary_union(polys)
+        except Exception:
+            return None
+
+    horizontales = [
+        (g, _huella(g))
+        for g in groups
+        if g.min_y is not None and g.max_y is not None
+        and abs(g.representative_normal.y) >= HORIZONTAL_THRESHOLD
+    ]
+    horizontales = [(g, h) for g, h in horizontales if h is not None]
+
+    losas = []
+    for g, huella in horizontales:
+        if g.category != "floor":
+            continue
+        y0, y1 = g.min_y, g.max_y
+        # La OTRA piel de la losa puede no estar en el grupo: cuando el clasificador no
+        # las une, la segunda queda como un horizontal descartado. Sin buscarla acá el
+        # "espesor" de la losa sería cero y ningún canto cabría en él. Sólo cuenta como
+        # la otra piel una superficie que tape al menos media losa: una tarima o un
+        # escalón encima no convierten en canto al murete que los sostiene.
+        for otro, h2 in horizontales:
+            if otro is g:
+                continue
+            if otro.min_y < g.min_y - RIM_MAX_SLAB_THICKNESS:
+                continue
+            if otro.max_y > g.max_y + RIM_MAX_SLAB_THICKNESS:
+                continue
+            try:
+                if huella.intersection(h2).area < 0.5 * huella.area:
+                    continue
+            except Exception:
+                continue
+            y0, y1 = min(y0, otro.min_y), max(y1, otro.max_y)
+        if y1 - y0 > RIM_MAX_SLAB_THICKNESS:
+            continue
+        losas.append((y0, y1, huella.buffer(RIM_FOOTPRINT_TOL)))
+    if not losas:
+        return 0
+    recortados = 0
+
+    def _es_canto(indices: List[int]) -> bool:
+        """Estas caras caben ENTERAS en el espesor de alguna losa y caen sobre su huella."""
+        ys = [v.y for fi in indices for v in faces[fi].vertices]
+        pts = [(v.x, v.z) for fi in indices for v in faces[fi].vertices]
+        if not pts:
+            return False
+        y_lo, y_hi = min(ys), max(ys)
+        traza = None
+        for y0, y1, huella in losas:
+            if y_lo < y0 - RIM_Y_TOL or y_hi > y1 + RIM_Y_TOL:
+                continue
+            if traza is None:
+                traza = MultiPoint(pts).convex_hull
+            if huella.covers(traza):
+                return True
+        return False
+
+    descartados = 0
+    for g in groups:
+        if g.category != "wall" or g.min_y is None or g.max_y is None:
+            continue
+        if abs(g.representative_normal.y) > VERTICAL_THRESHOLD:
+            continue
+        validas = [fi for fi in g.face_indices if 0 <= fi < len(faces)]
+        if not validas:
+            continue
+        if _es_canto(validas):
+            g.category = "discard"
+            g.label = re.sub(r"^(Piso|Pared)", CATEGORY_LABELS["discard"], g.label)
+            descartados += 1
+            continue
+
+        # Grupo MIXTO: el canto quedó agrupado con otra cosa coplanar que lo toca —el
+        # testero de un muro que nace a filo con el borde, o la cara de una fachada que
+        # baja tapando el canto—. El grupo entero no cabe en el espesor de la losa, pero
+        # algunas de sus caras sí: ésas son canto y se le sacan. Si lo que queda no llega
+        # al área mínima (eran sólo testeros) se descarta; si es un muro de verdad, sigue,
+        # arrancando desde la cara de la losa.
+        if len(validas) < 2:
+            continue
+        de_canto = [fi for fi in validas if _es_canto([fi])]
+        if not de_canto or len(de_canto) == len(validas):
+            continue
+        resto = [fi for fi in validas if fi not in set(de_canto)]
+        # Sin el canto, lo que queda puede haber dejado de estar unido: dos testeros a
+        # 20 m uno del otro sólo eran "un grupo" porque el canto los conectaba. Cada isla
+        # se juzga sola; las que no llegan al área mínima se van con el canto.
+        #
+        # SÓLO las islas que están en el plano de un canto que se sacó: son las que ese
+        # canto unía. Un grupo trae además la OTRA piel del muro, que es una isla aparte
+        # por definición y puede ser chica (un retazo de 0.3 m²): si se la saca, el plano
+        # medio del muro se corre a la piel que queda. Se probó filtrar todas las islas y
+        # en demo.obj los bordes de esquina mal subieron de 13 a 17.
+        planos_canto = []
+        for fi in de_canto:
+            f = faces[fi]
+            n = normalize(f.normal)
+            planos_canto.append((n, dot(n, f.vertices[0])))
+
+        def _en_plano_de_canto(isla: List[int]) -> bool:
+            f = faces[isla[0]]
+            n = normalize(f.normal)
+            d = dot(n, f.vertices[0])
+            return any(
+                abs(dot(n, nc)) > 0.999 and abs(d - dc * (1 if dot(n, nc) > 0 else -1)) < 0.01
+                for nc, dc in planos_canto
+            )
+
+        resto = [
+            fi
+            for isla in _islas_por_vertice(resto, faces)
+            if not _en_plano_de_canto(isla)
+            or sum(face_area(faces[k]) for k in isla) >= min_real_area
+            for fi in isla
+        ]
+        area = sum(face_area(faces[fi]) for fi in resto)
+        if not resto or area < min_real_area:
+            g.category = "discard"
+            g.label = re.sub(r"^(Piso|Pared)", CATEGORY_LABELS["discard"], g.label)
+            descartados += 1
+            continue
+        ys = [v.y for fi in resto for v in faces[fi].vertices]
+        cx = cy = cz = 0.0
+        for fi in resto:
+            a = face_area(faces[fi])
+            c = face_centroid(faces[fi])
+            cx += c.x * a; cy += c.y * a; cz += c.z * a
+        g.face_indices = resto
+        g.total_area = area
+        g.min_y, g.max_y = min(ys), max(ys)
+        if area > 0:
+            g.centroid = Vec3(cx / area, cy / area, cz / area)
+        recortados += 1
+
+    if descartados or recortados:
+        ORDER = {"floor": 0, "wall": 1, "discard": 2}
+        groups.sort(key=lambda g: (ORDER[g.category], -g.total_area))
+    if descartados:
+        if out_warnings is not None:
+            out_warnings.append(
+                f"{descartados} superficie(s) vertical(es) son el canto de una losa "
+                "(caben enteras dentro de su espesor) y no se cortan como pieza: ese "
+                "canto lo da la placa de la losa. Si alguna es una pieza real, "
+                "reclasificala a mano."
+            )
+    return descartados
+
+
 def peel_buried_walls(
     faces: List[Face3D], groups: List[GeometryGroup]
 ) -> List[GeometryGroup]:
