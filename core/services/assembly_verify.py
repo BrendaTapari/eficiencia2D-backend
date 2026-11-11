@@ -38,6 +38,8 @@ from core.services.plate_intersect import PLATE_THICKNESS_M, pair_key
 # Margen por debajo del cual una penetración es ruido de proyección y no un choque. Del
 # orden del kerf, igual que la tolerancia del banco de pruebas.
 TOL_MM = 0.2
+# Normales más paralelas que esto: las dos placas están apiladas, no se cruzan.
+COS_PARALELAS = 0.99
 # Lado de la grilla de muestreo, en metros de PLANCHA. 3 mm es el espesor de la placa: una
 # penetración más chica que eso ya está por debajo de lo que se puede detectar sin que el
 # muestreo sea el que manda.
@@ -62,6 +64,8 @@ class Interferencia:
     #   "no_detectada"  -> las piezas se tocan y el sistema no vio la unión (defecto NUESTRO)
     #   "escala"        -> a esta escala la placa no entra; a una más fina sí (cambiar escala)
     #   "modelo"        -> el modelo tiene un solape que no es un encuentro (revisar archivo)
+    #   "superpuestas"  -> dos placas PARALELAS montadas una sobre otra en parte de su
+    #                      superficie (revisar el archivo o fusionarlas a mano)
     causa: str
 
 
@@ -168,6 +172,7 @@ def verificar_ensamble(
 
     peor: Dict[Tuple[str, str], float] = {}
     grupos: Dict[Tuple[str, str], Tuple[int, int]] = {}
+    paralelas: Dict[Tuple[str, str], bool] = {}
 
     for i in range(len(pz)):
         for j in range(len(pz)):
@@ -198,11 +203,17 @@ def verificar_ensamble(
             if prof > peor.get(clave, 0.0):
                 peor[clave] = prof
                 grupos[clave] = k_grupo
+                paralelas[clave] = abs(float(A["n"] @ B["n"])) > COS_PARALELAS
 
     salida: List[Interferencia] = []
     for (a, b), prof in sorted(peor.items(), key=lambda kv: -kv[1]):
         k = grupos[(a, b)]
-        if k in juntas_sin_resolver:
+        if paralelas.get((a, b)):
+            # Dos placas paralelas no forman una unión: no hay junta que detectar ni
+            # recorte que falte. Rotularlas "no_detectada" le decía al usuario que el
+            # sistema no había visto un encuentro que no existe.
+            causa = "superpuestas"
+        elif k in juntas_sin_resolver:
             causa = "sin_recorte"
         elif k not in joints_detectadas:
             causa = "no_detectada"
@@ -234,6 +245,12 @@ MENSAJES = {
     "escala": (
         "A esta escala la placa de 3 mm representa demasiado edificio y las piezas no "
         "entran. Probá una escala más fina: el mismo modelo suele cerrar a 1:50."
+    ),
+    "superpuestas": (
+        "Estas dos piezas son paralelas y en el modelo están más cerca que el espesor de "
+        "la placa, así que se montan una sobre otra en parte de su superficie. Si son la "
+        "misma pared, fusionalas; si son dos elementos distintos, separalos en el modelo "
+        "o usá una escala más fina."
     ),
     "modelo": (
         "Las piezas se superponen más de lo que un encuentro explica. Conviene revisar el "
