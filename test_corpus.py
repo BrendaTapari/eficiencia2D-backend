@@ -65,7 +65,27 @@ LINEA_BASE = {
     # regresaba las mediciones; con el motor booleano cambió de signo y hoy es una mejora
     # clara: el invariante de esquina pasa de 46/30 a 72/21 a 1:50 y de 47/29 a 71/22 a
     # 1:100, con los choques igual o mejor.
-    "demo.obj": {"piezas": 50, "choques": {50.0: 7, 100.0: 10}},
+    #
+    # `piezas` pasa a depender de la ESCALA (37 a 1:50, 32 a 1:100; antes 50 fijo) y los
+    # choques bajan de 7/10 a 2/2. Tres cambios, medidos también sobre `Prueba app.obj`
+    # (403 piezas -> 348/342, choques 53/50 -> 3/2):
+    #   1. `discard_slab_rims`: 11 "muros" eran cantos de losa (tiras de hasta 17 cm por
+    #      medio milímetro de plancha). No dependen de la escala.
+    #   2. `placas_superpuestas`: superficies paralelas a menos de media placa y con
+    #      solape real son UNA pieza. Depende de la escala porque la placa mide 15 cm de
+    #      edificio a 1:50 y 30 a 1:100: por eso a 1:100 se funden más.
+    #   3. Dos tramos coplanares ya no crecen uno dentro del otro al tapar el canto de un
+    #      tabique que llega a su costura: pasa el primero y el segundo hace tope.
+    # De los 104 choques entre placas PARALELAS que había sumando los dos modelos y las
+    # dos escalas quedan 4; los que restan son casi todos perpendiculares de causa
+    # "escala".
+    #
+    # 1:100 baja de 2 a 0: una pieza ya no crece dentro de la placa ante la que cede
+    # (`cede_ante` en `aplicar_destinos`). Eran los dos choques de causa "escala".
+    # 1:50 pasa de 37 a 36 piezas: una piel interior partida en tramos se reconoce como
+    # la otra cara de su muro por solape real (`_espalda_con_espalda`), no por centroides.
+    # 1:50 baja de 2 a 1 choque al sacar las caras de canto de los grupos MIXTOS.
+    "demo.obj": {"piezas": {50.0: 36, 100.0: 32}, "choques": {50.0: 1, 100.0: 0}},
 }
 
 
@@ -109,14 +129,22 @@ def _base_externa(path: Path):
             datos = {}
     if path.name in datos:
         b = datos[path.name]
-        return {"piezas": b["piezas"], "choques": {float(k): v for k, v in b["choques"].items()}}
+        if not isinstance(b.get("piezas"), dict):
+            # Instantánea vieja, de cuando la cantidad de piezas no dependía de la escala:
+            # ya no es comparable. Se vuelve a medir más abajo.
+            datos.pop(path.name)
+        else:
+            return {
+                "piezas": {float(k): v for k, v in b["piezas"].items()},
+                "choques": {float(k): v for k, v in b["choques"].items()},
+            }
 
     # Primera vez: se mide y se registra. No se afirma nada en esta corrida.
     piezas = choques = None
-    registro = {"piezas": None, "choques": {}}
+    registro = {"piezas": {}, "choques": {}}
     for s in ESCALAS:
         work, walls, floors, pjs = _procesar(path, s)
-        registro["piezas"] = len(walls) + len(floors)
+        registro["piezas"][str(s)] = len(walls) + len(floors)
         detectadas = {pair_key(j.group_a, j.group_b) for j in work.joints}
         sin_res = {
             pair_key(j.group_a, j.group_b)
@@ -211,8 +239,9 @@ def test_linea_base_del_ensamble(path, scale):
 
     work, walls, floors, pjs = _procesar(path, scale)
     piezas = len(walls) + len(floors)
-    assert piezas == base["piezas"], (
-        f"{path.name}: {piezas} piezas, la línea base dice {base['piezas']}"
+    assert piezas == base["piezas"][scale], (
+        f"{path.name} 1:{scale:.0f}: {piezas} piezas, la línea base dice "
+        f"{base['piezas'][scale]}"
     )
 
     detectadas = {pair_key(j.group_a, j.group_b) for j in work.joints}
@@ -312,7 +341,21 @@ def test_ninguna_pieza_lleva_aristas_de_largo_cero(path, scale):
 # Bordes de esquina que NO caen a media placa del plano medio de su vecina, por modelo
 # y escala: (correctos, mal). Ver el test de abajo.
 LINEA_BASE_ENCAJE = {
-    "demo.obj": {50.0: (72, 21), 100.0: (71, 22)},
+    # Antes (72, 21) y (71, 22). Los bordes MAL bajan de 21 a 13 y de 22 a 14. Los
+    # correctos también bajan en número absoluto, y no es una regresión: hay menos juntas
+    # que medir, porque las dos pieles de un muro contaban cada esquina dos veces y los
+    # cantos de losa aportaban juntas contra los muros de verdad. La proporción de bordes
+    # correctos pasa de 77% a 80% a 1:50 y de 76% a 78% a 1:100.
+    #
+    # De los que quedan mal, los de +20 mm o más (A1, A14) no son esquinas: son encuentros
+    # en T medidos desde el muro PASANTE, cuyo extremo está —correctamente— a metros del
+    # tabique. Es una limitación de esta medición, que mira el extremo más cercano de las
+    # dos piezas de cada junta sin distinguir quién pasa. Queda anotado, no corregido.
+    # 1:50 pasa de (52, 13) a (50, 13): una pieza menos (ver LINEA_BASE), y con ella dos
+    # bordes que se medían contra la piel que ahora es parte de su muro. Los mal no cambian.
+    # (50, 13) y (49, 14) pasan a (49, 13) y (48, 14) al sacar las caras de canto de los
+    # grupos mixtos: una junta menos, que era de un muro contra un canto. Los mal no cambian.
+    "demo.obj": {50.0: (49, 13), 100.0: (48, 14)},
 }
 
 
@@ -411,7 +454,22 @@ def test_las_esquinas_las_cierran_las_dos_piezas(path, scale):
 LINEA_BASE_RESTRICCIONES = {
     # Baja de 20 a 16 incumplidas al pasar el recorte al motor booleano: el crecimiento
     # hacia la cara exterior de la vecina, que antes se descartaba entero, ahora se aplica.
-    "demo.obj": {50.0: (72, 11, 5), 100.0: (72, 12, 5)},
+    #
+    # Antes (72, 11, 5) y (72, 12, 5). Con los cantos de losa descartados y las pieles
+    # superpuestas fundidas hay menos restricciones que evaluar (51 y 48), bajan las
+    # incumplidas (8 y 10) y bajan los conflictos de 5 a 1 y 2: varios eran un mismo borde
+    # reclamado por las dos pieles de un mismo muro, que ya no son dos vecinas.
+    #
+    # 1:50 pasa de (51, 8, 1) a (48, 9, 2) con el criterio de pieles del mismo muro
+    # (`_espalda_con_espalda`): tres restricciones menos, pero UNA incumplida y UN conflicto
+    # más. Es una regresión chica en este archivo y se acepta a sabiendas, porque en
+    # `Prueba app.obj` el mismo cambio saca 46 piezas duplicadas y 28 de 32 pares de placas
+    # montadas media placa que el verificador no ve. Va en un commit propio para poder
+    # revertirlo solo si en los modelos reales no rinde.
+    #
+    # Con las caras de canto fuera de los grupos mixtos se evalúa una restricción menos
+    # (47); incumplidas y conflictos no cambian.
+    "demo.obj": {50.0: (47, 9, 2), 100.0: (47, 10, 2)},
 }
 
 
