@@ -41,6 +41,8 @@ from core.services.recorte_csg import (
     aplicar_destinos,
     construir_placa,
     destinos_de_ajustes,
+    paralela_ya_resuelta_que_la_pisa,
+    registrar_final,
     usar_caras,
 )
 from core.services.flex_bending import (
@@ -400,12 +402,29 @@ def _poly_a_edges(poly, off_u: float, off_v: float) -> List[Edge2D]:
         anillos = [(list(g.exterior.coords), False)]
         anillos += [(list(h.coords), True) for h in g.interiors]
         for coords, es_hueco in anillos:
-            for i in range(len(coords) - 1):
-                (ax, ay), (bx, by) = coords[i], coords[i + 1]
-                # Los booleanos de shapely dejan puntos repetidos donde el rectángulo toca
-                # el contorno: una arista de largo cero no corta nada y rompe el cierre.
-                if abs(ax - bx) <= 1e-9 and abs(ay - by) <= 1e-9:
+            # Los booleanos de shapely dejan puntos repetidos donde el rectángulo toca el
+            # contorno. Se quitan los PUNTOS repetidos y recién después se arman las
+            # aristas entre los que quedan, encadenadas y cerrando contra el primero.
+            #
+            # Antes se salteaba la ARISTA de largo casi cero, y eso rompe el anillo: si
+            # los dos puntos difieren en 1e-12, la arista anterior termina en uno y la
+            # siguiente empieza en el otro. A la vista está cerrado, pero ya no comparten
+            # nodo, `polygonize` no lo cierra y la pieza deja de ser un polígono para el
+            # verificador, que la saltea sin avisar. Apareció al hacer crecer las losas:
+            # 4 de 6 quedaban sin contorno en `Prueba app.obj`.
+            pts: List[Tuple[float, float]] = []
+            for (x, y) in coords:
+                if pts and abs(pts[-1][0] - x) <= 1e-9 and abs(pts[-1][1] - y) <= 1e-9:
                     continue
+                pts.append((x, y))
+            while len(pts) > 1 and (
+                abs(pts[0][0] - pts[-1][0]) <= 1e-9 and abs(pts[0][1] - pts[-1][1]) <= 1e-9
+            ):
+                pts.pop()
+            if len(pts) < 3:
+                continue
+            for i in range(len(pts)):
+                (ax, ay), (bx, by) = pts[i], pts[(i + 1) % len(pts)]
                 out.append(
                     Edge2D(a=Vec2(ax - off_u, ay - off_v),
                            b=Vec2(bx - off_u, by - off_v), hole=es_hueco)
@@ -836,22 +855,36 @@ def decompose_panels_from_groups(
         ajustes_pieza = (
             [a for a in adj_result.adjustments if a.group_id == group.id]
         )
-        if ajustes_pieza:
-            placa = placas_csg.get(group.id)
-            if placa is not None:
-                destinos = destinos_de_ajustes(
-                    ajustes_pieza, placa, opts.scale_denom or 1.0, group_by_id
-                )
-                res_csg = aplicar_destinos(
-                    placa, destinos,
-                    obstaculos=list(placas_csg.values()),
-                    espesor_m=PLATE_THICKNESS_M * (opts.scale_denom or 1.0),
-                )
-                if res_csg is not None:
-                    poly_csg, width_m, height_m, off_u, off_v = res_csg
-                    edges = _poly_a_edges(poly_csg, off_u, off_v)
-                    clip_off_u += off_u
-                    clip_off_v += off_v
+        placa = placas_csg.get(group.id)
+        espesor_edif = PLATE_THICKNESS_M * (opts.scale_denom or 1.0)
+        # También entra la pieza SIN ajustes si una paralela ya resuelta creció: ese
+        # material está tomado y hay que cedérselo aunque a ésta nadie le pida nada.
+        if placa is not None and (
+            ajustes_pieza
+            or paralela_ya_resuelta_que_la_pisa(
+                placa, placas_csg.values(), espesor_edif
+            )
+        ):
+            destinos = destinos_de_ajustes(
+                ajustes_pieza, placa, opts.scale_denom or 1.0, group_by_id
+            )
+            res_csg = aplicar_destinos(
+                placa, destinos,
+                obstaculos=list(placas_csg.values()),
+                espesor_m=espesor_edif,
+                # Cede = el ajuste de ancho le QUITA la media placa (la que pasa la suma).
+                cede_ante={
+                    a.against_group_id for a in ajustes_pieza
+                    if a.axis == "width" and getattr(a, "delta_plate", 0.0) < 0
+                    and a.against_group_id is not None
+                },
+            )
+            if res_csg is not None:
+                poly_csg, width_m, height_m, off_u, off_v = res_csg
+                registrar_final(placa, poly_csg)
+                edges = _poly_a_edges(poly_csg, off_u, off_v)
+                clip_off_u += off_u
+                clip_off_v += off_v
 
         edges = mirror_edges_horizontal(edges, width_m)
 
@@ -1040,6 +1073,102 @@ def _panels_to_nesting(panels: List[Panel], scale_denom: float) -> List[NestingP
     return out
 
 
+def _una_placa_por_lugar(
+    work: Phase1Result,
+    scale_denom: float,
+    overrides: Optional[Dict[int, str]],
+    wall_wall_decisions: Optional[Dict[int, int]],
+) -> Tuple[Phase1Result, Optional[Dict[int, int]]]:
+    """Funde los grupos paralelos que a esta escala son la misma placa de MDF.
+
+    Ver `core.services.placas_superpuestas`. Devuelve la topología fundida y las
+    decisiones del usuario TRADUCIDAS a ella.
+
+    Por qué hay que traducir las decisiones: viajan como {índice de junta -> grupo que
+    cede} y el índice es posicional. Fundir grupos reconstruye la lista de juntas, así que
+    el mismo índice pasa a nombrar otra junta. Acá se conoce la lista de antes y la de
+    después, entonces la decisión se pasa a {par de grupos -> quién cede}, que es lo único
+    que significa algo, y se vuelve a ubicar por par en la lista nueva. Si la decisión era
+    sobre una piel que se fundió, vale para la pieza que la absorbió.
+    """
+    from core.services.placas_superpuestas import detectar_placas_superpuestas
+
+    overrides = overrides or {}
+    try:
+        conjuntos = detectar_placas_superpuestas(
+            work.groups, work.faces, scale_denom,
+            lambda g: _effective_category(g, overrides),
+            orient_group_normals_outward(work.groups),
+        )
+    except Exception:
+        import logging
+        logging.getLogger("eficiencia2d.pipeline").exception(
+            "detectar_placas_superpuestas falló; se sigue sin fundir"
+        )
+        return work, wall_wall_decisions
+    if not conjuntos:
+        return work, wall_wall_decisions
+
+    fundido = apply_merges(work, conjuntos, overrides)
+    vivos = {g.id for g in fundido.groups}
+    by_id = {g.id: g for g in work.groups}
+    # Quién absorbió a quién. `apply_merges` puede negarse a fundir un miembro (lo separa
+    # una losa): ése sigue vivo y se representa a sí mismo.
+    absorbe: Dict[int, int] = {}
+    nombres: List[str] = []
+    for ids in conjuntos:
+        sobrevivientes = [i for i in ids if i in vivos]
+        if not sobrevivientes:
+            continue
+        principal = max(sobrevivientes, key=lambda i: by_id[i].total_area)
+        idos = [i for i in ids if i not in vivos]
+        for i in idos:
+            absorbe[i] = principal
+        if idos:
+            nombres.append(
+                f"{by_id[principal].label or principal} absorbe "
+                + ", ".join(str(by_id[i].label or i) for i in idos)
+            )
+    if not absorbe:
+        return fundido, wall_wall_decisions
+
+    avisos = list(fundido.warnings or [])
+    espesor_cm = PLATE_THICKNESS_M * scale_denom * 100.0
+    avisos.append(
+        f"A escala 1:{scale_denom:g} la placa de {PLATE_THICKNESS_M * 1000:g} mm ocupa "
+        f"{espesor_cm:.0f} cm de edificio: {len(absorbe)} superficie(s) paralela(s) que "
+        "en el modelo están más cerca que eso se cortan como UNA sola pieza con su "
+        "vecina (no hay lugar físico para dos). "
+        + "; ".join(nombres[:4]) + ("…" if len(nombres) > 4 else "")
+    )
+
+    decisiones = None
+    if wall_wall_decisions:
+        nuevo_indice: Dict[Tuple[int, int], int] = {}
+        for ji, j in enumerate(fundido.joints):
+            nuevo_indice.setdefault(pair_key(j.group_a, j.group_b), ji)
+        decisiones = {}
+        for ji, cede in wall_wall_decisions.items():
+            if not (0 <= ji < len(work.joints)):
+                continue
+            j = work.joints[ji]
+            a = absorbe.get(j.group_a, j.group_a)
+            b = absorbe.get(j.group_b, j.group_b)
+            if a == b:
+                continue  # la junta era entre dos pieles de la misma placa: ya no existe
+            destino = nuevo_indice.get(pair_key(a, b))
+            if destino is None:
+                avisos.append(
+                    f"La decisión sobre la unión {by_id[j.group_a].label or j.group_a} / "
+                    f"{by_id[j.group_b].label or j.group_b} no se pudo conservar al "
+                    "fundir superficies superpuestas: se resolvió automáticamente."
+                )
+                continue
+            decisiones.setdefault(destino, absorbe.get(cede, cede))
+
+    return replace(fundido, warnings=avisos, absorbed_groups=absorbe), decisiones
+
+
 def _decompose(
     phase1: Phase1Result,
     opts: PipelineOptions,
@@ -1055,6 +1184,9 @@ def _decompose(
 ) -> Tuple[Phase1Result, List[Panel], List[Panel], List]:
     """Aplica merges, resuelve encastres 3D y descompone a paneles 2D."""
     work = apply_merges(phase1, merges or [], overrides)
+    work, wall_wall_decisions = _una_placa_por_lugar(
+        work, opts.scale_denom or 1.0, overrides, wall_wall_decisions
+    )
 
     # ORDEN IMPORTANTE: primero se decide quién cede en cada junta, y recién después se
     # resuelven las ranuras CONSUMIENDO esa decisión. Antes era al revés y cada una la
@@ -1092,7 +1224,49 @@ def _decompose(
         user_cuts, flex, mark_lines, ribs, columns,
         adj_result=adj_result,
     )
+    aviso = _aviso_piezas_mas_finas_que_la_placa(
+        wall_panels + floor_panels, opts.scale_denom or 1.0
+    )
+    if aviso:
+        work = replace(work, warnings=list(work.warnings or []) + [aviso])
     return work, wall_panels, floor_panels, plate_joints
+
+
+def _aviso_piezas_mas_finas_que_la_placa(panels: List[Panel], scale_denom: float):
+    """Texto de aviso si alguna pieza mide, de ancho o de alto, menos que el espesor.
+
+    Una tira más angosta que los 3 mm de la placa no se puede armar parada: es más fina
+    que el canto del material con el que se corta. Casi siempre es un elemento del modelo
+    que a esta escala queda por debajo de lo que el MDF puede representar (un zócalo, un
+    antepecho, el canto de algo). Hasta ahora salía a la plancha sin ningún aviso.
+
+    No se la quita: decidir que sobra es del usuario. Se le dice cuáles son y cuánto
+    miden, en centímetros de edificio y en milímetros de plancha.
+    """
+    limite = PLATE_THICKNESS_M * scale_denom
+    finas = [
+        p for p in panels
+        if p.frame and min(p.width_m, p.height_m) < limite - 1e-9
+    ]
+    if not finas:
+        return None
+    finas.sort(key=lambda p: min(p.width_m, p.height_m))
+
+    def _una(p: Panel) -> str:
+        chico, grande = sorted((p.width_m, p.height_m))
+        return (
+            f"{p.id} ({grande:.2f} m × {chico * 100:.0f} cm de edificio = "
+            f"{chico / scale_denom * 1000:.1f} mm de plancha)"
+        )
+
+    return (
+        f"{len(finas)} pieza(s) miden menos que el espesor de la placa "
+        f"({PLATE_THICKNESS_M * 1000:g} mm = {limite * 100:.0f} cm de edificio a "
+        f"1:{scale_denom:g}) y no se pueden armar como placa: "
+        + "; ".join(_una(p) for p in finas[:5])
+        + ("…" if len(finas) > 5 else "")
+        + ". Conviene descartarlas, engrosarlas en el modelo o usar una escala más fina."
+    )
 
 
 def panel_ids_by_group(
@@ -1315,8 +1489,12 @@ def placements_fieles(
     scale_denom: float,
     overrides: Optional[Dict[int, str]] = None,
     wall_wall_decisions: Optional[Dict[int, int]] = None,
+    absorbidos_out: Optional[Dict[int, int]] = None,
 ) -> Dict[str, Dict]:
     """Marco 3D de cada pieza YA RECORTADA, a la escala a la que se va a cortar.
+
+    Si se pasa `absorbidos_out`, se llena con los grupos que a esta escala no tienen
+    pieza propia (`id absorbido -> id del grupo que lo incluye`).
 
     Es lo que el instructivo tiene que dibujar. `build_placements` proyecta el modelo
     crudo y por eso no conoce ningún recorte de encaje: sobre un modelo real dibujaba 19
@@ -1330,9 +1508,11 @@ def placements_fieles(
     opts = PipelineOptions(
         scale_denom=scale_denom, paper="A4", min_area_m2=1.0, sheet_config=None
     )
-    _work, walls, floors, _pjs = _decompose(
+    work, walls, floors, _pjs = _decompose(
         phase1, opts, overrides, wall_wall_decisions, None, None
     )
+    if absorbidos_out is not None:
+        absorbidos_out.update(work.absorbed_groups or {})
     return final_placements(walls, floors, scale_denom)
 
 
