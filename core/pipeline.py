@@ -9,6 +9,7 @@ from core.services.facade_extractor import detect_up_axis
 from core.group_classifier import (
     GeometryGroup,
     classify_into_groups,
+    discard_slab_rims,
     peel_buried_walls,
     polish_groups,
     split_groups_by_tags,
@@ -46,6 +47,11 @@ class Phase1Result:
     # "quién toca a quién": se deriva de `joints` y la comparten los encastres y el
     # instructivo, en vez de que cada consumidor la reconstruya con su propio criterio.
     group_adjacency: Dict[int, List[int]] = field(default_factory=dict)
+    # Grupos que a la escala de corte se fundieron en otro (`id absorbido -> id de la
+    # pieza que lo absorbió`). Lo llena `review_generate._una_placa_por_lugar`; vacío en
+    # la Fase 1, que no conoce la escala. El instructivo lo necesita para NO dibujar por
+    # su cuenta un grupo que no tiene pieza propia.
+    absorbed_groups: Dict[int, int] = field(default_factory=dict)
 
 
 def _rotate_z_to_y(face: Face3D) -> Face3D:
@@ -145,6 +151,11 @@ def parse_pipeline(
     # (sólo grupos finos por grosor; los muros gruesos quedan intactos).
     with timer.step("split_thin_groups_by_pane", group_count=len(split_groups)):
         split_groups = split_thin_groups_by_pane(split_groups, split_faces)
+
+    # 4.7 Los cantos de losa no son piezas (ver discard_slab_rims). Va ANTES de detectar
+    # juntas para que tampoco participen del encaje como vecinos de los muros reales.
+    with timer.step("discard_slab_rims", group_count=len(split_groups)):
+        discard_slab_rims(split_groups, split_faces, warnings, min_real_area)
 
     # 5. Detección de joints
     with timer.step("detect_joints", group_count=len(split_groups), face_count=len(split_faces)):
