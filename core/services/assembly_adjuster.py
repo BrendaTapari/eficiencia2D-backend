@@ -59,10 +59,14 @@ class DimensionAdjustment:
     # "height"     → recorta la BASE del muro (muro encima de losa de piso)
     # "height_top" → recorta la CIMA del muro (techo/losa encima del muro)
     # "width"      → recorta un lado lateral (muro-muro)
+    # "reach"      → la losa tiene que LLEGAR hasta la cara exterior de la placa del muro
+    #                `against_group_id` que nace (o muere) en su borde. Sólo agrega
+    #                material, nunca quita; `delta` no se usa: el destino sale del plano
+    #                medio del muro. Ver `floor_reach_adjustments`.
     # "plane"      → recorta la pieza EN SU PROPIO PLANO contra `against_group_id`; el eje
     #                (u o v) y el lado salen de la normal de ese grupo. Es el caso de una
     #                losa que tiene que entrar entre dos muros continuos.
-    axis: Literal["height", "height_top", "width", "plane"]
+    axis: Literal["height", "height_top", "width", "plane", "reach"]
     reason: str
     joint_index: int
     # Grupo CONTRA el que se recorta. Sólo lo usa `axis="plane"`, donde el eje del panel
@@ -406,6 +410,7 @@ def compute_adjustments(
     # absorbe el dedupe de altura de más abajo.
     adjustments.extend(floor_fit_adjustments(groups, faces))
     adjustments.extend(wall_end_fit_adjustments(groups, faces))
+    adjustments.extend(floor_reach_adjustments(groups, faces))
 
     # Deduplicar ajustes de altura: mantener el delta más negativo por grupo y eje.
     # Los ajustes de ancho (muro-muro) pasan directos.
@@ -651,6 +656,61 @@ def wall_end_fit_adjustments(
                     against_group_id=f.id,
                 )
             )
+    return out
+
+
+def floor_reach_adjustments(
+    groups: List[GeometryGroup], faces: Optional[List[Face3D]]
+) -> List[DimensionAdjustment]:
+    """La losa tiene que llegar hasta la cara EXTERIOR de los muros que apoyan en su borde.
+
+    Es el tercer caso del encuentro muro-losa, y el que faltaba. Los otros dos:
+    `floor_fit_adjustments` achica la losa que pasa entre muros CONTINUOS, y
+    `wall_end_fit_adjustments` acorta el muro para que su extremo apoye sobre la cara de
+    la losa. Ninguno mira el BORDE de la losa de apoyo, que conservaba la huella del
+    modelo.
+
+    Y la huella del modelo queda corta. En el modelo el muro mide lo que mide en el
+    edificio (20 cm, o cero si es una sola cara); en la maqueta es una placa de 3 mm
+    centrada en su plano medio, o sea 15 cm de edificio a 1:50 y 30 cm a 1:100. Un muro
+    de una sola cara parado en el borde de la losa tiene media placa en el aire. Medido:
+    asomaban 1.5 mm de plancha 56 de 278 muros apoyados en `Prueba app.obj` a 1:50, y es
+    lo que el usuario midió en el DXF como "la pared no coincide con el borde del piso
+    por unos 3 mm" (1.5 de cada lado).
+
+    Acá sólo se decide QUÉ pares (losa, muro) se encuentran así; cuánto crece la losa y de
+    qué lado lo resuelve `recorte_csg` contra el contorno real, porque depende de la
+    escala y del borde LOCAL de la losa (que en una planta en L no es el del bounding
+    box). Vale igual para una losa de techo que apoya sobre la cima de los muros.
+    """
+    # Los pares salen de `wall_end_fit_adjustments`, a propósito: son exactamente los
+    # muros a los que se les recortó el extremo para apoyar en esta losa. Si la losa
+    # creciera bajo un muro que NO recibió ese recorte, se le metería adentro. Se probó
+    # con un criterio propio, más laxo en planta, y pasó eso: un choque nuevo en demo.obj
+    # contra un muro que está 9 cm al costado de la losa. Una sola decisión, dos
+    # consumidores.
+    out: List[DimensionAdjustment] = []
+    by_id = {g.id: g for g in groups}
+    vistos = set()
+    for tope in wall_end_fit_adjustments(groups, faces):
+        w = by_id.get(tope.group_id)
+        f = by_id.get(tope.against_group_id)
+        if w is None or f is None or (f.id, w.id) in vistos:
+            continue
+        if wall_crosses_level(w, f):
+            continue      # ése es un entrepiso entre muros: lo resuelve floor_fit
+        vistos.add((f.id, w.id))
+        out.append(
+            DimensionAdjustment(
+                group_id=f.id,
+                delta=0.0,
+                delta_plate=PLATE_THICKNESS_M / 2.0,
+                axis="reach",
+                reason=f"Llega a la cara exterior de {w.label or w.id}",
+                joint_index=-1,
+                against_group_id=w.id,
+            )
+        )
     return out
 
 
