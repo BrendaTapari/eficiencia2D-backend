@@ -986,9 +986,19 @@ def test_losa_de_base_no_se_recorta(scale):
         if res is None:
             continue
         recorte_mm = (res.width_m - panel.width_m) / scale * 1000.0
-        assert recorte_mm == pytest.approx(0.0, abs=1e-6), (
+        # No se ACHICA nunca. Sí puede crecer: los muros nacen a filo con su borde y la
+        # placa de 3 mm ocupa más que los 20 cm del muro del modelo a escalas gruesas, así
+        # que la losa se estira hasta la cara exterior de esas placas (ver
+        # `test_la_losa_llega_a_la_cara_exterior_de_los_muros_de_su_borde`).
+        assert recorte_mm <= 1e-6, (
             f"1:{scale:.0f} la losa de base se achicó {recorte_mm:.2f}mm, y los muros "
             "apoyan sobre ella: no hay nada entre lo que entrar"
+        )
+        # Lo que crece es, como mucho, lo que la placa excede al muro, por los dos lados.
+        exceso_mm = max(0.0, PLATE_THICKNESS_M * scale - t) / scale * 1000.0
+        assert -recorte_mm == pytest.approx(exceso_mm, abs=TOL_MM), (
+            f"1:{scale:.0f} la losa de base creció {-recorte_mm:.2f}mm y debía crecer "
+            f"{exceso_mm:.2f}mm (placa − muro)"
         )
 
 
@@ -1443,4 +1453,256 @@ def test_la_decision_del_usuario_invierte_los_dos_ajustes(scale):
         f"1:{scale:.0f} al invertir la decisión los dos muros se movieron para el mismo "
         f"lado (A: {a_auto:.4f}→{a_inv:.4f}, B: {b_auto:.4f}→{b_inv:.4f}). Uno tiene que "
         "acortarse y el otro alargarse."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Una placa por lugar
+#
+# El modelo describe un edificio; la maqueta se arma con placas de 3 mm. Lo que en el
+# modelo son dos superficies puede ser, a la escala de corte, una sola pieza de MDF — y lo
+# que el clasificador llama "pared" puede ser el espesor de una losa. Estos casos fijan
+# esa conversión con respuesta calculada a mano.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("scale", ESCALAS)
+def test_el_canto_de_una_losa_no_es_una_pieza(scale):
+    """Las caras verticales del borde de una losa sólida no se cortan como muros.
+
+    Una losa de 20 m con 30 cm de espesor tiene un canto de 6 m²: vertical, y por encima
+    del área mínima. Salía como una "pared" de 20 m × 0.30 m —una tira de 1.5 mm de plancha
+    a 1:200, más angosta que la placa— y entraba al cálculo de juntas. En `demo.obj` eran
+    11 de 50 piezas.
+    """
+    t = 0.20
+    b = _ObjBuilder()
+    b.box(0.0, 20.0, 0.0, 0.30, 0.0, 8.0)          # losa de base, sólida
+    # Dos muros de verdad encima, RETIRADOS del borde: el caso limpio. El caso en que el
+    # testero de un muro queda a filo con el canto va aparte, en
+    # `test_el_canto_no_sobrevive_agrupado_con_los_testeros`.
+    b.box(1.0, 1.0 + t, 0.30, 3.30, 1.0, 7.0)
+    b.box(19.0 - t, 19.0, 0.30, 3.30, 1.0, 7.0)
+    work, paneles, grupos, _ = _procesar(b.text(), scale)
+
+    muros = [p for p in paneles if grupos[p.source_group_id].category == "wall"]
+    cantos = [p for p in muros if grupos[p.source_group_id].max_y <= 0.30 + 1e-6]
+    assert not cantos, (
+        f"1:{scale:.0f} el canto de la losa salió como pieza: "
+        f"{[(p.id, round(p.width_m, 2), round(p.height_m, 2)) for p in cantos]}"
+    )
+    assert len(muros) == 2, f"1:{scale:.0f} se esperaban los 2 muros, hay {len(muros)}"
+    assert any(
+        g.category == "discard" and g.max_y is not None and g.max_y <= 0.30 + 1e-6
+        and abs(g.representative_normal.y) < 0.5
+        for g in work.groups
+    ), "los cantos tienen que quedar como DESCARTADOS (rescatables), no desaparecer"
+
+
+def _modelo_muro_con_revestimiento(separacion):
+    """Esquina en L más una chapa paralela al muro A, a `separacion` de su plano medio.
+
+    Muro A: x ∈ [0, 8], z ∈ [0, 0.20] -> plano medio z = 0.10
+    Muro B: x ∈ [0, 0.20], z ∈ [0, 6]
+    Chapa:  x ∈ [6, 8], una sola cara, en z = 0.10 + separacion
+
+    La chapa está en una punta y es mucho más corta que el muro a propósito: así el
+    clasificador NO la toma por gemela del muro (su criterio es del modelo: centroides
+    alineados) y llega a la fabricación como un grupo aparte, que es el caso real.
+    """
+    b = _ObjBuilder()
+    b.box(0.0, 8.0, 0.0, 3.0, 0.0, 0.20)
+    b.box(0.0, 0.20, 0.0, 3.0, 0.0, 6.0)
+    z = 0.10 + separacion
+    b.quad((6.0, 0.0, z), (8.0, 0.0, z), (8.0, 3.0, z), (6.0, 3.0, z))
+    return b.text()
+
+
+@pytest.mark.parametrize("scale", ESCALAS)
+def test_dos_superficies_paralelas_son_una_pieza_si_la_placa_no_entra_dos_veces(scale):
+    """A menos de media placa de distancia no hay lugar físico para dos piezas.
+
+    La chapa está a 11 cm del plano medio del muro. Media placa son 3 cm de edificio a
+    1:20, 7.5 a 1:50, 15 a 1:100 y 30 a 1:200: a las dos primeras escalas son dos piezas
+    legítimas, a las dos últimas el plano medio de una cae DENTRO del volumen de la otra
+    y tienen que cortarse como una sola. La respuesta depende de la escala y no puede no
+    depender.
+    """
+    separacion = 0.11
+    work, paneles, grupos, pjs = _procesar(
+        _modelo_muro_con_revestimiento(separacion), scale
+    )
+    media_placa = PLATE_THICKNESS_M * scale / 2.0
+    # Piezas paralelas al muro A (normal en Z) que tocan la zona de la chapa.
+    en_z = [
+        p for p in paneles
+        if grupos[p.source_group_id].category == "wall"
+        and abs(grupos[p.source_group_id].representative_normal.z) > 0.9
+    ]
+    if separacion < media_placa:
+        assert len(en_z) == 1, (
+            f"1:{scale:.0f} la placa ocupa {media_placa * 200:.0f} cm de edificio y las "
+            f"dos superficies están a {separacion * 100:.0f} cm: tiene que ser UNA pieza, "
+            f"salieron {len(en_z)}"
+        )
+        assert verificar_ensamble(paneles, pjs, scale) == [], (
+            f"1:{scale:.0f} quedaron piezas ocupando el mismo material"
+        )
+        assert any("UNA sola pieza" in w for w in work.warnings), (
+            "fundir dos superficies del modelo tiene que avisarse, no hacerse en silencio"
+        )
+    else:
+        assert len(en_z) == 2, (
+            f"1:{scale:.0f} hay lugar para las dos placas (media placa = "
+            f"{media_placa * 100:.1f} cm, separación {separacion * 100:.0f} cm) y "
+            f"salieron {len(en_z)} piezas"
+        )
+
+
+def test_las_decisiones_del_usuario_sobreviven_a_la_fusion():
+    """La decisión es sobre un PAR de piezas; el índice de junta es sólo cómo viaja.
+
+    Fundir superficies reconstruye la lista de juntas y el mismo índice pasa a nombrar
+    otra unión. La decisión se traduce a {par de grupos -> quién cede} con la lista vieja
+    y se vuelve a ubicar en la nueva; si nombraba una superficie absorbida, vale para la
+    pieza que la absorbió. Sin esto, elegir quién cede en una esquina y después cambiar
+    de escala podía recortar un muro ajeno.
+    """
+    from core.review_generate import _una_placa_por_lugar
+    from core.services.plate_intersect import pair_key
+
+    parsed = parse_obj(_modelo_muro_con_revestimiento(0.11))
+    p1 = parse_pipeline("sintetico.obj", parsed["faces"], parsed["warnings"], force_axis="Y")
+    forzadas = _forzar_lo_contrario(p1)
+    assert forzadas, "el modelo tiene que tener al menos una unión con sugerencia"
+
+    work, traducidas = _una_placa_por_lugar(p1, 100.0, None, dict(forzadas))
+    assert len(work.groups) < len(p1.groups), "a 1:100 la chapa tiene que fundirse"
+    assert traducidas, "las decisiones no pueden perderse al fundir"
+
+    vivos = {g.id for g in work.groups}
+    for ji, cede in traducidas.items():
+        j = work.joints[ji]
+        assert cede in (j.group_a, j.group_b), (
+            f"la decisión {ji} -> {cede} quedó apuntando a la junta "
+            f"{j.group_a}/{j.group_b}, de la que ese grupo no participa"
+        )
+    # Toda decisión original entre dos grupos que siguen vivos se conserva tal cual.
+    por_par = {
+        pair_key(work.joints[ji].group_a, work.joints[ji].group_b): cede
+        for ji, cede in traducidas.items()
+    }
+    for ji, cede in forzadas.items():
+        j = p1.joints[ji]
+        if j.group_a in vivos and j.group_b in vivos:
+            assert por_par.get(pair_key(j.group_a, j.group_b)) == cede
+
+    # Y aplicarlas no deja ninguna ignorada.
+    res = compute_adjustments(work.joints, work.groups, traducidas, work.faces)
+    assert res.decisiones_ignoradas == []
+
+
+@pytest.mark.parametrize("scale", ESCALAS)
+def test_dos_placas_paralelas_montadas_no_se_informan_como_union_no_detectada(scale):
+    """El verificador tiene que decir lo que pasa, no culpar a una junta que no existe.
+
+    Dos placas paralelas que se pisan no forman una unión: no hay encuentro que el
+    detector pudiera ver ni recorte que falte. Se rotulaban "no_detectada" —"el sistema
+    no reconoció la unión"— y eso mandaba a buscar el problema donde no estaba: eran 104
+    de 120 choques sumando los dos modelos del repo.
+    """
+    # Las dos en planos z = cte, separadas un cuarto de placa: se pisan seguro.
+    sep = PLATE_THICKNESS_M * scale / 4.0
+    a = _placa("A1", 1, (0.0, 0.0, 0.0), (1, 0, 0), (0, 1, 0), 4.0, 3.0)
+    b = _placa("A2", 2, (1.0, 0.0, sep), (1, 0, 0), (0, 1, 0), 4.0, 3.0)
+    fallos = verificar_ensamble([a, b], [], scale)
+    assert fallos, f"1:{scale:.0f} dos placas montadas una sobre otra y no se detectó"
+    assert fallos[0].causa == "superpuestas", (
+        f"1:{scale:.0f} causa informada: {fallos[0].causa!r}"
+    )
+    from core.services.assembly_verify import MENSAJES
+    assert MENSAJES.get("superpuestas"), "la causa nueva tiene que tener mensaje"
+
+
+@pytest.mark.parametrize("scale", ESCALAS)
+def test_una_pieza_mas_fina_que_la_placa_se_avisa(scale):
+    """Una tira más angosta que el espesor del MDF no se puede armar: hay que decirlo.
+
+    Un antepecho de 20 cm de alto mide 10 mm de plancha a 1:20 y 1 mm a 1:200. Mientras
+    mide más que los 3 mm de la placa es una pieza; por debajo es una tira más fina que
+    el canto del material. Salía a la plancha igual y sin ningún aviso.
+    """
+    from core.review_generate import _aviso_piezas_mas_finas_que_la_placa
+
+    alto = 0.20
+    tira = _placa("A7", 7, (0.0, 0.0, 0.0), (1, 0, 0), (0, 1, 0), 6.0, alto)
+    normal = _placa("A8", 8, (0.0, 0.0, 5.0), (1, 0, 0), (0, 1, 0), 6.0, 3.0)
+    aviso = _aviso_piezas_mas_finas_que_la_placa([tira, normal], scale)
+    if alto < PLATE_THICKNESS_M * scale:
+        assert aviso and "A7" in aviso and "A8" not in aviso, (
+            f"1:{scale:.0f} la tira mide {alto / scale * 1000:.1f} mm de plancha y no "
+            f"se avisó: {aviso!r}"
+        )
+    else:
+        assert aviso is None, f"1:{scale:.0f} aviso de más: {aviso!r}"
+
+
+@pytest.mark.parametrize("scale", ESCALAS)
+def test_la_losa_llega_a_la_cara_exterior_de_los_muros_de_su_borde(scale):
+    """Un muro que apoya en el borde de la losa no puede tener media placa en el aire.
+
+    Caso medido por el usuario sobre el DXF: "la pared no coincide con el borde del piso
+    por unos 3 mm". Dos muros de UNA SOLA CARA parados exactamente sobre los bordes de una
+    losa de 8 m. En el modelo no tienen espesor; en la maqueta son placas de 3 mm
+    centradas en su plano, así que cada una asoma 1.5 mm por fuera de una losa que
+    conserve la huella del modelo. La losa tiene que medir 8 m + una placa entera, en
+    cualquier escala, y no crecer en la dirección en la que no hay muros.
+    """
+    b = _ObjBuilder()
+    b.quad((0.0, 0.0, 0.0), (8.0, 0.0, 0.0), (8.0, 0.0, 5.0), (0.0, 0.0, 5.0))     # losa
+    b.quad((0.0, 0.0, 0.0), (0.0, 3.0, 0.0), (0.0, 3.0, 5.0), (0.0, 0.0, 5.0))     # muro x=0
+    b.quad((8.0, 0.0, 0.0), (8.0, 0.0, 5.0), (8.0, 3.0, 5.0), (8.0, 3.0, 0.0))     # muro x=8
+    work, paneles, grupos, _ = _procesar(b.text(), scale)
+
+    losas = [p for p in paneles if grupos[p.source_group_id].category == "floor"]
+    assert len(losas) == 1, f"se esperaba una losa, hay {len(losas)}"
+    losa = losas[0]
+    placa = PLATE_THICKNESS_M * scale
+    largo, ancho = max(losa.width_m, losa.height_m), min(losa.width_m, losa.height_m)
+    assert (largo - 8.0) / scale * 1000.0 == pytest.approx(3.0, abs=TOL_MM), (
+        f"1:{scale:.0f} la losa mide {largo:.3f} m entre los muros; con una placa de "
+        f"{placa * 100:.0f} cm de edificio por lado tenía que medir {8.0 + placa:.3f}"
+    )
+    assert ancho == pytest.approx(5.0, abs=1e-6), (
+        f"1:{scale:.0f} la losa creció a {ancho:.3f} m donde no apoya ningún muro"
+    )
+
+
+@pytest.mark.parametrize("scale", ESCALAS)
+def test_el_canto_no_sobrevive_agrupado_con_los_testeros(scale):
+    """El canto de la losa tampoco es pieza cuando viene agrupado con otra cosa.
+
+    Dos muros que nacen A FILO con el borde de la losa: sus testeros (20 cm × 3 m) son
+    coplanares con el canto y lo tocan, así que el clasificador arma un solo grupo con
+    forma de U —canto más dos testeros— de 19.7 m × 3.3 m. Ese grupo no cabe en el espesor
+    de la losa y la regla "el grupo entero es canto" lo dejaba pasar: salía como una pieza
+    de casi 20 m. Se decide cara por cara: el canto se saca y lo que queda (dos testeros
+    de 0.6 m²) no llega al área mínima.
+    """
+    t = 0.20
+    b = _ObjBuilder()
+    b.box(0.0, 20.0, 0.0, 0.30, 0.0, 8.0)          # losa de base, sólida
+    b.box(0.0, t, 0.30, 3.30, 0.0, 8.0)            # muros a filo con los cuatro bordes
+    b.box(20.0 - t, 20.0, 0.30, 3.30, 0.0, 8.0)
+    work, paneles, grupos, _ = _procesar(b.text(), scale)
+
+    muros = [p for p in paneles if grupos[p.source_group_id].category == "wall"]
+    largos = [p for p in muros if max(p.width_m, p.height_m) > 12.0]
+    assert not largos, (
+        f"1:{scale:.0f} salió una pieza del largo de la losa, que sólo puede ser su canto: "
+        f"{[(p.id, round(p.width_m, 2), round(p.height_m, 2)) for p in largos]}"
+    )
+    assert len(muros) == 2, (
+        f"1:{scale:.0f} se esperaban los 2 muros, hay {len(muros)}: "
+        f"{[(p.id, round(p.width_m, 2), round(p.height_m, 2)) for p in muros]}"
     )
