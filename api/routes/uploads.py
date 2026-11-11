@@ -216,10 +216,15 @@ def serialize_topology(
         from core.review_generate import placements_fieles
 
         try:
+            absorbidos: Dict[int, int] = {}
             topo["placements"] = placements_fieles(
-                result, scale_denom, overrides, wall_wall_decisions
+                result, scale_denom, overrides, wall_wall_decisions, absorbidos
             )
             topo["placements_fieles"] = True
+            # Grupos sin pieza propia a esta escala: se cortan dentro de la pieza de otro
+            # (`id absorbido -> id del grupo que lo incluye`). No hay que dibujarlos
+            # aparte; ver `absorbed_groups` en /nesting-preview.
+            topo["absorbed_groups"] = {str(k): v for k, v in absorbidos.items()}
             # Espesor de la placa en metros de EDIFICIO: 3 mm de MDF son 0.15 m a 1:50 y
             # 0.60 m a 1:200. Dibujar las piezas sin espesor esconde justo los choques
             # que el espesor provoca.
@@ -899,8 +904,19 @@ async def recompute_endpoint(
             merged = apply_merges(rebuilt, request.merges or [], request.overrides)
 
         with timer.step("panel_id_by_group"):
+            # A la escala pedida, si vino: la cantidad de piezas depende de ella (las
+            # superficies que se funden en una sola placa cambian con la escala), y las
+            # etiquetas A#/B# son correlativas. Con la escala fija de antes podían no
+            # coincidir con las de la plancha.
+            pid_opts = (
+                PipelineOptions(
+                    scale_denom=request.scale_denom, paper="A4",
+                    min_area_m2=None, sheet_config=None,
+                )
+                if request.scale_denom else None
+            )
             pid_by_group = compute_panel_id_by_group(
-                merged, overrides=request.overrides
+                merged, pid_opts, overrides=request.overrides
             )
 
         timer.report()
@@ -1042,6 +1058,17 @@ async def nesting_preview_endpoint(
             # espesor provoca. Se manda calculado para que el front no tenga que saber ni
             # el espesor del material ni la escala.
             "plate_thickness_m": PLATE_THICKNESS_M * (opts.scale_denom or 1.0),
+            # Grupos que a ESTA escala no tienen pieza propia porque se cortan junto con
+            # otro (`id absorbido -> id del grupo cuya pieza lo incluye`). El instructivo
+            # no debe dibujarlos por separado ni caer a la malla cruda para ellos: ya
+            # están dentro del `placement` del grupo que los absorbió.
+            "absorbed_groups": {
+                str(k): v for k, v in (work.absorbed_groups or {}).items()
+            },
+            # Avisos de la generación A ESTA ESCALA (fusiones, piezas más finas que la
+            # placa, decisiones que no se pudieron aplicar). Antes sólo viajaban los de la
+            # Fase 1 y éstos se perdían.
+            "warnings": list(work.warnings or []),
             # Chequeo de ensamble: [] = verificado; si no, gap/overlap/unsupported.
             "assembly_warnings": assembly_warnings,
             # Fase D: pares de piezas que ocupan el mismo material. `causa` dice de quién
