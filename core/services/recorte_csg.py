@@ -664,6 +664,47 @@ def _solo_poligonos(geom):
     return unary_union(partes) if partes else Polygon()
 
 
+# Una lengüeta más angosta que esto (fracción del espesor de placa) no es material: es el
+# resto de una resta. 1/15 de placa son 0.2 mm de plancha, el orden del kerf.
+FRACCION_ASTILLA = 1.0 / 15.0
+
+
+def _sin_astillas(poly, espesor_m: float):
+    """Quita del contorno las tiras más finas que el kerf y las islas que dejan.
+
+    Cuando una pieza crece hacia su vecina y una tercera placa ocupa casi todo ese
+    lugar, de lo agregado sobrevive una tira de un milímetro de edificio —centésimas de
+    plancha—, a veces pegada al cuerpo y a veces suelta. No es material que se pueda
+    cortar: el láser quema más que eso. Pero viaja a la plancha como un contorno aparte,
+    agranda el bounding box de la pieza y, peor, hace que quien reconstruye la pieza desde
+    sus aristas vea dos caras y se quede con una. Medido: 101 de las 296 piezas de
+    `Prueba app.obj` a 1:50 tenían al menos una.
+
+    Es una apertura morfológica (achicar y volver a agrandar con esquinas en inglete):
+    deja idéntico todo lo que mide más que el umbral y borra lo que mide menos. Después
+    se descartan las islas chicas que hayan quedado separadas del cuerpo.
+    """
+    if poly is None or poly.is_empty or espesor_m <= 0:
+        return poly
+    r = espesor_m * FRACCION_ASTILLA / 2.0
+    try:
+        limpio = poly.buffer(-r, join_style=2).buffer(r, join_style=2)
+        # La apertura sólo puede QUITAR; el inglete puede asomar un pelo en esquinas agudas.
+        limpio = limpio.intersection(poly)
+    except Exception:
+        return poly
+    limpio = _solo_poligonos(limpio)
+    if limpio is None or limpio.is_empty:
+        return poly
+    partes = [g for g in getattr(limpio, "geoms", [limpio]) if g.area > 1e-12]
+    if len(partes) > 1:
+        mayor = max(g.area for g in partes)
+        partes = [g for g in partes if g.area >= 0.2 * mayor]
+        from shapely.ops import unary_union
+        limpio = unary_union(partes) if len(partes) > 1 else partes[0]
+    return limpio
+
+
 def aplicar_destinos(
     placa: "Placa",
     destinos: List[Destino],
@@ -869,7 +910,8 @@ def aplicar_destinos(
             if not falta.is_empty and falta.area > 1e-12:
                 poly = unary_union([poly, falta])
 
-    if poly.is_empty or poly.area <= 1e-9:
+    poly = _sin_astillas(poly, espesor_m)
+    if poly is None or poly.is_empty or poly.area <= 1e-9:
         return None
     minx, miny, maxx, maxy = poly.bounds
     return poly, maxx - minx, maxy - miny, minx, miny
