@@ -52,6 +52,10 @@ class Phase1Result:
     # la Fase 1, que no conoce la escala. El instructivo lo necesita para NO dibujar por
     # su cuenta un grupo que no tiene pieza propia.
     absorbed_groups: Dict[int, int] = field(default_factory=dict)
+    # Reporte de verificación por unión de las piezas que se van a cortar (ver
+    # `core.services.reporte_verificacion`). Lo llena `review_generate.compute_nesting`:
+    # depende de la escala, así que en la Fase 1 es None.
+    verificacion: Optional[Dict] = None
 
 
 def _rotate_z_to_y(face: Face3D) -> Face3D:
@@ -203,6 +207,8 @@ def generate_pipeline(
     mark_lines: Optional[List[dict]] = None,
     ribs: Optional[List[dict]] = None,
     columns: Optional[List[dict]] = None,
+    decisiones_por_par: Optional[List[dict]] = None,
+    bloquear_si_no_arma: bool = False,
 ) -> List[OutputFile]:
     from core.review_generate import generate_from_review
 
@@ -218,6 +224,8 @@ def generate_pipeline(
         mark_lines=mark_lines,
         ribs=ribs,
         columns=columns,
+        decisiones_por_par=decisiones_por_par,
+        bloquear_si_no_arma=bloquear_si_no_arma,
     )
 
 
