@@ -355,7 +355,16 @@ LINEA_BASE_ENCAJE = {
     # bordes que se medían contra la piel que ahora es parte de su muro. Los mal no cambian.
     # (50, 13) y (49, 14) pasan a (49, 13) y (48, 14) al sacar las caras de canto de los
     # grupos mixtos: una junta menos, que era de un muro contra un canto. Los mal no cambian.
-    "demo.obj": {50.0: (49, 13), 100.0: (48, 14)},
+    #
+    # (49, 13) y (48, 14) pasan a (46, 16) y (45, 17), y NO es que el encaje haya
+    # empeorado: esos tres bordes estaban mal desde antes y esta medición los contaba
+    # bien. Mira hasta dónde llega el bounding box de la pieza, y la pieza llegaba a
+    # destino sólo con una ASTILLA de un milímetro de edificio (0.02 mm de plancha) que
+    # sobrevivía cuando un obstáculo se comía el resto de lo que había crecido. Al limpiar
+    # las astillas (`recorte_csg._sin_astillas`) el borde vuelve a donde está el material.
+    # Es la tercera vez que una medición de este archivo resulta más optimista que la
+    # realidad; la que no se deja engañar es `test_el_veredicto_de_cada_modelo`.
+    "demo.obj": {50.0: (46, 16), 100.0: (45, 17)},
 }
 
 
@@ -469,7 +478,11 @@ LINEA_BASE_RESTRICCIONES = {
     #
     # Con las caras de canto fuera de los grupos mixtos se evalúa una restricción menos
     # (47); incumplidas y conflictos no cambian.
-    "demo.obj": {50.0: (47, 9, 2), 100.0: (47, 10, 2)},
+    #
+    # 1:50 pasa de 9 a 10 incumplidas al limpiar las astillas, por el mismo motivo que
+    # el invariante de esquina de más abajo: un borde que "cumplía" con una tira de
+    # 0.02 mm de plancha.
+    "demo.obj": {50.0: (47, 10, 2), 100.0: (47, 10, 2)},
 }
 
 
@@ -642,4 +655,63 @@ def test_el_instructivo_muestra_exactamente_lo_que_se_corta(path, scale):
         assert 0.0 <= max(e["a"]["x"] for e in d["outline"]) <= d["width_m"] + 1e-6, (
             f"{p.id}: el contorno se sale del ancho declarado; en la plancha el nesting "
             "separa por width×height y esto invadiría a la pieza vecina."
+        )
+
+
+
+# Veredicto por modelo y escala: (uniones, ok, revisar, no_arma). Sale del verificador
+# EXACTO por unión (`core/services/verificacion_uniones.py`), que mide choques, luces,
+# esquinas sin tapar y placas montadas, y no se deja engañar por astillas ni por contornos
+# abiertos. Es la línea base que hay que mirar para saber si un cambio mejora el encaje.
+#
+# NO es un objetivo cumplido: es el estado real, y es bastante peor de lo que mostraban
+# las mediciones anteriores. En demo.obj encaja el 68% de las uniones a 1:50 y el 61% a
+# 1:100. Bajar `revisar` y `no_arma` es el trabajo que queda.
+LINEA_BASE_VEREDICTO = {
+    "demo.obj": {50.0: (77, 52, 19, 6), 100.0: (80, 49, 24, 7)},
+}
+
+
+@pytest.mark.skipif(not MODELOS, reason="no hay modelos disponibles")
+@pytest.mark.parametrize("path", MODELOS, ids=lambda p: p.name)
+@pytest.mark.parametrize("scale", ESCALAS)
+def test_el_veredicto_de_cada_modelo(path, scale):
+    """Cuántas uniones encajan, cuántas hay que revisar y cuántas no arman.
+
+    Además de la línea base, afirma lo que tiene que valer para CUALQUIER archivo: el
+    reporte se calcula, viaja como JSON, sus cuentas cierran y cada problema trae al menos
+    una acción.
+    """
+    import json
+
+    from core.review_generate import reporte_de_verificacion
+
+    work, walls, floors, _pjs = _procesar(path, scale)
+    r = reporte_de_verificacion(work, walls, floors, scale)
+    assert r is not None, f"{path.name} 1:{scale:.0f}: el reporte no se pudo calcular"
+    json.dumps(r)
+
+    x = r["resumen"]
+    assert x["uniones"] == x["uniones_ok"] + x["uniones_revisar"] + x["uniones_no_arma"]
+    assert x["piezas"] == x["piezas_ok"] + x["piezas_revisar"] + x["piezas_no_arma"]
+    assert x["piezas"] == len([p for p in walls + floors if p.frame])
+    en_problemas = {i for p in r["problemas"] for i in p["uniones"]}
+    con_falla = {u["id"] for u in r["uniones"] if u["estado"] != "ok"}
+    assert en_problemas == con_falla, "hay uniones que fallan y no están en ningún problema"
+    assert all(p["acciones"] for p in r["problemas"]), "un problema sin ninguna acción"
+    assert (r["veredicto"] == "listo") == (not r["problemas"])
+
+    base = LINEA_BASE_VEREDICTO.get(path.name)
+    if base is None or scale not in base:
+        pytest.skip(f"{path.name} 1:{scale:.0f} no tiene línea base de veredicto")
+    uniones, ok, revisar, no_arma = base[scale]
+    obtenido = (x["uniones"], x["uniones_ok"], x["uniones_revisar"], x["uniones_no_arma"])
+    assert x["uniones_no_arma"] <= no_arma and x["uniones_revisar"] + x["uniones_no_arma"] <= revisar + no_arma, (
+        f"{path.name} 1:{scale:.0f}: {obtenido} (uniones, ok, revisar, no_arma); la "
+        f"línea base dice {base[scale]}. REGRESIÓN."
+    )
+    if obtenido != base[scale]:
+        pytest.fail(
+            f"{path.name} 1:{scale:.0f}: {obtenido} contra {base[scale]} de la línea "
+            "base. Si es una MEJORA, actualizá LINEA_BASE_VEREDICTO en este mismo commit."
         )
