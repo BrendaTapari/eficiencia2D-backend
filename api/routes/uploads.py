@@ -27,6 +27,7 @@ from core.profiler import PipelineTimer
 from core.services.obj_parser import parse_obj
 from core.services.stl_parser import parse_stl
 from core.pipeline import parse_pipeline, generate_pipeline, Phase1Result
+from core.review_generate import EnsambleNoArma
 from core.services.cutting_sheet import build_placements
 from core.services.curvature import build_curvature_map
 from core.services.assembly_check import compute_assembly_warnings
@@ -163,6 +164,7 @@ def serialize_topology(
     *,
     scale_denom: Optional[float] = None,
     wall_wall_decisions: Optional[Dict[int, int]] = None,
+    decisiones_por_par: Optional[List[dict]] = None,
 ) -> Dict:
     """Topología para el front. Con `scale_denom`, `placements` son las piezas RECORTADAS.
 
@@ -218,7 +220,8 @@ def serialize_topology(
         try:
             absorbidos: Dict[int, int] = {}
             topo["placements"] = placements_fieles(
-                result, scale_denom, overrides, wall_wall_decisions, absorbidos
+                result, scale_denom, overrides, wall_wall_decisions, absorbidos,
+                decisiones_por_par,
             )
             topo["placements_fieles"] = True
             # Grupos sin pieza propia a esta escala: se cortan dentro de la pieza de otro
@@ -526,6 +529,17 @@ class GenerateRequest(BaseModel):
     sheet_config: Optional[SheetConfigModel] = None
     overrides: Optional[Dict[int, str]] = None
     wall_wall_decisions: Optional[Dict[int, int]] = None
+    # Quién cede en cada unión muro-muro, por PAR de grupos:
+    # [{"group_a": int, "group_b": int, "yield_group_id": int}]. Es la forma estable: no
+    # depende de la posición de la junta en la lista, que cambia con cada fusión, división
+    # o cambio de escala. `wall_wall_decisions` (por índice) se sigue aceptando; si llegan
+    # las dos para la misma unión, manda ésta.
+    wall_wall_decisions_by_pair: Optional[List[dict]] = None
+    # true => si la verificación dice que hay uniones que NO ARMAN, no se generan los
+    # archivos y se responde 409 con el reporte. El usuario puede reintentar con `forzar`.
+    # Por defecto false para no cambiarle el comportamiento a un front que no lo conoce.
+    bloquear_si_no_arma: bool = False
+    forzar: bool = False
     merges: Optional[List[List[int]]] = None
     splits: Optional[List[SplitModel]] = None
     marks: Optional[List[int]] = None  # ids de componentes cuyas aberturas se graban
@@ -552,6 +566,12 @@ class RecomputeRequest(BaseModel):
     # fiel posible y se devuelve la proyección cruda del modelo (ver serialize_topology).
     scale_denom: Optional[float] = None
     wall_wall_decisions: Optional[Dict[int, int]] = None
+    # Quién cede en cada unión muro-muro, por PAR de grupos:
+    # [{"group_a": int, "group_b": int, "yield_group_id": int}]. Es la forma estable: no
+    # depende de la posición de la junta en la lista, que cambia con cada fusión, división
+    # o cambio de escala. `wall_wall_decisions` (por índice) se sigue aceptando; si llegan
+    # las dos para la misma unión, manda ésta.
+    wall_wall_decisions_by_pair: Optional[List[dict]] = None
 
 
 class NestingPreviewRequest(BaseModel):
@@ -564,6 +584,12 @@ class NestingPreviewRequest(BaseModel):
     splits: Optional[List[SplitModel]] = None
     overrides: Optional[Dict[int, str]] = None
     wall_wall_decisions: Optional[Dict[int, int]] = None
+    # Quién cede en cada unión muro-muro, por PAR de grupos:
+    # [{"group_a": int, "group_b": int, "yield_group_id": int}]. Es la forma estable: no
+    # depende de la posición de la junta en la lista, que cambia con cada fusión, división
+    # o cambio de escala. `wall_wall_decisions` (por índice) se sigue aceptando; si llegan
+    # las dos para la misma unión, manda ésta.
+    wall_wall_decisions_by_pair: Optional[List[dict]] = None
     marks: Optional[List[int]] = None
     user_cuts: Optional[List[dict]] = None
     flex: Optional[List[dict]] = None  # patrón de flexión por grupo (kerf / auxético)
@@ -837,6 +863,8 @@ async def generate_pdf_endpoint(
                 mark_lines=request.mark_lines,
                 ribs=request.ribs,
                 columns=request.columns,
+                decisiones_por_par=request.wall_wall_decisions_by_pair,
+                bloquear_si_no_arma=request.bloquear_si_no_arma and not request.forzar,
             )
 
         if not files:
@@ -864,9 +892,66 @@ async def generate_pdf_endpoint(
 
     except HTTPException:
         raise
+    except EnsambleNoArma as e:
+        # No es un error del servidor: es la respuesta a "¿esto se puede cortar?". Va con
+        # el reporte entero para que el front muestre QUÉ no arma y ofrezca forzar.
+        return JSONResponse(
+            status_code=409,
+            content={
+                "code": "ensamble_no_arma",
+                "message": (
+                    "La maqueta tiene uniones que no arman. Revisalas o generá igual "
+                    "enviando forzar=true."
+                ),
+                "verificacion": e.reporte,
+            },
+        )
     except Exception as e:
         logger.exception(f"[generate] Error: {e}")
         raise HTTPException(status_code=500, detail=f"Error en generación: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# Endpoint /probeta — plancha de calibración (no depende de ningún modelo)
+# ---------------------------------------------------------------------------
+
+class ProbetaRequest(BaseModel):
+    sheet_config: Optional[SheetConfigModel] = None
+    paper: str = "A4"
+
+
+@router.post("/probeta")
+async def probeta_endpoint(request: ProbetaRequest = ProbetaRequest()):
+    """Probeta de calibración: peine de muescas, ranuras cerradas y testigo de 40 mm.
+
+    Se corta ANTES que la maqueta, en la misma placa, para saber si el espesor y el kerf
+    reales son los que el cálculo supone. Ver `core/services/probeta.py`.
+    """
+    try:
+        from core.services.probeta import generar_probeta, instrucciones
+
+        sheet = request.sheet_config
+        cfg = (
+            SheetConfig(width_m=sheet.width_m, height_m=sheet.height_m, gap_m=sheet.gap_m)
+            if sheet else None
+        )
+        archivos, nesting = generar_probeta(cfg, request.paper)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in archivos:
+                zf.writestr(f.name, f.blob)
+        return JSONResponse(content={
+            "generated_files": [f.name for f in archivos],
+            "zip_base64": base64.b64encode(buf.getvalue()).decode("ascii"),
+            "zip_filename": "probeta_calibracion.zip",
+            # Misma forma que wall_nesting de /nesting-preview: se dibuja con el mismo
+            # componente de planchas.
+            "nesting": serialize_nesting(nesting),
+            "instrucciones": instrucciones(),
+        })
+    except Exception as e:
+        logger.exception(f"[probeta] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error generando la probeta: {str(e)}")
 
 
 # ---------------------------------------------------------------------------
@@ -928,6 +1013,7 @@ async def recompute_endpoint(
                     request.overrides,
                     scale_denom=request.scale_denom,
                     wall_wall_decisions=request.wall_wall_decisions,
+                    decisiones_por_par=request.wall_wall_decisions_by_pair,
                 )
             }
         )
@@ -1005,6 +1091,7 @@ async def nesting_preview_endpoint(
                 mark_lines=request.mark_lines,
                 ribs=request.ribs,
                 columns=request.columns,
+                decisiones_por_par=request.wall_wall_decisions_by_pair,
             )
 
         # Chequeo automático de ensamble: huecos/solapes/piezas sin apoyo (world coords),
@@ -1069,7 +1156,14 @@ async def nesting_preview_endpoint(
             # placa, decisiones que no se pudieron aplicar). Antes sólo viajaban los de la
             # Fase 1 y éstos se perdían.
             "warnings": list(work.warnings or []),
-            # Chequeo de ensamble: [] = verificado; si no, gap/overlap/unsupported.
+            # VERIFICACIÓN POR UNIÓN: veredicto, estado de cada pieza, problemas agrupados
+            # con su acción y todas las uniones medidas. Es lo que el instructivo tiene que
+            # mostrar. null = no se pudo calcular ("sin verificar", que NO es "verificado").
+            # Contrato en CONTRATO_verificacion.md.
+            "verificacion": work.verificacion,
+            # OBSOLETO para el instructivo: mezcla un chequeo sobre los GRUPOS del modelo
+            # (el de los "Sin apoyo 15,01 m") con las interferencias por muestreo. Se deja
+            # por compatibilidad; lo reemplaza `verificacion`.
             "assembly_warnings": assembly_warnings,
             # Fase D: pares de piezas que ocupan el mismo material. `causa` dice de quién
             # es el problema y por lo tanto qué puede hacer el usuario; ver MENSAJES en
