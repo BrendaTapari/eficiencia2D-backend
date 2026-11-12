@@ -1169,6 +1169,51 @@ def _una_placa_por_lugar(
     return replace(fundido, warnings=avisos, absorbed_groups=absorbe), decisiones
 
 
+def _decisiones_por_par_a_indice(
+    work: Phase1Result,
+    wall_wall_decisions: Optional[Dict[int, int]],
+    decisiones_por_par: Optional[List[dict]],
+) -> Tuple[Phase1Result, Optional[Dict[int, int]]]:
+    """Suma a las decisiones por índice las que llegan por PAR de grupos.
+
+    `{group_a, group_b, yield_group_id}` es la forma estable de decir quién cede: no
+    depende de en qué posición de la lista quedó la junta después de una fusión, una
+    división o un cambio de escala. El índice posicional se sigue aceptando para no romper
+    al front que ya lo manda; si llegan las dos para la misma junta, manda la del par.
+
+    Un id de un grupo que a esta escala se fundió en otro vale para el que lo absorbió.
+    """
+    if not decisiones_por_par:
+        return work, wall_wall_decisions
+    absorbe = work.absorbed_groups or {}
+    indice: Dict[Tuple[int, int], int] = {}
+    for ji, j in enumerate(work.joints):
+        indice.setdefault(pair_key(j.group_a, j.group_b), ji)
+
+    out = dict(wall_wall_decisions or {})
+    avisos: List[str] = []
+    for d in decisiones_por_par:
+        try:
+            a = int(d["group_a"]); b = int(d["group_b"]); cede = int(d["yield_group_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        a, b, cede = absorbe.get(a, a), absorbe.get(b, b), absorbe.get(cede, cede)
+        if a == b:
+            continue   # las dos son hoy la misma placa: ya no hay junta
+        ji = indice.get(pair_key(a, b))
+        if ji is None or cede not in (a, b):
+            avisos.append(
+                f"La decisión sobre la unión entre los grupos {a} y {b} no se pudo "
+                "aplicar: esa unión no existe con la clasificación actual. Se resolvió "
+                "automáticamente."
+            )
+            continue
+        out[ji] = cede
+    if avisos:
+        work = replace(work, warnings=list(work.warnings or []) + avisos)
+    return work, out
+
+
 def _decompose(
     phase1: Phase1Result,
     opts: PipelineOptions,
@@ -1181,11 +1226,15 @@ def _decompose(
     mark_lines: Optional[List[dict]] = None,
     ribs: Optional[List[dict]] = None,
     columns: Optional[List[dict]] = None,
+    decisiones_por_par: Optional[List[dict]] = None,
 ) -> Tuple[Phase1Result, List[Panel], List[Panel], List]:
     """Aplica merges, resuelve encastres 3D y descompone a paneles 2D."""
     work = apply_merges(phase1, merges or [], overrides)
     work, wall_wall_decisions = _una_placa_por_lugar(
         work, opts.scale_denom or 1.0, overrides, wall_wall_decisions
+    )
+    work, wall_wall_decisions = _decisiones_por_par_a_indice(
+        work, wall_wall_decisions, decisiones_por_par
     )
 
     # ORDEN IMPORTANTE: primero se decide quién cede en cada junta, y recién después se
@@ -1203,6 +1252,11 @@ def _decompose(
             work,
             warnings=list(work.warnings or []) + adj_result.decisiones_ignoradas,
         )
+    # Las juntas muro-muro de `work` pasan a ser las de ESTA corrida, con la decisión que
+    # de verdad se aplicó en cada una (la del usuario o la sugerida). Las que traía eran
+    # las de `apply_merges`, calculadas sin decisiones: quien mirara ahí quién cede
+    # —el verificador, el reporte— veía una respuesta que no era la que se cortó.
+    work = replace(work, wall_wall_joints=adj_result.wall_wall_joints)
 
     # Misión 1: resolver intersecciones placa-placa en 3D (encastres) sobre la
     # topología final (post-merges), antes de proyectar.
@@ -1352,11 +1406,22 @@ def compute_nesting(
     mark_lines: Optional[List[dict]] = None,
     ribs: Optional[List[dict]] = None,
     columns: Optional[List[dict]] = None,
+    decisiones_por_par: Optional[List[dict]] = None,
 ) -> Tuple[Phase1Result, NestingResult, NestingResult, SheetConfig, Dict[int, str], List, Dict[str, Dict], List]:
-    """Descompone y anida paneles. Compartido por /generate y /nesting-preview."""
+    """Descompone y anida paneles. Compartido por /generate y /nesting-preview.
+
+    El `work` que devuelve trae en `verificacion` el reporte por unión de las piezas.
+    """
     work, wall_panels, floor_panels, plate_joints = _decompose(
         phase1, opts, overrides, wall_wall_decisions, merges, marks,
         user_cuts, flex, mark_lines, ribs, columns,
+        decisiones_por_par=decisiones_por_par,
+    )
+    work = replace(
+        work,
+        verificacion=reporte_de_verificacion(
+            work, wall_panels, floor_panels, opts.scale_denom or 1.0
+        ),
     )
 
     sc = opts.sheet_config
@@ -1408,6 +1473,54 @@ def compute_nesting(
         # que a escalas finas no existen.
         _verificar(work, wall_panels, floor_panels, plate_joints, opts.scale_denom or 1.0),
     )
+
+
+def reporte_de_verificacion(work, wall_panels, floor_panels, scale_denom) -> Optional[Dict]:
+    """Reporte por unión de las piezas que se van a cortar (ver `reporte_verificacion`).
+
+    Igual que `_verificar`, no puede tumbar la generación: si falla devuelve None y el
+    consumidor lo trata como "sin verificar", que no es lo mismo que "verificado".
+    """
+    try:
+        from core.services.assembly_adjuster import (
+            floor_wall_encounters,
+            wall_end_fit_adjustments,
+        )
+        from core.services.reporte_verificacion import construir_reporte
+        from core.services.verificacion_uniones import verificar_uniones
+
+        piezas = list(wall_panels) + list(floor_panels)
+        previstos = {pair_key(j.group_a, j.group_b) for j in work.joints}
+        apoyos = {
+            pair_key(a.group_id, a.against_group_id)
+            for a in wall_end_fit_adjustments(work.groups, work.faces)
+            if a.against_group_id is not None
+        } | {
+            pair_key(f.id, w.id)
+            for f, w, _s in floor_wall_encounters(work.groups, work.faces)
+        }
+        uniones = verificar_uniones(piezas, scale_denom, previstos, apoyos)
+        cede = {
+            pair_key(j.group_a, j.group_b): j.yield_group_id
+            for j in work.wall_wall_joints
+            if j.yield_group_id is not None
+        }
+        return construir_reporte(
+            piezas, uniones, scale_denom, cede,
+            {g.id: g.category for g in work.groups},
+        )
+    except Exception:
+        import logging
+        logging.getLogger("eficiencia2d.pipeline").exception("reporte_de_verificacion falló")
+        return None
+
+
+class EnsambleNoArma(Exception):
+    """Se pidió bloquear la generación si hay uniones que no arman, y las hay."""
+
+    def __init__(self, reporte: Dict):
+        super().__init__("La maqueta tiene uniones que no arman.")
+        self.reporte = reporte
 
 
 def _verificar(work, wall_panels, floor_panels, plate_joints, scale_denom):
@@ -1490,6 +1603,7 @@ def placements_fieles(
     overrides: Optional[Dict[int, str]] = None,
     wall_wall_decisions: Optional[Dict[int, int]] = None,
     absorbidos_out: Optional[Dict[int, int]] = None,
+    decisiones_por_par: Optional[List[dict]] = None,
 ) -> Dict[str, Dict]:
     """Marco 3D de cada pieza YA RECORTADA, a la escala a la que se va a cortar.
 
@@ -1509,7 +1623,8 @@ def placements_fieles(
         scale_denom=scale_denom, paper="A4", min_area_m2=1.0, sheet_config=None
     )
     work, walls, floors, _pjs = _decompose(
-        phase1, opts, overrides, wall_wall_decisions, None, None
+        phase1, opts, overrides, wall_wall_decisions, None, None,
+        decisiones_por_par=decisiones_por_par,
     )
     if absorbidos_out is not None:
         absorbidos_out.update(work.absorbed_groups or {})
@@ -1528,11 +1643,20 @@ def generate_from_review(
     mark_lines: Optional[List[dict]] = None,
     ribs: Optional[List[dict]] = None,
     columns: Optional[List[dict]] = None,
+    decisiones_por_par: Optional[List[dict]] = None,
+    bloquear_si_no_arma: bool = False,
 ) -> List[OutputFile]:
     work, wall_nesting, floor_nesting, sheet_cfg, _, _, _, _ = compute_nesting(
         phase1, opts, overrides, wall_wall_decisions, merges, marks,
         user_cuts, flex, mark_lines, ribs, columns,
+        decisiones_por_par=decisiones_por_par,
     )
+    # Pedido original del usuario: si una unión no tiene solución, frenar ANTES de
+    # entregar el archivo de corte, y sólo seguir si quien genera lo fuerza a conciencia.
+    # Es opcional (lo pide el front) para no dejar sin poder generar a quien todavía usa
+    # un visor que no muestra el reporte.
+    if bloquear_si_no_arma and (work.verificacion or {}).get("veredicto") == "no_arma":
+        raise EnsambleNoArma(work.verificacion)
     scale = opts.scale_denom
     stem = work.stem
 
