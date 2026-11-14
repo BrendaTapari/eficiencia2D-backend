@@ -103,6 +103,11 @@ class Placa:
     poly_final: object = None
     # True si `poly_final` tiene material que el contorno crudo no tenía.
     crecio: bool = False
+    # Huellas ya calculadas de las vecinas NO paralelas sobre este plano, por
+    # `(id de la vecina, espesor, acotada)`. Dependen sólo de los contornos crudos, no de
+    # quién cede en cada unión, así que valen entre un armado y el siguiente del
+    # resolvedor. Sin esto se recalculaban 106.000 por armado en un modelo de 300 piezas.
+    huellas_cache: Dict = None
 
 
 def construir_placa(
@@ -154,6 +159,22 @@ def construir_placa(
         poly=poly, width_m=res.width_m, height_m=res.height_m,
         v_up=res.v_up,
     )
+
+
+_SIN_HUELLA = object()
+
+
+def huella_cacheada(a: Placa, b: Placa, espesor_m: float, acotada: bool = False):
+    """`huella`, recordando el resultado en `a`. Sólo para pares NO paralelos: entre
+    paralelas lo que importa es el contorno ya resuelto de la otra, que sí cambia."""
+    if a.huellas_cache is None:
+        a.huellas_cache = {}
+    clave = (b.group_id, round(espesor_m, 9), acotada)
+    h = a.huellas_cache.get(clave, _SIN_HUELLA)
+    if h is _SIN_HUELLA:
+        h = huella(a, b, espesor_m, acotada)
+        a.huellas_cache[clave] = h
+    return h
 
 
 def huella(a: Placa, b: Placa, espesor_m: float, acotada: bool = False):
@@ -751,7 +772,7 @@ def aplicar_destinos(
         for otra in obstaculos:
             if otra.group_id == placa.group_id:
                 continue
-            h = huella(placa, otra, espesor_m)
+            h = huella_cacheada(placa, otra, espesor_m)
             if h is None:
                 # Paralela y a menos de una placa: no la CORTA, pero ocupa el mismo MDF.
                 # Es el caso de una fachada que el modelo trae partida en dos tramos
@@ -845,7 +866,7 @@ def aplicar_destinos(
                 for otra in obstaculos or []:
                     if otra.group_id == placa.group_id or otra.group_id in apoyados:
                         continue
-                    h = huella(placa, otra, espesor_m, acotada=True)
+                    h = huella_cacheada(placa, otra, espesor_m, acotada=True)
                     if h is not None:
                         otras.append(h)
             if otras and not falta.is_empty:
@@ -906,7 +927,21 @@ def aplicar_destinos(
                 )
             ]
             if otras:
-                falta = falta.difference(unary_union(otras))
+                # Sólo las que tocan lo que falta. Unir las cien franjas de la planta
+                # para descontarle tres a un rectángulo de 15 cm era el 40% del tiempo de
+                # armado. Se sigue restando la UNIÓN (de las cercanas) y no una por una:
+                # da el mismo polígono, pero restar de a una cambiaba algún vértice en la
+                # décima cifra y con él el estado de una o dos uniones.
+                fb = falta.bounds
+                cerca = [
+                    h for h in otras
+                    if not (
+                        h.bounds[0] > fb[2] or h.bounds[2] < fb[0]
+                        or h.bounds[1] > fb[3] or h.bounds[3] < fb[1]
+                    )
+                ]
+                if cerca:
+                    falta = falta.difference(unary_union(cerca))
             if not falta.is_empty and falta.area > 1e-12:
                 poly = unary_union([poly, falta])
 
