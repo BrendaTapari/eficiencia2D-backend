@@ -85,7 +85,12 @@ LINEA_BASE = {
     # 1:50 pasa de 37 a 36 piezas: una piel interior partida en tramos se reconoce como
     # la otra cara de su muro por solape real (`_espalda_con_espalda`), no por centroides.
     # 1:50 baja de 2 a 1 choque al sacar las caras de canto de los grupos MIXTOS.
-    "demo.obj": {"piezas": {50.0: 36, 100.0: 32}, "choques": {50.0: 1, 100.0: 0}},
+    # Piezas 36/32 -> 32/29 al fundir también las placas paralelas que se pisan entre
+    # media y una placa (`placas_superpuestas`): eran piezas montadas una sobre otra.
+    # Los choques del verificador por muestreo pasan de 1/0 a 0/1: a 1:100 aparece un par
+    # de placas montadas (A18/A19) que antes no veía. El verificador exacto, que es el que
+    # manda, mide mejora en las dos escalas (ver LINEA_BASE_VEREDICTO).
+    "demo.obj": {"piezas": {50.0: 32, 100.0: 29}, "choques": {50.0: 0, 100.0: 1}},
 }
 
 
@@ -364,7 +369,22 @@ LINEA_BASE_ENCAJE = {
     # las astillas (`recorte_csg._sin_astillas`) el borde vuelve a donde está el material.
     # Es la tercera vez que una medición de este archivo resulta más optimista que la
     # realidad; la que no se deja engañar es `test_el_veredicto_de_cada_modelo`.
-    "demo.obj": {50.0: (46, 16), 100.0: (45, 17)},
+    #
+    # (46, 16) y (45, 17) pasan a (44, 18) y (40, 22) con el RESOLVEDOR de uniones
+    # (`review_generate._resolver_uniones`), y es el primer caso en que esta medición y
+    # el verificador exacto dicen cosas opuestas. El verificador gana: a 1:100 las uniones
+    # que encajan suben de 49 a 51 y las que no arman bajan de 7 a 6.
+    #
+    # La diferencia es de criterio, no de error. Acá cada borde vale 1 ó 0 según caiga a
+    # 0.2 mm de su destino. El resolvedor invierte quién cede donde eso cierra MÁS uniones:
+    # cuatro esquinas abiertas pasan a encastrar bien, una luz de 2.1 mm pasa a ser un
+    # contacto de canto, y a cambio dos vecinas quedan un poco peor. Para esta medición lo
+    # segundo pesa igual que lo primero y las mejoras parciales no cuentan. Se la conserva
+    # como alarma, pero la línea base que manda es `LINEA_BASE_VEREDICTO`.
+    #
+    # 1:100 pasa de (40, 22) a (46, 12) al fundir las placas paralelas que se pisan entre
+    # media y una placa. 1:50 no cambia.
+    "demo.obj": {50.0: (44, 18), 100.0: (46, 12)},
 }
 
 
@@ -482,7 +502,14 @@ LINEA_BASE_RESTRICCIONES = {
     # 1:50 pasa de 9 a 10 incumplidas al limpiar las astillas, por el mismo motivo que
     # el invariante de esquina de más abajo: un borde que "cumplía" con una tira de
     # 0.02 mm de plancha.
-    "demo.obj": {50.0: (47, 10, 2), 100.0: (47, 10, 2)},
+    #
+    # Con el resolvedor de uniones pasan a 12 y 15 incumplidas. El grafo evalúa cada borde
+    # contra la decisión SUGERIDA de quién cede; el resolvedor la invierte donde el
+    # verificador exacto mide que así cierran más uniones, así que por definición se aleja
+    # de lo que el grafo espera. Ver la nota de LINEA_BASE_ENCAJE.
+    # 1:100 pasa a 43 evaluadas, 6 incumplidas y 0 conflictos al fundir las placas que
+    # se pisan entre media y una placa: varias "vecinas" eran la misma pieza.
+    "demo.obj": {50.0: (47, 12, 2), 100.0: (43, 6, 0)},
 }
 
 
@@ -659,16 +686,23 @@ def test_el_instructivo_muestra_exactamente_lo_que_se_corta(path, scale):
 
 
 
-# Veredicto por modelo y escala: (uniones, ok, revisar, no_arma). Sale del verificador
-# EXACTO por unión (`core/services/verificacion_uniones.py`), que mide choques, luces,
-# esquinas sin tapar y placas montadas, y no se deja engañar por astillas ni por contornos
-# abiertos. Es la línea base que hay que mirar para saber si un cambio mejora el encaje.
+# Veredicto por modelo y escala: (uniones, ok, revisar, no_arma, terminaciones). Sale del
+# verificador EXACTO por unión (`core/services/verificacion_uniones.py`), que mide choques,
+# luces, esquinas sin tapar y placas montadas, y no se deja engañar por astillas ni por
+# contornos abiertos. Es la línea base que hay que mirar para saber si un cambio mejora el
+# encaje.
 #
-# NO es un objetivo cumplido: es el estado real, y es bastante peor de lo que mostraban
-# las mediciones anteriores. En demo.obj encaja el 68% de las uniones a 1:50 y el 61% a
-# 1:100. Bajar `revisar` y `no_arma` es el trabajo que queda.
+# Historia de estos números en demo.obj, a 1:50 y 1:100:
+#   (77, 52, 19, 6)  (80, 49, 24, 7)   primera medición exacta
+#   (77, 53, 18, 6)  (78, 51, 21, 6)   + resolvedor de uniones
+#   (69, 49, 18, 2)  (69, 53, 12, 4)   + fundir placas que se pisan entre media y una placa
+#
+# El último cambio NO es una mejora del encaje sino de la CUENTA: las uniones que sólo se
+# tocan de canto dejaron de valer "revisar" y pasaron a una columna propia, terminaciones.
+# Eran 16 de las 18 a 1:50 y 10 de las 12 a 1:100. Lo que de verdad falla es lo que queda
+# en `revisar` y `no_arma`, y bajarlo sigue siendo el trabajo pendiente.
 LINEA_BASE_VEREDICTO = {
-    "demo.obj": {50.0: (77, 52, 19, 6), 100.0: (80, 49, 24, 7)},
+    "demo.obj": {50.0: (69, 65, 2, 2, 16), 100.0: (69, 63, 2, 4, 10)},
 }
 
 
@@ -700,12 +734,28 @@ def test_el_veredicto_de_cada_modelo(path, scale):
     assert en_problemas == con_falla, "hay uniones que fallan y no están en ningún problema"
     assert all(p["acciones"] for p in r["problemas"]), "un problema sin ninguna acción"
     assert (r["veredicto"] == "listo") == (not r["problemas"])
+    # Nudos: cada unión que falla está en exactamente uno, y cada uno se puede dibujar.
+    en_nudos = sorted(i for n in r["nudos"] for i in n["uniones"])
+    assert en_nudos == sorted(con_falla), "los nudos no cubren las uniones que fallan"
+    assert x["nudos"] == len(r["nudos"]) <= len(con_falla)
+    assert all(n["quien"] in ("decidir", "escala", "modelo") for n in r["nudos"])
+    sin_dibujo = [n["titulo"] for n in r["nudos"] if not n["detalle"]]
+    assert not sin_dibujo, f"nudos sin detalle para dibujar: {sin_dibujo[:3]}"
+    # Las terminaciones no cuentan como falla y están todas en su lista.
+    de_canto = {u["id"] for u in r["uniones"] if u["terminacion"]}
+    assert all(r["uniones"][i]["estado"] == "ok" for i in de_canto)
+    assert {i for t in r["terminaciones"] for i in t["uniones"]} == de_canto
+    assert x["terminaciones"] == len(de_canto)
+    assert x["resueltas_solas"] == len(r["decisiones_automaticas"])
 
     base = LINEA_BASE_VEREDICTO.get(path.name)
     if base is None or scale not in base:
         pytest.skip(f"{path.name} 1:{scale:.0f} no tiene línea base de veredicto")
-    uniones, ok, revisar, no_arma = base[scale]
-    obtenido = (x["uniones"], x["uniones_ok"], x["uniones_revisar"], x["uniones_no_arma"])
+    uniones, ok, revisar, no_arma, _terminaciones = base[scale]
+    obtenido = (
+        x["uniones"], x["uniones_ok"], x["uniones_revisar"], x["uniones_no_arma"],
+        x["terminaciones"],
+    )
     assert x["uniones_no_arma"] <= no_arma and x["uniones_revisar"] + x["uniones_no_arma"] <= revisar + no_arma, (
         f"{path.name} 1:{scale:.0f}: {obtenido} (uniones, ok, revisar, no_arma); la "
         f"línea base dice {base[scale]}. REGRESIÓN."
