@@ -1187,6 +1187,88 @@ def _una_placa_por_lugar(
     return replace(fundido, warnings=avisos, absorbed_groups=absorbe), decisiones
 
 
+def _fusiones_pendientes_del_usuario(
+    work: Phase1Result,
+    merges: Optional[List[List[int]]],
+    overrides: Optional[Dict[int, str]],
+    wall_wall_decisions: Optional[Dict[int, int]],
+) -> Tuple[Phase1Result, Optional[Dict[int, int]]]:
+    """Segunda oportunidad para las fusiones que pidió el usuario y no se aplicaron.
+
+    Las fusiones del usuario se aplican PRIMERO, sobre los grupos del modelo. Ahí dos
+    tramos de muro separados por una losa no se unen (el entrepiso dejaría de entrar). Pero
+    después corre la fusión automática por escala, y uno de esos tramos puede quedar
+    fundido con una piel paralela que SÍ cruza la losa: la pieza resultante ya atraviesa
+    ese nivel, y la guarda que frenó la fusión dejó de tener sentido para ella.
+
+    El caso concreto: el reporte marcaba dos piezas montadas una sobre otra y ofrecía
+    "cortarlas como una sola pieza". El usuario lo elegía, la fusión se frenaba en el
+    primer paso por la losa, y el problema volvía idéntico. Medido en un modelo real: 5 de
+    las 7 fusiones ofrecidas no cambiaban nada.
+
+    Acá se vuelven a intentar, ya sobre la topología de esta escala, las fusiones cuyos
+    miembros siguen siendo grupos distintos. Las guardas de `apply_merges` se aplican de
+    nuevo, ahora contra las piezas que de verdad se van a cortar.
+    """
+    if not merges:
+        return work, wall_wall_decisions
+    absorbe = work.absorbed_groups or {}
+    vivos = {g.id for g in work.groups}
+    pendientes: List[List[int]] = []
+    for conjunto in merges:
+        actuales = sorted({absorbe.get(int(g), int(g)) for g in conjunto} & vivos)
+        if len(actuales) >= 2:
+            pendientes.append(actuales)
+    if not pendientes:
+        return work, wall_wall_decisions
+
+    antes = work
+    avisos_antes = list(work.warnings or [])
+    fundido = apply_merges(replace(work, warnings=[]), pendientes, overrides)
+    vivos_despues = {g.id for g in fundido.groups}
+    por_id = {g.id: g for g in antes.groups}
+    nuevos: Dict[int, int] = {}
+    for conjunto in pendientes:
+        quedan = [g for g in conjunto if g in vivos_despues]
+        if not quedan:
+            continue
+        principal = max(quedan, key=lambda g: por_id[g].total_area)
+        for g in conjunto:
+            if g not in vivos_despues:
+                nuevos[g] = principal
+    if not nuevos:
+        # No se pudo fundir nada tampoco ahora: se conserva la topología que había (con
+        # sus avisos) en vez de pagar las juntas recalculadas por nada.
+        return work, wall_wall_decisions
+
+    # El aviso del primer intento ("no se fusionaron tramos separados por una losa") ya
+    # no es cierto para lo que se acaba de fundir.
+    resueltos = {str(por_id[g].label or g) for g in nuevos}
+    avisos = [
+        a for a in avisos_antes
+        if not (a.startswith("No se fusionaron tramos") and any(r in a for r in resueltos))
+    ] + list(fundido.warnings or [])
+    absorbidos = dict(absorbe)
+    for viejo, nuevo in list(absorbidos.items()):
+        absorbidos[viejo] = nuevos.get(nuevo, nuevo)
+
+    decisiones = None
+    if wall_wall_decisions:
+        indice: Dict[Tuple[int, int], int] = {}
+        for ji, j in enumerate(fundido.joints):
+            indice.setdefault(pair_key(j.group_a, j.group_b), ji)
+        decisiones = {}
+        for ji, cede in wall_wall_decisions.items():
+            if not (0 <= ji < len(antes.joints)):
+                continue
+            j = antes.joints[ji]
+            a, b = nuevos.get(j.group_a, j.group_a), nuevos.get(j.group_b, j.group_b)
+            destino = indice.get(pair_key(a, b)) if a != b else None
+            if destino is not None:
+                decisiones.setdefault(destino, nuevos.get(cede, cede))
+    return replace(fundido, warnings=avisos, absorbed_groups=absorbidos), decisiones
+
+
 def _decisiones_por_par_a_indice(
     work: Phase1Result,
     wall_wall_decisions: Optional[Dict[int, int]],
@@ -1246,8 +1328,14 @@ def _decompose(
     columns: Optional[List[dict]] = None,
     decisiones_por_par: Optional[List[dict]] = None,
     resolver: bool = True,
+    pista: Optional[Dict] = None,
 ) -> Tuple[Phase1Result, List[Panel], List[Panel], List]:
     """Aplica merges, resuelve encastres 3D y descompone a paneles 2D.
+
+    `pista` es el `resolucion` de una corrida ANTERIOR sobre el mismo modelo y la misma
+    escala (lo conserva la API entre un pedido y el siguiente). El resolvedor arranca de
+    lo que ya había encontrado en vez de redescubrirlo: después de que el usuario toca un
+    botón, casi todo el modelo sigue igual.
 
     Con `resolver` (por defecto) las uniones muro-muro que el usuario NO decidió pasan por
     `_resolver_uniones`, que prueba la decisión contraria donde la sugerida no cierra y se
@@ -1257,6 +1345,9 @@ def _decompose(
     work = apply_merges(phase1, merges or [], overrides)
     work, wall_wall_decisions = _una_placa_por_lugar(
         work, opts.scale_denom or 1.0, overrides, wall_wall_decisions
+    )
+    work, wall_wall_decisions = _fusiones_pendientes_del_usuario(
+        work, merges, overrides, wall_wall_decisions
     )
     work, wall_wall_decisions = _decisiones_por_par_a_indice(
         work, wall_wall_decisions, decisiones_por_par
@@ -1292,22 +1383,24 @@ def _decompose(
         )
         return adj, muros, pisos, pjs
 
-    adj_result, wall_panels, floor_panels, plate_joints = armar(wall_wall_decisions)
     resolucion = None
+    uniones_medidas = None
+    resultado = None
     if resolver:
         try:
-            mejor = _resolver_uniones(
-                work, opts.scale_denom or 1.0, wall_wall_decisions, armar,
-                (adj_result, wall_panels, floor_panels, plate_joints),
+            resultado, resolucion, uniones_medidas = _resolver_uniones(
+                work, opts.scale_denom or 1.0, wall_wall_decisions, armar, pista,
             )
         except Exception:
             import logging
             logging.getLogger("eficiencia2d.pipeline").exception(
                 "_resolver_uniones falló; se sigue con las decisiones sugeridas"
             )
-            mejor = None
-        if mejor is not None:
-            (adj_result, wall_panels, floor_panels, plate_joints), resolucion = mejor
+            resultado = None
+    if resultado is None:
+        resultado = armar(wall_wall_decisions)
+        resolucion = uniones_medidas = None
+    adj_result, wall_panels, floor_panels, plate_joints = resultado
 
     # Una decisión que no se pudo aplicar tiene que llegar al usuario. Es su elección
     # sobre quién cede en una esquina; si se descarta en silencio, la pieza sale sin el
@@ -1323,6 +1416,7 @@ def _decompose(
     # quien mirara ahí quién cede veía una respuesta que no era la que se cortó.
     work = replace(
         work, wall_wall_joints=adj_result.wall_wall_joints, resolucion=resolucion,
+        uniones_medidas=uniones_medidas,
         pares_decididos=sorted({
             pair_key(work.joints[ji].group_a, work.joints[ji].group_b)
             for ji in (wall_wall_decisions or {})
@@ -1337,9 +1431,12 @@ def _decompose(
     return work, wall_panels, floor_panels, plate_joints
 
 
-# Cuántas veces se repite "probar lo contrario y conservar lo que mejora". Cada ronda
-# cuesta dos armados completos de piezas; en la práctica la segunda ya rinde poco.
-RONDAS_DEL_RESOLVEDOR = 2
+# Tope de rondas de "probar lo contrario y conservar lo que mejora". Cada ronda cuesta
+# hasta dos armados completos de piezas. Se repite hasta que no quede ninguna unión con
+# problema sin probar: así el resultado es un punto fijo, y el pedido siguiente (con la
+# pista) no encuentra candidatas viejas que volver a probar. Con el tope en 2 quedaban
+# candidatas sin probar y cada clic del usuario pagaba una ronda entera por ellas.
+RONDAS_DEL_RESOLVEDOR = 5
 
 _RANGO_ESTADO = {"no_arma": 0, "revisar": 1, "ok": 2}
 
@@ -1389,7 +1486,7 @@ def _puntaje(uniones) -> Tuple[int, int, float]:
     return (no_arma, otras, round(mm, 3))
 
 
-def _resolver_uniones(work, scale_denom, decisiones_usuario, armar, base):
+def _resolver_uniones(work, scale_denom, decisiones_usuario, armar, pista=None):
     """Prueba la decisión contraria donde la sugerida no cierra, y conserva lo que mejora.
 
     Por qué existe
@@ -1406,22 +1503,39 @@ def _resolver_uniones(work, scale_denom, decisiones_usuario, armar, base):
 
     Cómo decide
     -----------
-    1. Mide las piezas con las decisiones sugeridas.
+    1. Mide las piezas con las decisiones de partida.
     2. Toma las uniones que fallan, tienen quién ceda y el usuario NO decidió.
     3. Arma de nuevo con todas ésas invertidas y mide.
     4. Conserva una inversión sólo si las uniones de SUS dos piezas quedaron mejor.
     5. Arma con las conservadas. Si el conjunto no mejora al de partida, descarta todo.
 
-    Nunca toca una decisión del usuario, y nunca devuelve algo peor que lo que recibió.
-    Devuelve `(piezas, resolucion)` o None si no había nada que probar.
+    Nunca toca una decisión del usuario. Sin `pista`, nunca devuelve algo peor que las
+    decisiones sugeridas.
+
+    Con `pista`
+    -----------
+    `pista` es el `resolucion` de una corrida anterior del mismo modelo a la misma escala.
+    Se parte de las inversiones que esa corrida ya había encontrado y no se vuelve a
+    probar lo que ya probó sin mejora. Es lo que hace que apretar un botón en el visor
+    cueste un armado y no cinco: después de fusionar o descartar una pieza, el resto del
+    modelo sigue igual. Una inversión heredada cuya unión ahora falla vuelve a ser
+    candidata, así que la pista se corrige sola. Lo que se pierde es la comparación contra
+    las decisiones sugeridas, que ya no se arman.
+
+    Devuelve `(piezas, resolucion, uniones)`; `resolucion` es None si no había nada que
+    probar ni que heredar.
     """
     from core.services.verificacion_uniones import verificar_uniones
 
     previstos, apoyos = _pares_a_verificar(work)
+    cache_de_medicion: Dict = {}
 
     def medir(resultado):
         _adj, muros, pisos, _pjs = resultado
-        return verificar_uniones(list(muros) + list(pisos), scale_denom, previstos, apoyos)
+        return verificar_uniones(
+            list(muros) + list(pisos), scale_denom, previstos, apoyos,
+            cache=cache_de_medicion,
+        )
 
     fijas = {
         pair_key(work.joints[ji].group_a, work.joints[ji].group_b)
@@ -1431,13 +1545,46 @@ def _resolver_uniones(work, scale_denom, decisiones_usuario, armar, base):
     indice: Dict[Tuple[int, int], int] = {}
     for ji, j in enumerate(work.joints):
         indice.setdefault(pair_key(j.group_a, j.group_b), ji)
+    vivos = {g.id for g in work.groups}
 
-    actual = base
-    uniones = medir(actual)
-    puntaje_inicial = _puntaje(uniones)
     decisiones = dict(decisiones_usuario or {})
     invertidas: Dict[Tuple[int, int], int] = {}
     probadas: set = set()
+    heredadas: set = set()
+    # Cómo quedó cada unión cuando se aceptó su inversión: (rango de estado, mm). Una
+    # heredada sólo se vuelve a probar si HOY está peor que entonces. Sin esto volvía a
+    # ser candidata toda inversión que hubiera mejorado la unión sin dejarla perfecta, o
+    # sea casi todas, y cada pedido pagaba una ronda entera por ellas.
+    al_aceptar: Dict[Tuple[int, int], Tuple[int, float]] = {}
+    if pista:
+        for clave, valor in (pista.get("estado_de_invertidas") or {}).items():
+            try:
+                a, b = (int(x) for x in str(clave).split(","))
+                al_aceptar[pair_key(a, b)] = (int(valor[0]), float(valor[1]))
+            except (ValueError, TypeError, IndexError):
+                continue
+        for d in pista.get("invertidas", []):
+            try:
+                k = pair_key(int(d["group_a"]), int(d["group_b"]))
+                g = int(d["yield_group_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if k in fijas or k not in indice or g not in k or g not in vivos:
+                continue
+            invertidas[k] = g
+            decisiones[indice[k]] = g
+        heredadas = set(invertidas)
+        for par in pista.get("probadas_sin_mejora", []):
+            try:
+                k = pair_key(int(par[0]), int(par[1]))
+            except (IndexError, TypeError, ValueError):
+                continue
+            if k in indice and k not in fijas:
+                probadas.add(k)
+
+    actual = armar(decisiones)
+    uniones = medir(actual)
+    puntaje_inicial = _puntaje(uniones)
     rondas = 0
 
     for _ in range(RONDAS_DEL_RESOLVEDOR):
@@ -1453,6 +1600,13 @@ def _resolver_uniones(work, scale_denom, decisiones_usuario, armar, base):
             k = pair_key(u.grupo_a, u.grupo_b)
             if k in fijas or k in probadas or k not in cede or k not in indice:
                 continue
+            if k in heredadas:
+                antes = al_aceptar.get(k)
+                ahora = (_RANGO_ESTADO[u.estado], u.medida_mm)
+                if antes is not None and not (
+                    ahora[0] < antes[0] or ahora[1] > antes[1] + 0.05
+                ):
+                    continue        # está como cuando se la aceptó: no hay nada nuevo
             candidatas[k] = u.grupo_b if cede[k] == u.grupo_a else u.grupo_a
         if not candidatas:
             break
@@ -1471,20 +1625,34 @@ def _resolver_uniones(work, scale_denom, decisiones_usuario, armar, base):
             if local(uniones_prueba, k) < local(uniones, k)
         }
         if not mejoran:
-            break
+            continue    # ninguna sirvió; quedan anotadas como probadas y no hay más
         if len(mejoran) == len(candidatas):
             nuevo, uniones_nuevo = prueba, uniones_prueba
         else:
             nuevo = armar({**decisiones, **{indice[k]: g for k, g in mejoran.items()}})
             uniones_nuevo = medir(nuevo)
         if _puntaje(uniones_nuevo) >= _puntaje(uniones):
-            break       # por separado mejoraban, juntas no: se queda con lo que tenía
+            continue    # por separado mejoraban, juntas no: se queda con lo que tenía
         actual, uniones = nuevo, uniones_nuevo
         decisiones.update({indice[k]: g for k, g in mejoran.items()})
-        invertidas.update(mejoran)
+        for k, g in mejoran.items():
+            if k in heredadas:
+                # Era una inversión heredada y hubo que deshacerla: vuelve a la sugerida.
+                invertidas.pop(k, None)
+                heredadas.discard(k)
+            else:
+                invertidas[k] = g
 
-    if not probadas:
-        return None
+    if not probadas and not invertidas:
+        return actual, None, uniones
+    por_par = {pair_key(u.grupo_a, u.grupo_b): u for u in uniones}
+    estado_de_invertidas = {}
+    for k in invertidas:
+        u = por_par.get(k)
+        estado_de_invertidas[f"{k[0]},{k[1]}"] = (
+            [_RANGO_ESTADO[u.estado], round(u.medida_mm, 3)] if u is not None
+            else [_RANGO_ESTADO["ok"], 0.0]
+        )
     resolucion = {
         "rondas": rondas,
         "invertidas": [
@@ -1496,8 +1664,11 @@ def _resolver_uniones(work, scale_denom, decisiones_usuario, armar, base):
         "probadas_sin_mejora": sorted([a, b] for (a, b) in probadas - set(invertidas)),
         "puntaje_antes": list(puntaje_inicial),
         "puntaje_despues": list(_puntaje(uniones)),
+        "con_pista": bool(pista),
+        # Para la pista del pedido siguiente; ver `al_aceptar`.
+        "estado_de_invertidas": estado_de_invertidas,
     }
-    return actual, resolucion
+    return actual, resolucion, uniones
 
 
 def _aviso_piezas_mas_finas_que_la_placa(panels: List[Panel], scale_denom: float):
@@ -1623,6 +1794,7 @@ def compute_nesting(
     ribs: Optional[List[dict]] = None,
     columns: Optional[List[dict]] = None,
     decisiones_por_par: Optional[List[dict]] = None,
+    pista: Optional[Dict] = None,
 ) -> Tuple[Phase1Result, NestingResult, NestingResult, SheetConfig, Dict[int, str], List, Dict[str, Dict], List]:
     """Descompone y anida paneles. Compartido por /generate y /nesting-preview.
 
@@ -1631,7 +1803,7 @@ def compute_nesting(
     work, wall_panels, floor_panels, plate_joints = _decompose(
         phase1, opts, overrides, wall_wall_decisions, merges, marks,
         user_cuts, flex, mark_lines, ribs, columns,
-        decisiones_por_par=decisiones_por_par,
+        decisiones_por_par=decisiones_por_par, pista=pista,
     )
     work = replace(
         work,
@@ -1702,16 +1874,35 @@ def reporte_de_verificacion(work, wall_panels, floor_panels, scale_denom) -> Opt
         from core.services.verificacion_uniones import verificar_uniones
 
         piezas = list(wall_panels) + list(floor_panels)
-        previstos, apoyos = _pares_a_verificar(work)
-        uniones = verificar_uniones(piezas, scale_denom, previstos, apoyos)
+        uniones = getattr(work, "uniones_medidas", None)
+        if uniones is None:
+            # No pasó por el resolvedor (o falló): se mide acá. Si pasó, ésta es la misma
+            # medición con la que el resolvedor eligió, y repetirla era un 20% del tiempo.
+            previstos, apoyos = _pares_a_verificar(work)
+            uniones = verificar_uniones(piezas, scale_denom, previstos, apoyos)
         cede = {
             pair_key(j.group_a, j.group_b): j.yield_group_id
             for j in work.wall_wall_joints
             if j.yield_group_id is not None
         }
+        por_id = {g.id: g for g in work.groups}
+        losas = [g for g in work.groups if g.category == "floor"]
+
+        def puede_fusionar(a: int, b: int) -> bool:
+            """Las MISMAS guardas que `apply_merges`: si acá da False, allá no las une."""
+            ga, gb = por_id.get(a), por_id.get(b)
+            if ga is None or gb is None:
+                return False
+            mayor, menor = (ga, gb) if ga.total_area >= gb.total_area else (gb, ga)
+            return (
+                _coplanar_for_merge(menor, mayor)
+                and _floor_between(mayor, menor, losas, work.faces) is None
+            )
+
         return construir_reporte(
             piezas, uniones, scale_denom, cede,
             {g.id: g.category for g in work.groups},
+            puede_fusionar=puede_fusionar,
             resolucion=work.resolucion,
             pares_decididos_por_el_usuario={tuple(p) for p in (work.pares_decididos or [])},
             espesor_modelo={g.id: float(g.thickness or 0.0) for g in work.groups},
@@ -1811,6 +2002,7 @@ def placements_fieles(
     wall_wall_decisions: Optional[Dict[int, int]] = None,
     absorbidos_out: Optional[Dict[int, int]] = None,
     decisiones_por_par: Optional[List[dict]] = None,
+    pista: Optional[Dict] = None,
 ) -> Dict[str, Dict]:
     """Marco 3D de cada pieza YA RECORTADA, a la escala a la que se va a cortar.
 
@@ -1831,7 +2023,7 @@ def placements_fieles(
     )
     work, walls, floors, _pjs = _decompose(
         phase1, opts, overrides, wall_wall_decisions, None, None,
-        decisiones_por_par=decisiones_por_par,
+        decisiones_por_par=decisiones_por_par, pista=pista,
     )
     if absorbidos_out is not None:
         absorbidos_out.update(work.absorbed_groups or {})
@@ -1852,11 +2044,12 @@ def generate_from_review(
     columns: Optional[List[dict]] = None,
     decisiones_por_par: Optional[List[dict]] = None,
     bloquear_si_no_arma: bool = False,
+    pista: Optional[Dict] = None,
 ) -> List[OutputFile]:
     work, wall_nesting, floor_nesting, sheet_cfg, _, _, _, _ = compute_nesting(
         phase1, opts, overrides, wall_wall_decisions, merges, marks,
         user_cuts, flex, mark_lines, ribs, columns,
-        decisiones_por_par=decisiones_por_par,
+        decisiones_por_par=decisiones_por_par, pista=pista,
     )
     # Pedido original del usuario: si una unión no tiene solución, frenar ANTES de
     # entregar el archivo de corte, y sólo seguir si quien genera lo fuerza a conciencia.
