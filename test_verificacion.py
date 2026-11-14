@@ -445,9 +445,20 @@ def test_el_detalle_de_un_nudo_dibuja_las_placas_con_su_espesor():
         assert min(ancho, alto) == pytest.approx(t, abs=1e-6), "la sección no tiene el espesor de la placa"
         assert max(abs(v) for v in xs + ys) <= R + 1e-6, "se sale de la ventana"
         assert p["estado"] == "no_arma" and poly.is_valid
+        # La etiqueta va en un punto que está dentro de la sección.
+        from shapely.geometry import Point
+        assert poly.contains(Point(p["centro"]))
     assert len(d["solapes"]) == 1
     assert Polygon(d["solapes"][0]["poligono"]).area == pytest.approx(t * t, rel=1e-6)
     assert sorted(d["solapes"][0]["piezas"]) == ["A1", "A2"]
+    # La cota dice cuánto: 3 mm de plancha (una placa entera), que en el edificio son
+    # 30 cm, y marca el ancho de lo que comparten.
+    assert len(d["cotas"]) == 1
+    c = d["cotas"][0]
+    assert c["tipo"] == "choque" and c["texto"] == "3.0 mm" and c["mm"] == pytest.approx(3.0)
+    assert c["cm_edificio"] == pytest.approx(30.0) and c["union"] == n["uniones"][0]
+    largo = ((c["hasta"][0] - c["desde"][0]) ** 2 + (c["hasta"][1] - c["desde"][1]) ** 2) ** 0.5
+    assert largo == pytest.approx(t, abs=1e-6)
     # El nudo está donde se cruzan: x = 2, z = 0.
     assert n["punto"]["x"] == pytest.approx(2.0, abs=1e-6)
     assert n["punto"]["z"] == pytest.approx(0.0, abs=1e-6)
@@ -575,3 +586,49 @@ def test_el_resolvedor_no_empeora_ni_toca_lo_que_decidio_el_usuario():
         pair_key(x["group_a"], x["group_b"]) != k
         for x in (work2.resolucion or {}).get("invertidas", [])
     )
+
+
+def test_la_cota_de_una_luz_marca_el_hueco_y_las_astillas_no_se_dibujan():
+    """En una luz la cota va entre las dos placas, y mide lo que mide la unión.
+
+    Además, una pieza vecina que apenas roza la ventana del dibujo no aparece: es una
+    astilla con una etiqueta encima de la de al lado.
+    """
+    scale = 100.0
+    t = PLATE_THICKNESS_M * scale
+    h = t / 2.0
+    mm = scale / 1000.0
+    a = P("A1", 1, (0.0, 0.0, 0.0), (1, 0, 0), (0, 1, 0), 4.0, 3.0)
+    b = P("A2", 2, (2.0, 0.0, h + 1.0 * mm), (0, 0, 1), (0, 1, 0), 2.0, 3.0)   # 1 mm corta
+    # Vecina de contexto que entra a la ventana sólo 1 cm (la ventana mide 5 placas).
+    roza = P("A9", 9, (2.0 + 5 * t - 0.01, 0.0, 0.6), (1, 0, 0), (0, 1, 0), 3.0, 3.0)
+    piezas = [a, b, roza]
+    r = construir_reporte(piezas, verificar_uniones(piezas, scale, {pair_key(1, 2)}), scale)
+    assert len(r["nudos"]) == 1
+    d = r["nudos"][0]["detalle"]
+
+    assert sorted(p["pieza"] for p in d["placas"]) == ["A1", "A2"], "se dibujó la astilla"
+    assert d["solapes"] == []
+    c = d["cotas"][0]
+    assert c["tipo"] == "luz" and c["texto"] == "1.0 mm" and c["cm_edificio"] == pytest.approx(10.0)
+    largo = ((c["hasta"][0] - c["desde"][0]) ** 2 + (c["hasta"][1] - c["desde"][1]) ** 2) ** 0.5
+    assert largo == pytest.approx(1.0 * mm, abs=1e-6), "la cota no mide el hueco"
+
+
+def test_las_etiquetas_de_dos_placas_montadas_no_caen_en_el_mismo_lugar():
+    """Dos placas montadas tienen la sección en el mismo sitio: sus etiquetas no pueden
+    salir una encima de la otra, que es justo cuando hay que poder leerlas."""
+    from shapely.geometry import Point, Polygon
+
+    scale = 100.0
+    t = PLATE_THICKNESS_M * scale
+    a = P("A1", 1, (0.0, 0.0, 0.0), (1, 0, 0), (0, 1, 0), 4.0, 3.0)
+    b = P("A2", 2, (0.0, 0.0, 0.1 * t), (1, 0, 0), (0, 1, 0), 4.0, 3.0)     # casi encima
+    r = construir_reporte([a, b], verificar_uniones([a, b], scale), scale)
+    d = r["nudos"][0]["detalle"]
+    assert len(d["placas"]) == 2
+    c0, c1 = d["placas"][0]["centro"], d["placas"][1]["centro"]
+    separacion = ((c0[0] - c1[0]) ** 2 + (c0[1] - c1[1]) ** 2) ** 0.5
+    assert separacion > t, f"las etiquetas quedaron a {separacion:.3f} m: se pisan"
+    for p in d["placas"]:
+        assert Polygon(p["poligono"]).buffer(1e-9).contains(Point(p["centro"]))
