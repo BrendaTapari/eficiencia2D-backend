@@ -174,6 +174,7 @@ def _acciones(
     categoria: Dict[int, str],
     probadas: set,
     escala_sugerida: Optional[int],
+    puede_fusionar=None,
 ) -> List[Dict]:
     """Qué se puede hacer con esta unión, ya como el cambio a mandar al backend.
 
@@ -195,7 +196,14 @@ def _acciones(
     k = pair_key(u.grupo_a, u.grupo_b)
 
     if u.tipo == "superpuestas":
-        if categoria.get(u.grupo_a) == categoria.get(u.grupo_b):
+        # Fusionar se ofrece sólo si la fusión se va a HACER. `apply_merges` se niega a
+        # unir dos tramos separados por una losa (el entrepiso dejaría de entrar) o en
+        # planos distintos, y lo hace en silencio: el botón "cortarlas como una sola
+        # pieza" no cambiaba nada y el problema volvía igual. Medido en un modelo real:
+        # 6 de 7 fusiones ofrecidas no hacían nada.
+        if categoria.get(u.grupo_a) == categoria.get(u.grupo_b) and (
+            puede_fusionar is None or puede_fusionar(u.grupo_a, u.grupo_b)
+        ):
             out.append({
                 "tipo": "fusionar",
                 "etiqueta": f"Cortarlas como una sola pieza ({u.pieza_a} + {u.pieza_b})",
@@ -580,6 +588,7 @@ def construir_reporte(
     resolucion: Optional[Dict] = None,
     pares_decididos_por_el_usuario: Optional[set] = None,
     espesor_modelo: Optional[Dict[int, float]] = None,
+    puede_fusionar=None,
 ) -> Dict:
     """Reporte serializable (JSON) de la verificación. Ver `CONTRATO_verificacion.md`."""
     escala = scale_denom or 1.0
@@ -587,8 +596,15 @@ def construir_reporte(
     categoria = dict(categoria_por_grupo or {})
     espesor_modelo = espesor_modelo or {}
     fijas = set(pares_decididos_por_el_usuario or ())
+    # Uniones donde invertir quién cede YA se evaluó: las que se probaron sin mejora y
+    # las que el resolvedor dejó invertidas. En las segundas, "invertir" sería volver a
+    # la decisión sugerida, que es justo la que midió peor. Ofrecerlo mandaba a la
+    # persona a deshacer un arreglo: probado en un modelo real, 4 de 6 no cambiaban nada.
     probadas = {
         pair_key(a, b) for a, b in (resolucion or {}).get("probadas_sin_mejora", [])
+    } | {
+        pair_key(d["group_a"], d["group_b"])
+        for d in (resolucion or {}).get("invertidas", [])
     }
     espesor_mm = PLATE_THICKNESS_M * 1000.0
     espesor = PLATE_THICKNESS_M * escala
@@ -696,11 +712,15 @@ def construir_reporte(
             "peor_mm": _mm(peor.medida_mm),
             "peor_cm_edificio": round(peor.medida_mm * a_cm_edificio, 1),
             "piezas": nombres,
+            "grupos": [piezas[n]["grupo"] for n in nombres if n in piezas],
             "pieza_comun": comun if len(us) > 1 else None,
             "punto": _punto(peor.punto),
             "uniones": list(indices),
             "acciones": (
-                _acciones(peor, area_por_pieza, cede_por_par, categoria, probadas, sugerida)
+                _acciones(
+                    peor, area_por_pieza, cede_por_par, categoria, probadas, sugerida,
+                    puede_fusionar,
+                )
                 if len(us) == 1
                 else _acciones_de_grupo(tipo, comun, us, piezas, sugerida)
             ),
@@ -762,6 +782,7 @@ def construir_reporte(
             "peor_mm": _mm(mm),
             "peor_cm_edificio": round(chico * 100.0, 1),
             "piezas": [p.id],
+            "grupos": [p.source_group_id],
             "pieza_comun": None,
             "punto": {"x": round(o["x"], 4), "y": round(o["y"], 4), "z": round(o["z"], 4)},
             "uniones": [],
@@ -927,6 +948,10 @@ def _nudos(
             "peor_mm": _mm(peor.medida_mm),
             "peor_cm_edificio": round(peor.medida_mm * a_cm_edificio, 1),
             "piezas": nombres,
+            # Ids de grupo de esas piezas. Las ETIQUETAS (A12) se renumeran cuando una
+            # pieza se fusiona o se descarta; los ids no. Para reconocer "el mismo nudo"
+            # antes y después de una acción hay que comparar esto.
+            "grupos": [piezas[n]["grupo"] for n in nombres if n in piezas],
             "punto": _punto(centro),
             "uniones": sorted(indices),
             "terminaciones": sorted(cerca),
