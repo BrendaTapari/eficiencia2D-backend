@@ -63,6 +63,9 @@ class Phase1Result:
     # Pares de grupos `(a, b)` cuya decisión de quién cede vino del USUARIO en esta
     # corrida. El resolvedor no los toca y el reporte los ofrece como "elegí vos".
     pares_decididos: List = field(default_factory=list)
+    # Las uniones tal como las midió el resolvedor al elegir (lista de `Union`). El
+    # reporte las reusa en vez de volver a medir. No se serializa.
+    uniones_medidas: Optional[List] = None
 
 
 def _rotate_z_to_y(face: Face3D) -> Face3D:
@@ -216,6 +219,7 @@ def generate_pipeline(
     columns: Optional[List[dict]] = None,
     decisiones_por_par: Optional[List[dict]] = None,
     bloquear_si_no_arma: bool = False,
+    pista: Optional[Dict] = None,
 ) -> List[OutputFile]:
     from core.review_generate import generate_from_review
 
@@ -233,6 +237,7 @@ def generate_pipeline(
         columns=columns,
         decisiones_por_par=decisiones_por_par,
         bloquear_si_no_arma=bloquear_si_no_arma,
+        pista=pista,
     )
 
 
