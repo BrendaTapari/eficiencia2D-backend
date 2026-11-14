@@ -165,6 +165,7 @@ def serialize_topology(
     scale_denom: Optional[float] = None,
     wall_wall_decisions: Optional[Dict[int, int]] = None,
     decisiones_por_par: Optional[List[dict]] = None,
+    pista: Optional[Dict] = None,
 ) -> Dict:
     """Topología para el front. Con `scale_denom`, `placements` son las piezas RECORTADAS.
 
@@ -221,7 +222,7 @@ def serialize_topology(
             absorbidos: Dict[int, int] = {}
             topo["placements"] = placements_fieles(
                 result, scale_denom, overrides, wall_wall_decisions, absorbidos,
-                decisiones_por_par,
+                decisiones_por_par, pista,
             )
             topo["placements_fieles"] = True
             # Grupos sin pieza propia a esta escala: se cortan dentro de la pieza de otro
@@ -604,6 +605,45 @@ class NestingPreviewRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Pistas del resolvedor entre un pedido y el siguiente
+#
+# Cada vez que el usuario toca un botón del instructivo (fusionar, descartar, invertir
+# quién cede) el front vuelve a pedir. Sin memoria, el resolvedor de uniones redescubre
+# desde cero todo lo que ya había resuelto en el pedido anterior, aunque el 99% del modelo
+# siga igual: en un modelo de 300 piezas eso eran unos 25 s por clic, con todos los
+# botones deshabilitados mientras tanto.
+#
+# Se guarda lo último que resolvió, por modelo y escala, y se le pasa como punto de
+# partida. Es memoria del proceso: se pierde al reiniciar y entonces el primer pedido
+# vuelve a tardar lo que tardaba. No cambia qué se calcula, sólo desde dónde se empieza.
+# ---------------------------------------------------------------------------
+
+_PISTAS_DEL_RESOLVEDOR: Dict[tuple, Dict] = {}
+_MAX_PISTAS = 64
+
+
+def _clave_de_pista(request, scale_denom) -> Optional[tuple]:
+    quien = getattr(request, "file_id", None) or getattr(request, "proyecto_id", None)
+    if not quien or not scale_denom:
+        return None
+    return (str(quien), round(float(scale_denom), 6), getattr(request, "axis", None))
+
+
+def _pista_para(request, scale_denom) -> Optional[Dict]:
+    clave = _clave_de_pista(request, scale_denom)
+    return _PISTAS_DEL_RESOLVEDOR.get(clave) if clave else None
+
+
+def _guardar_pista(request, scale_denom, resolucion: Optional[Dict]) -> None:
+    clave = _clave_de_pista(request, scale_denom)
+    if not clave or not resolucion:
+        return
+    if clave not in _PISTAS_DEL_RESOLVEDOR and len(_PISTAS_DEL_RESOLVEDOR) >= _MAX_PISTAS:
+        _PISTAS_DEL_RESOLVEDOR.pop(next(iter(_PISTAS_DEL_RESOLVEDOR)))
+    _PISTAS_DEL_RESOLVEDOR[clave] = resolucion
+
+
+# ---------------------------------------------------------------------------
 # Caché de Phase1 en disco (pickle + gzip)
 # ---------------------------------------------------------------------------
 
@@ -865,6 +905,7 @@ async def generate_pdf_endpoint(
                 columns=request.columns,
                 decisiones_por_par=request.wall_wall_decisions_by_pair,
                 bloquear_si_no_arma=request.bloquear_si_no_arma and not request.forzar,
+                pista=_pista_para(request, request.scale_denom),
             )
 
         if not files:
@@ -1014,6 +1055,7 @@ async def recompute_endpoint(
                     scale_denom=request.scale_denom,
                     wall_wall_decisions=request.wall_wall_decisions,
                     decisiones_por_par=request.wall_wall_decisions_by_pair,
+                    pista=_pista_para(request, request.scale_denom),
                 )
             }
         )
@@ -1092,7 +1134,9 @@ async def nesting_preview_endpoint(
                 ribs=request.ribs,
                 columns=request.columns,
                 decisiones_por_par=request.wall_wall_decisions_by_pair,
+                pista=_pista_para(request, request.scale_denom),
             )
+            _guardar_pista(request, request.scale_denom, work.resolucion)
 
         # Chequeo automático de ensamble: huecos/solapes/piezas sin apoyo (world coords),
         # para avisar ANTES de mandar a cortar. Vacío = ensamble verificado.
