@@ -56,6 +56,13 @@ class Phase1Result:
     # `core.services.reporte_verificacion`). Lo llena `review_generate.compute_nesting`:
     # depende de la escala, así que en la Fase 1 es None.
     verificacion: Optional[Dict] = None
+    # Qué hizo el resolvedor de uniones en esta corrida (`review_generate._resolver_uniones`):
+    # qué decisiones invirtió y cuáles probó sin mejora. None si no corrió o no había nada
+    # que probar.
+    resolucion: Optional[Dict] = None
+    # Pares de grupos `(a, b)` cuya decisión de quién cede vino del USUARIO en esta
+    # corrida. El resolvedor no los toca y el reporte los ofrece como "elegí vos".
+    pares_decididos: List = field(default_factory=list)
 
 
 def _rotate_z_to_y(face: Face3D) -> Face3D:
