@@ -306,6 +306,11 @@ MIN_VERTICAL_OVERLAP_M = 0.30
 MIN_JOINT_ANGLE_DEG = 20.0
 
 
+# Memoria de contactos ya calculados entre pares de muros; ver `detect_contact_joints`.
+_CONTACTOS: Dict[tuple, list] = {}
+_MAX_CONTACTOS = 400_000
+
+
 def detect_contact_joints(
     faces: List[Face3D],
     groups: List[GeometryGroup],
@@ -368,6 +373,16 @@ def detect_contact_joints(
 
     tol = CONTACT_TOL_M
 
+    # El contacto entre dos muros depende sólo de la geometría de los dos. Cada fusión
+    # (del usuario o automática) vuelve a detectar las juntas de TODO el modelo aunque
+    # haya cambiado un solo grupo: en un modelo de 300 piezas eran 2.5 s por pasada y
+    # hasta tres pasadas por pedido. Se recuerda el resultado por par.
+    #
+    # Cada grupo se identifica por las COORDENADAS de sus caras, no por su id ni por
+    # índices: un id o un índice se repiten entre dos modelos distintos (o entre dos
+    # versiones del mismo archivo), y confundirlos devolvería las juntas de otro edificio.
+    firma = {gid: hash(verts[gid].tobytes()) for gid in verts}
+
     def touching_points(P: "np.ndarray", T: "np.ndarray") -> List[Tuple[float, float, float]]:
         """Puntos de P que están a <= tol de la superficie T (el contacto en sí)."""
         A, B, C = T[:, 0], T[:, 1], T[:, 2]
@@ -420,8 +435,14 @@ def detect_contact_joints(
                 continue
 
             # Contacto real: puntos de un muro que tocan la superficie del otro.
-            contact = touching_points(verts[b], tris[a])
-            contact += touching_points(verts[a], tris[b])
+            clave = (firma[a], firma[b])
+            contact = _CONTACTOS.get(clave)
+            if contact is None:
+                contact = touching_points(verts[b], tris[a])
+                contact += touching_points(verts[a], tris[b])
+                if len(_CONTACTOS) >= _MAX_CONTACTOS:
+                    _CONTACTOS.clear()
+                _CONTACTOS[clave] = contact
             if not contact:
                 continue
             ys = [p[1] for p in contact]
