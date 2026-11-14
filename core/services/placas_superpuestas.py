@@ -23,9 +23,13 @@ Criterio
 Dos grupos de la misma categoría se funden si, y sólo si:
 
 1. son paralelos (`COS_PARALELAS`);
-2. sus planos medios están a menos de MEDIA placa. Es exactamente la condición con la que
-   `assembly_verify` declara un choque (el plano medio de una cae dentro del volumen de la
-   otra), así que este módulo y el verificador no pueden discrepar sobre qué es un solape;
+2. sus planos medios están a menos de UNA placa: sus volúmenes se pisan. Empezó siendo
+   media placa, que era la condición del verificador por muestreo (el plano medio de una
+   dentro del volumen de la otra). El verificador exacto mostró lo que ése no veía: entre
+   media y una placa las dos piezas también se montan —un cuarto de placa, media placa— y
+   quedaban sin fundir y sin arreglo posible. Medido al extender el límite: las uniones
+   que no arman de demo.obj bajan de 6 a 2 a 1:50 y de 6 a 4 a 1:100; `Prueba app.obj`
+   queda igual a 1:100 y con una más a 1:50;
 3. sus contornos, vistos en el mismo plano, se pisan en una fracción apreciable de la más
    chica (`FRACCION_MINIMA`). Dos tramos coplanares que sólo se TOCAN de canto no entran:
    son dos piezas legítimas, una al lado de la otra.
@@ -78,8 +82,8 @@ FRACCION_MINIMA = 0.2
 ESPESOR_MAX_MURO_M = 0.40      # igual que THIN_WALL_THRESHOLD del clasificador
 FRACCION_MISMA_PARED = 0.5
 
-# Margen bajo la media placa, en metros de PLANCHA. Igual a la tolerancia del verificador:
-# una separación que él no contaría como choque tampoco se funde acá.
+# Margen bajo el espesor de placa, en metros de PLANCHA. Igual a la tolerancia del
+# verificador: un solape que él no contaría tampoco se funde acá.
 TOL_PLANCHA_M = 0.0002
 
 
@@ -108,7 +112,7 @@ def detectar_placas_superpuestas(
     Devuelve listas listas para pasarle a `apply_merges`. Vacío si no hay ninguna.
     """
     escala = scale_denom or 1.0
-    limite = max(0.0, (PLATE_THICKNESS_M / 2.0 - TOL_PLANCHA_M) * escala)
+    limite = max(0.0, (PLATE_THICKNESS_M - TOL_PLANCHA_M) * escala)
 
     placas: List[Tuple[GeometryGroup, str, Placa]] = []
     for g in groups:
