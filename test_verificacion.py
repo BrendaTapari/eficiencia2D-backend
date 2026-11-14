@@ -632,3 +632,89 @@ def test_las_etiquetas_de_dos_placas_montadas_no_caen_en_el_mismo_lugar():
     assert separacion > t, f"las etiquetas quedaron a {separacion:.3f} m: se pisan"
     for p in d["placas"]:
         assert Polygon(p["poligono"]).buffer(1e-9).contains(Point(p["centro"]))
+
+
+def test_con_la_pista_del_pedido_anterior_da_lo_mismo_sin_volver_a_probar():
+    """La pista es lo que hace que un clic en el visor no cueste cinco armados.
+
+    Con las mismas entradas y la pista de la corrida anterior, las piezas tienen que ser
+    las mismas y el resolvedor no tiene que probar nada de nuevo (cero rondas).
+    """
+    from pathlib import Path
+
+    path = Path(__file__).parent / "demo.obj"
+    if not path.exists():
+        pytest.skip("demo.obj no está disponible")
+    parsed = parse_obj(path.read_text())
+    p1 = parse_pipeline(path.name, parsed["faces"], parsed["warnings"])
+    opts = PipelineOptions(scale_denom=100.0, paper="A4", min_area_m2=1.0, sheet_config=None)
+
+    def piezas(work, muros, pisos):
+        return sorted(
+            (p.source_group_id, round(p.width_m, 6), round(p.height_m, 6), len(p.edges))
+            for p in muros + pisos
+        )
+
+    frio, m0, p0, _ = _decompose(p1, opts, None, None, None, None)
+    assert frio.resolucion["rondas"] >= 1 and not frio.resolucion["con_pista"]
+
+    tibio, m1, p1b, _ = _decompose(p1, opts, None, None, None, None, pista=frio.resolucion)
+    assert tibio.resolucion["con_pista"]
+    assert tibio.resolucion["rondas"] == 0, "volvió a probar lo que ya había probado"
+    assert piezas(tibio, m1, p1b) == piezas(frio, m0, p0)
+    assert tibio.resolucion["invertidas"] == frio.resolucion["invertidas"]
+    assert tibio.resolucion["puntaje_despues"] == frio.resolucion["puntaje_despues"]
+
+    # Una pista que nombra grupos que no existen (otro modelo, otra escala) no rompe nada.
+    basura = {"invertidas": [{"group_a": 999001, "group_b": 999002, "yield_group_id": 999001}],
+              "probadas_sin_mejora": [[999003, 999004]], "estado_de_invertidas": {"x": 1}}
+    raro, m2, p2, _ = _decompose(p1, opts, None, None, None, None, pista=basura)
+    assert piezas(raro, m2, p2) == piezas(frio, m0, p0)
+
+
+def test_fusionar_se_ofrece_solo_si_la_fusion_se_va_a_hacer():
+    """Un botón que no cambia nada es peor que no tener botón.
+
+    El reporte ofrecía "cortarlas como una sola pieza" para dos tramos separados por una
+    losa; el backend rechazaba esa fusión en silencio y el problema volvía idéntico.
+    """
+    scale = 100.0
+    t = PLATE_THICKNESS_M * scale
+    a = P("A1", 1, (0.0, 0.0, 0.0), (1, 0, 0), (0, 1, 0), 4.0, 3.0)
+    b = P("A2", 2, (1.0, 0.0, 0.8 * t), (1, 0, 0), (0, 1, 0), 4.0, 3.0)
+    uniones = verificar_uniones([a, b], scale)
+    cat = {1: "wall", 2: "wall"}
+
+    def tipos(**kw):
+        r = construir_reporte([a, b], uniones, scale, categoria_por_grupo=cat, **kw)
+        return [x["tipo"] for x in r["problemas"][0]["acciones"]], r["problemas"][0]["quien"]
+
+    assert "fusionar" in tipos(puede_fusionar=lambda x, y: True)[0]
+    sin, quien = tipos(puede_fusionar=lambda x, y: False)
+    assert "fusionar" not in sin and "descartar" in sin
+    assert quien == "decidir", "sigue habiendo una decisión que tomar: no cortarla"
+
+
+def test_los_contactos_recordados_no_se_confunden_entre_modelos():
+    """La memoria de contactos entre muros identifica cada muro por su geometría.
+
+    Dos modelos con los mismos ids de grupo y la misma cantidad de caras, pero con un muro
+    corrido: en uno se tocan y en el otro no. El segundo no puede heredar la junta.
+    """
+    from core.services.joint_detector import detect_joints
+
+    def juntas_muro_muro(separacion):
+        b = te._ObjBuilder()
+        b.box(0.0, 8.0, 0.0, 3.0, 0.0, 0.20)                              # muro A
+        b.box(4.0, 4.20, 0.0, 3.0, 0.20 + separacion, 5.0)                # muro B, en T
+        parsed = parse_obj(b.text())
+        p1 = parse_pipeline("s.obj", parsed["faces"], parsed["warnings"], force_axis="Y")
+        muros = {g.id for g in p1.groups if g.category == "wall"}
+        return [
+            j for j in detect_joints(p1.faces, p1.groups)
+            if j.group_a in muros and j.group_b in muros
+        ]
+
+    assert juntas_muro_muro(0.0), "pegados tienen que formar una unión"
+    assert not juntas_muro_muro(0.50), "a 50 cm no se tocan: no puede aparecer la junta del otro modelo"
+    assert juntas_muro_muro(0.0)
