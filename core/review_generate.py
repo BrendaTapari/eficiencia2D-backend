@@ -638,7 +638,15 @@ def decompose_panels_from_groups(
     ribs: Optional[List[dict]] = None,
     columns: Optional[List[dict]] = None,
     adj_result: Optional[AdjustmentsResult] = None,
+    cache: Optional[Dict] = None,
 ) -> Tuple[List[Panel], List[Panel]]:
+    """Piezas 2D de cada grupo, ya recortadas.
+
+    `cache` es un diccionario que el llamador conserva entre llamadas sobre la MISMA
+    topología y escala (el resolvedor arma las piezas varias veces cambiando sólo quién
+    cede). Guarda lo que no depende de esas decisiones: las placas de cada grupo y, dentro
+    de ellas, las huellas de sus vecinas.
+    """
     overrides = overrides or {}
     marks_set = set(marks or [])  # ids de grupos cuyas aberturas se graban (no se cortan)
     min_area = opts.min_area_m2 if opts.min_area_m2 is not None else 0.01
@@ -732,16 +740,26 @@ def decompose_panels_from_groups(
 
     # Placas para el motor booleano: marco 3D + contorno 2D de cada grupo, una sola vez.
     usar_caras(phase1.faces)
-    placas_csg: Dict[int, object] = {}
-    for _g in phase1.groups:
-        if _effective_category(_g, overrides) == "discard":
-            continue
-        _pl = construir_placa(
-            _g, phase1.faces,
-            oriented_normals.get(_g.id, _g.representative_normal),
-        )
-        if _pl is not None:
-            placas_csg[_g.id] = _pl
+    placas_csg: Dict[int, object] = cache.get("placas") if cache is not None else None
+    if placas_csg is None:
+        placas_csg = {}
+        for _g in phase1.groups:
+            if _effective_category(_g, overrides) == "discard":
+                continue
+            _pl = construir_placa(
+                _g, phase1.faces,
+                oriented_normals.get(_g.id, _g.representative_normal),
+            )
+            if _pl is not None:
+                placas_csg[_g.id] = _pl
+        if cache is not None:
+            cache["placas"] = placas_csg
+    else:
+        # Mismas placas que el armado anterior: se olvida lo que SÍ depende de las
+        # decisiones (el contorno resuelto) y se conserva lo que no (las huellas).
+        for _pl in placas_csg.values():
+            _pl.poly_final = None
+            _pl.crecio = False
 
 
     for group in phase1.groups:
@@ -1227,8 +1245,15 @@ def _decompose(
     ribs: Optional[List[dict]] = None,
     columns: Optional[List[dict]] = None,
     decisiones_por_par: Optional[List[dict]] = None,
+    resolver: bool = True,
 ) -> Tuple[Phase1Result, List[Panel], List[Panel], List]:
-    """Aplica merges, resuelve encastres 3D y descompone a paneles 2D."""
+    """Aplica merges, resuelve encastres 3D y descompone a paneles 2D.
+
+    Con `resolver` (por defecto) las uniones muro-muro que el usuario NO decidió pasan por
+    `_resolver_uniones`, que prueba la decisión contraria donde la sugerida no cierra y se
+    queda con la que el verificador mide mejor. Lo que resolvió queda en
+    `work.resolucion`.
+    """
     work = apply_merges(phase1, merges or [], overrides)
     work, wall_wall_decisions = _una_placa_por_lugar(
         work, opts.scale_denom or 1.0, overrides, wall_wall_decisions
@@ -1237,13 +1262,53 @@ def _decompose(
         work, wall_wall_decisions, decisiones_por_par
     )
 
-    # ORDEN IMPORTANTE: primero se decide quién cede en cada junta, y recién después se
-    # resuelven las ranuras CONSUMIENDO esa decisión. Antes era al revés y cada una la
-    # calculaba por su cuenta: la placa que se acortaba no era la que recibía la ranura en
-    # 7 de 15 pares de un modelo real. Una sola decisión por junta, una sola vez.
-    adj_result = compute_adjustments(
-        work.joints, work.groups, wall_wall_decisions, work.faces
-    )
+    cache_de_armado: Dict = {}
+
+    def armar(decisiones: Optional[Dict[int, int]]):
+        """Decisiones -> piezas. Es la parte que depende de quién cede; todo lo de
+        arriba (fusiones, traducción de decisiones) se hace una sola vez."""
+        # ORDEN IMPORTANTE: primero se decide quién cede en cada junta, y recién después
+        # se resuelven las ranuras CONSUMIENDO esa decisión. Antes era al revés y cada una
+        # la calculaba por su cuenta: la placa que se acortaba no era la que recibía la
+        # ranura en 7 de 15 pares de un modelo real. Una sola decisión por junta.
+        adj = compute_adjustments(work.joints, work.groups, decisiones, work.faces)
+        # Sólo llevan ranura las juntas DETECTADAS que ningún tope resolvió. Las demás ya
+        # están resueltas acortando una placa, y abrirles además una ranura sólo debilita
+        # la pieza. El encaje losa-muro va por su propio camino (`_floor_slots`), porque
+        # ahí la ranura no reemplaza a un tope: es lo único que sostiene la losa.
+        sin_resolver = {
+            pair_key(j.group_a, j.group_b)
+            for j in adj.wall_wall_joints
+            if j.yield_group_id is None
+        }
+        pjs = resolve_plate_joints(
+            work.groups, work.faces,
+            yield_by_pair=yield_by_pair(adj), sin_resolver=sin_resolver,
+        )
+        muros, pisos = decompose_panels_from_groups(
+            work, opts, overrides, decisiones, marks, pjs,
+            user_cuts, flex, mark_lines, ribs, columns,
+            adj_result=adj, cache=cache_de_armado,
+        )
+        return adj, muros, pisos, pjs
+
+    adj_result, wall_panels, floor_panels, plate_joints = armar(wall_wall_decisions)
+    resolucion = None
+    if resolver:
+        try:
+            mejor = _resolver_uniones(
+                work, opts.scale_denom or 1.0, wall_wall_decisions, armar,
+                (adj_result, wall_panels, floor_panels, plate_joints),
+            )
+        except Exception:
+            import logging
+            logging.getLogger("eficiencia2d.pipeline").exception(
+                "_resolver_uniones falló; se sigue con las decisiones sugeridas"
+            )
+            mejor = None
+        if mejor is not None:
+            (adj_result, wall_panels, floor_panels, plate_joints), resolucion = mejor
+
     # Una decisión que no se pudo aplicar tiene que llegar al usuario. Es su elección
     # sobre quién cede en una esquina; si se descarta en silencio, la pieza sale sin el
     # recorte que pidió y no hay forma de enterarse antes de cortar el MDF.
@@ -1253,30 +1318,16 @@ def _decompose(
             warnings=list(work.warnings or []) + adj_result.decisiones_ignoradas,
         )
     # Las juntas muro-muro de `work` pasan a ser las de ESTA corrida, con la decisión que
-    # de verdad se aplicó en cada una (la del usuario o la sugerida). Las que traía eran
-    # las de `apply_merges`, calculadas sin decisiones: quien mirara ahí quién cede
-    # —el verificador, el reporte— veía una respuesta que no era la que se cortó.
-    work = replace(work, wall_wall_joints=adj_result.wall_wall_joints)
-
-    # Misión 1: resolver intersecciones placa-placa en 3D (encastres) sobre la
-    # topología final (post-merges), antes de proyectar.
-    # Sólo llevan ranura las juntas DETECTADAS que ningún tope resolvió. Las demás ya
-    # están resueltas acortando una placa, y abrirles además una ranura sólo debilita la
-    # pieza. El encaje losa-muro va por su propio camino (`_floor_slots`), porque ahí la
-    # ranura no reemplaza a un tope: es lo único que sostiene la losa.
-    sin_resolver = {
-        pair_key(j.group_a, j.group_b)
-        for j in adj_result.wall_wall_joints
-        if j.yield_group_id is None
-    }
-    plate_joints = resolve_plate_joints(
-        work.groups, work.faces,
-        yield_by_pair=yield_by_pair(adj_result), sin_resolver=sin_resolver,
-    )
-    wall_panels, floor_panels = decompose_panels_from_groups(
-        work, opts, overrides, wall_wall_decisions, marks, plate_joints,
-        user_cuts, flex, mark_lines, ribs, columns,
-        adj_result=adj_result,
+    # de verdad se aplicó en cada una (la del usuario, la sugerida o la que eligió el
+    # resolvedor). Las que traía eran las de `apply_merges`, calculadas sin decisiones:
+    # quien mirara ahí quién cede veía una respuesta que no era la que se cortó.
+    work = replace(
+        work, wall_wall_joints=adj_result.wall_wall_joints, resolucion=resolucion,
+        pares_decididos=sorted({
+            pair_key(work.joints[ji].group_a, work.joints[ji].group_b)
+            for ji in (wall_wall_decisions or {})
+            if 0 <= ji < len(work.joints)
+        }),
     )
     aviso = _aviso_piezas_mas_finas_que_la_placa(
         wall_panels + floor_panels, opts.scale_denom or 1.0
@@ -1284,6 +1335,169 @@ def _decompose(
     if aviso:
         work = replace(work, warnings=list(work.warnings or []) + [aviso])
     return work, wall_panels, floor_panels, plate_joints
+
+
+# Cuántas veces se repite "probar lo contrario y conservar lo que mejora". Cada ronda
+# cuesta dos armados completos de piezas; en la práctica la segunda ya rinde poco.
+RONDAS_DEL_RESOLVEDOR = 2
+
+_RANGO_ESTADO = {"no_arma": 0, "revisar": 1, "ok": 2}
+
+
+def _pares_a_verificar(work) -> Tuple[set, set]:
+    """`(previstos, de_apoyo)`: qué encuentros existen en el modelo. Ver
+    `verificacion_uniones.verificar_uniones`."""
+    from core.services.assembly_adjuster import (
+        floor_wall_encounters,
+        wall_end_fit_adjustments,
+    )
+
+    previstos = {pair_key(j.group_a, j.group_b) for j in work.joints}
+    apoyos = {
+        pair_key(a.group_id, a.against_group_id)
+        for a in wall_end_fit_adjustments(work.groups, work.faces)
+        if a.against_group_id is not None
+    } | {
+        pair_key(f.id, w.id)
+        for f, w, _s in floor_wall_encounters(work.groups, work.faces)
+    }
+    return previstos, apoyos
+
+
+def _puntaje(uniones) -> Tuple[int, int, float]:
+    """Qué tan mal está un conjunto de uniones; menor es mejor.
+
+    En orden: las que no arman, las que no están bien (para revisar, incluidas las que
+    sólo se tocan de canto) y, a igualdad de eso, los milímetros acumulados de desvío.
+
+    Una unión de canto cuenta igual que una para revisar, a propósito. Con un escalón
+    propio y más barato, el resolvedor cambiaba una luz de medio milímetro por una esquina
+    abierta de tres: técnicamente "subía de categoría" y a la vista quedaba peor. Medido en
+    demo.obj a 1:50: 5 inversiones aceptadas para pasar de 3 luces a 2, con una esquina
+    abierta más y dos bordes de esquina peor.
+    """
+    no_arma = otras = 0
+    mm = 0.0
+    for u in uniones:
+        if u.estado == "ok":
+            continue
+        mm += u.medida_mm
+        if u.estado == "no_arma":
+            no_arma += 1
+        else:
+            otras += 1
+    return (no_arma, otras, round(mm, 3))
+
+
+def _resolver_uniones(work, scale_denom, decisiones_usuario, armar, base):
+    """Prueba la decisión contraria donde la sugerida no cierra, y conserva lo que mejora.
+
+    Por qué existe
+    --------------
+    Quién cede en cada unión muro-muro lo sugiere una heurística (posición de la junta,
+    espesores, topología). Acierta casi siempre, pero cuando no acierta la unión queda
+    pisándose o con luz, y hasta ahora la única salida era que una persona lo notara en
+    el visor y lo invirtiera a mano, unión por unión. En un modelo de 300 piezas eso no
+    lo hace nadie con una entrega encima.
+
+    Invertir una decisión sólo mueve UN extremo de dos piezas, así que el efecto es local:
+    se pueden invertir muchas a la vez, medir cada una por separado y quedarse con las
+    que mejoraron. El juez es el verificador exacto por unión, no una regla.
+
+    Cómo decide
+    -----------
+    1. Mide las piezas con las decisiones sugeridas.
+    2. Toma las uniones que fallan, tienen quién ceda y el usuario NO decidió.
+    3. Arma de nuevo con todas ésas invertidas y mide.
+    4. Conserva una inversión sólo si las uniones de SUS dos piezas quedaron mejor.
+    5. Arma con las conservadas. Si el conjunto no mejora al de partida, descarta todo.
+
+    Nunca toca una decisión del usuario, y nunca devuelve algo peor que lo que recibió.
+    Devuelve `(piezas, resolucion)` o None si no había nada que probar.
+    """
+    from core.services.verificacion_uniones import verificar_uniones
+
+    previstos, apoyos = _pares_a_verificar(work)
+
+    def medir(resultado):
+        _adj, muros, pisos, _pjs = resultado
+        return verificar_uniones(list(muros) + list(pisos), scale_denom, previstos, apoyos)
+
+    fijas = {
+        pair_key(work.joints[ji].group_a, work.joints[ji].group_b)
+        for ji in (decisiones_usuario or {})
+        if 0 <= ji < len(work.joints)
+    }
+    indice: Dict[Tuple[int, int], int] = {}
+    for ji, j in enumerate(work.joints):
+        indice.setdefault(pair_key(j.group_a, j.group_b), ji)
+
+    actual = base
+    uniones = medir(actual)
+    puntaje_inicial = _puntaje(uniones)
+    decisiones = dict(decisiones_usuario or {})
+    invertidas: Dict[Tuple[int, int], int] = {}
+    probadas: set = set()
+    rondas = 0
+
+    for _ in range(RONDAS_DEL_RESOLVEDOR):
+        cede = {
+            pair_key(j.group_a, j.group_b): j.yield_group_id
+            for j in actual[0].wall_wall_joints
+            if j.yield_group_id is not None
+        }
+        candidatas: Dict[Tuple[int, int], int] = {}
+        for u in uniones:
+            if u.estado == "ok" or u.tipo == "superpuestas":
+                continue
+            k = pair_key(u.grupo_a, u.grupo_b)
+            if k in fijas or k in probadas or k not in cede or k not in indice:
+                continue
+            candidatas[k] = u.grupo_b if cede[k] == u.grupo_a else u.grupo_a
+        if not candidatas:
+            break
+        rondas += 1
+        probadas |= set(candidatas)
+
+        prueba = armar({**decisiones, **{indice[k]: g for k, g in candidatas.items()}})
+        uniones_prueba = medir(prueba)
+
+        def local(us, k):
+            a, b = k
+            return _puntaje([u for u in us if u.grupo_a in (a, b) or u.grupo_b in (a, b)])
+
+        mejoran = {
+            k: g for k, g in candidatas.items()
+            if local(uniones_prueba, k) < local(uniones, k)
+        }
+        if not mejoran:
+            break
+        if len(mejoran) == len(candidatas):
+            nuevo, uniones_nuevo = prueba, uniones_prueba
+        else:
+            nuevo = armar({**decisiones, **{indice[k]: g for k, g in mejoran.items()}})
+            uniones_nuevo = medir(nuevo)
+        if _puntaje(uniones_nuevo) >= _puntaje(uniones):
+            break       # por separado mejoraban, juntas no: se queda con lo que tenía
+        actual, uniones = nuevo, uniones_nuevo
+        decisiones.update({indice[k]: g for k, g in mejoran.items()})
+        invertidas.update(mejoran)
+
+    if not probadas:
+        return None
+    resolucion = {
+        "rondas": rondas,
+        "invertidas": [
+            {"group_a": a, "group_b": b, "yield_group_id": g}
+            for (a, b), g in sorted(invertidas.items())
+        ],
+        # Uniones donde se probó invertir y NO mejoró: ofrecerle eso al usuario como
+        # arreglo sería mandarlo a probar algo que ya se sabe que no sirve.
+        "probadas_sin_mejora": sorted([a, b] for (a, b) in probadas - set(invertidas)),
+        "puntaje_antes": list(puntaje_inicial),
+        "puntaje_despues": list(_puntaje(uniones)),
+    }
+    return actual, resolucion
 
 
 def _aviso_piezas_mas_finas_que_la_placa(panels: List[Panel], scale_denom: float):
@@ -1351,8 +1565,10 @@ def compute_panel_id_by_group(
             scale_denom=50.0, paper="A4", min_area_m2=None, sheet_config=None
         )
     try:
+        # Sin resolvedor: las etiquetas dependen de QUÉ piezas hay, no de quién cede en
+        # cada unión, y esto corre en cada subida.
         _, wall_panels, floor_panels, _ = _decompose(
-            phase1, opts, overrides, None, None, None
+            phase1, opts, overrides, None, None, None, resolver=False
         )
         return panel_ids_by_group(wall_panels, floor_panels)
     except Exception:
@@ -1482,23 +1698,11 @@ def reporte_de_verificacion(work, wall_panels, floor_panels, scale_denom) -> Opt
     consumidor lo trata como "sin verificar", que no es lo mismo que "verificado".
     """
     try:
-        from core.services.assembly_adjuster import (
-            floor_wall_encounters,
-            wall_end_fit_adjustments,
-        )
         from core.services.reporte_verificacion import construir_reporte
         from core.services.verificacion_uniones import verificar_uniones
 
         piezas = list(wall_panels) + list(floor_panels)
-        previstos = {pair_key(j.group_a, j.group_b) for j in work.joints}
-        apoyos = {
-            pair_key(a.group_id, a.against_group_id)
-            for a in wall_end_fit_adjustments(work.groups, work.faces)
-            if a.against_group_id is not None
-        } | {
-            pair_key(f.id, w.id)
-            for f, w, _s in floor_wall_encounters(work.groups, work.faces)
-        }
+        previstos, apoyos = _pares_a_verificar(work)
         uniones = verificar_uniones(piezas, scale_denom, previstos, apoyos)
         cede = {
             pair_key(j.group_a, j.group_b): j.yield_group_id
@@ -1508,6 +1712,9 @@ def reporte_de_verificacion(work, wall_panels, floor_panels, scale_denom) -> Opt
         return construir_reporte(
             piezas, uniones, scale_denom, cede,
             {g.id: g.category for g in work.groups},
+            resolucion=work.resolucion,
+            pares_decididos_por_el_usuario={tuple(p) for p in (work.pares_decididos or [])},
+            espesor_modelo={g.id: float(g.thickness or 0.0) for g in work.groups},
         )
     except Exception:
         import logging
