@@ -1520,28 +1520,27 @@ def _modelo_muro_con_revestimiento(separacion):
 
 @pytest.mark.parametrize("scale", ESCALAS)
 def test_dos_superficies_paralelas_son_una_pieza_si_la_placa_no_entra_dos_veces(scale):
-    """A menos de media placa de distancia no hay lugar físico para dos piezas.
+    """A menos de UNA placa de distancia no hay lugar físico para dos piezas.
 
-    La chapa está a 11 cm del plano medio del muro. Media placa son 3 cm de edificio a
-    1:20, 7.5 a 1:50, 15 a 1:100 y 30 a 1:200: a las dos primeras escalas son dos piezas
-    legítimas, a las dos últimas el plano medio de una cae DENTRO del volumen de la otra
-    y tienen que cortarse como una sola. La respuesta depende de la escala y no puede no
-    depender.
+    La chapa está a 11 cm del plano medio del muro. La placa son 6 cm de edificio a 1:20,
+    15 a 1:50, 30 a 1:100 y 60 a 1:200: sólo a 1:20 entran las dos; a partir de 1:50 sus
+    volúmenes se pisan y tienen que cortarse como una sola. La respuesta depende de la
+    escala y no puede no depender.
     """
     separacion = 0.11
     work, paneles, grupos, pjs = _procesar(
         _modelo_muro_con_revestimiento(separacion), scale
     )
-    media_placa = PLATE_THICKNESS_M * scale / 2.0
+    placa = PLATE_THICKNESS_M * scale
     # Piezas paralelas al muro A (normal en Z) que tocan la zona de la chapa.
     en_z = [
         p for p in paneles
         if grupos[p.source_group_id].category == "wall"
         and abs(grupos[p.source_group_id].representative_normal.z) > 0.9
     ]
-    if separacion < media_placa:
+    if separacion < placa:
         assert len(en_z) == 1, (
-            f"1:{scale:.0f} la placa ocupa {media_placa * 200:.0f} cm de edificio y las "
+            f"1:{scale:.0f} la placa ocupa {placa * 100:.0f} cm de edificio y las "
             f"dos superficies están a {separacion * 100:.0f} cm: tiene que ser UNA pieza, "
             f"salieron {len(en_z)}"
         )
@@ -1553,8 +1552,8 @@ def test_dos_superficies_paralelas_son_una_pieza_si_la_placa_no_entra_dos_veces(
         )
     else:
         assert len(en_z) == 2, (
-            f"1:{scale:.0f} hay lugar para las dos placas (media placa = "
-            f"{media_placa * 100:.1f} cm, separación {separacion * 100:.0f} cm) y "
+            f"1:{scale:.0f} hay lugar para las dos placas (placa = "
+            f"{placa * 100:.1f} cm, separación {separacion * 100:.0f} cm) y "
             f"salieron {len(en_z)} piezas"
         )
 
