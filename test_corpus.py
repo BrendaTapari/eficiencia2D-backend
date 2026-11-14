@@ -741,6 +741,12 @@ def test_el_veredicto_de_cada_modelo(path, scale):
     assert all(n["quien"] in ("decidir", "escala", "modelo") for n in r["nudos"])
     sin_dibujo = [n["titulo"] for n in r["nudos"] if not n["detalle"]]
     assert not sin_dibujo, f"nudos sin detalle para dibujar: {sin_dibujo[:3]}"
+    for n in r["nudos"]:
+        d = n["detalle"]
+        assert {c["union"] for c in d["cotas"]} <= set(n["uniones"]), "cota de otra unión"
+        dibujadas = {p["pieza"] for p in d["placas"]}
+        assert all(set(c["piezas"]) <= dibujadas for c in d["cotas"])
+        assert all(set(sp["piezas"]) <= dibujadas for sp in d["solapes"])
     # Las terminaciones no cuentan como falla y están todas en su lista.
     de_canto = {u["id"] for u in r["uniones"] if u["terminacion"]}
     assert all(r["uniones"][i]["estado"] == "ok" for i in de_canto)
