@@ -117,6 +117,13 @@ class _Placa:
     lo: object = None
     hi: object = None
     verts: object = None
+    # Anillos del contorno ya llevados al MUNDO: [(exterior Nx3, [hueco Mx3, ...]), ...].
+    # Cambiar de coordenadas contra cada vecina pasa a ser un producto de matrices en vez
+    # de un cálculo por vértice (eran 400.000 por verificación en un modelo de 300 piezas).
+    anillos: object = None
+    # Huella de la pieza: contorno + marco. Dos placas con la misma firma son la misma
+    # pieza en el mismo lugar, así que lo medido entre ellas sigue valiendo.
+    firma: object = None
 
 
 def _estado(medida_mm: float, tope: str = "no_arma") -> str:
@@ -153,10 +160,21 @@ def _placas(panels: Iterable[Panel]) -> List[_Placa]:
         if not pts:
             continue
         verts = np.array(pts)
+
+        def al_mundo(coords):
+            c = np.asarray(coords, dtype=float)[:, :2]
+            return o + np.outer(c[:, 0], u) + np.outer(c[:, 1], v)
+
+        anillos = [
+            (al_mundo(g.exterior.coords), [al_mundo(h.coords) for h in g.interiors])
+            for g in getattr(poly, "geoms", [poly])
+        ]
         out.append(_Placa(
             id=p.id, gid=p.source_group_id, categoria=p.category, poly=poly,
             o=o, u=u, v=v, n=n, d=float(n @ o),
             lo=verts.min(axis=0), hi=verts.max(axis=0), verts=verts,
+            anillos=anillos,
+            firma=hash((p.id, poly.wkb, o.tobytes(), u.tobytes(), v.tobytes())),
         ))
     return out
 
@@ -164,20 +182,17 @@ def _placas(panels: Iterable[Panel]) -> List[_Placa]:
 def _en_tau_q(pl: _Placa, tau, n_otra, d_otra):
     """Contorno de `pl` en coordenadas (τ a lo largo de la recta de corte, q = distancia
     con signo al plano medio de la otra placa). El mapa es afín: sigue siendo un polígono."""
+    import numpy as np
     from shapely.geometry import Polygon
     from shapely.ops import unary_union
 
-    def mapa(x: float, y: float) -> Tuple[float, float]:
-        w = pl.o + pl.u * x + pl.v * y
-        return (float(w @ tau), float(w @ n_otra) - d_otra)
+    base = np.stack([tau, n_otra], axis=1)          # 3x2: columnas τ y normal de la otra
+    corr = np.array([0.0, d_otra])
 
     partes = []
-    for g in getattr(pl.poly, "geoms", [pl.poly]):
+    for ext, huecos in pl.anillos:
         try:
-            p = Polygon(
-                [mapa(x, y) for x, y in g.exterior.coords],
-                [[mapa(x, y) for x, y in h.coords] for h in g.interiors],
-            )
+            p = Polygon(ext @ base - corr, [h @ base - corr for h in huecos])
         except Exception:
             continue
         if not p.is_valid:
@@ -393,8 +408,15 @@ def verificar_uniones(
     scale_denom: float,
     pares_previstos: Optional[Set[Tuple[int, int]]] = None,
     pares_de_apoyo: Optional[Set[Tuple[int, int]]] = None,
+    cache: Optional[Dict] = None,
 ) -> List[Union]:
     """Estado de cada unión entre las piezas que se van a cortar.
+
+    `cache` es un diccionario que el llamador conserva entre llamadas con la misma escala
+    y los mismos pares previstos. Guarda lo medido entre cada par de piezas por su firma
+    (contorno + posición): si ninguna de las dos cambió, no se vuelve a medir. El
+    resolvedor arma las piezas varias veces cambiando unas pocas; sin esto volvía a medir
+    las 600 uniones cada vez.
 
     `pares_previstos` son `pair_key(gid_a, gid_b)` de los encuentros que existen en el
     modelo (juntas detectadas y apoyos muro-losa). Para ésos se informa también si queda
@@ -427,41 +449,51 @@ def verificar_uniones(
             clave = pair_key(A.gid, B.gid)
             de_apoyo = clave in pares_de_apoyo
             prevista = clave in pares_previstos or de_apoyo
-            if abs(float(A.n @ B.n)) > COS_PARALELAS:
-                u = _medir_paralelas(A, B, espesor, prevista, a_mm)
-                if u is not None:
-                    out.append(u)
-                continue
-
-            # "Se tocan" con la misma tolerancia con la que después se juzga la luz: la
-            # holgura del kerf en una ranura deja las caras a centésimas, no a cero.
-            m = _medir_cruce(A, B, espesor, prevista, TOL_OK_MM / a_mm)
-            if m is None:
-                continue
-            armar = m["armar"]
-            choque_mm = m["choque"] * a_mm
-            if choque_mm > TOL_OK_MM:
-                out.append(armar("choque", choque_mm, m["tramo_choque"], _estado(choque_mm)))
-                continue
-            if not prevista:
-                continue        # no chocan y no tenían por qué tocarse: no es una unión
-            luz_mm = m["luz"] * a_mm
-            if m["tramo_contacto"] is None or luz_mm > TOL_OK_MM:
-                if de_apoyo:
-                    continue
-                out.append(armar("luz", luz_mm, m["tramo_luz"], _estado(luz_mm)))
-                continue
-            # Se tocan sin pisarse. ¿Alguna atraviesa el espesor de la otra?
-            total = sum(l for _d, l, _q in m["deficit"]) or 1.0
-            sin_cubrir = sum(l for d, l, _q in m["deficit"] if d * a_mm > TOL_OK_MM)
-            if sin_cubrir > 0.5 * total:
-                # déficit típico: el de mayor largo acumulado
-                peor = max(m["deficit"], key=lambda x: x[1])
-                quien = (A, B)[peor[2]]
-                out.append(armar(
-                    "sin_cubrir", peor[0] * a_mm, m["tramo_contacto"],
-                    _estado(peor[0] * a_mm, tope="revisar"), ajusta=quien.id,
-                ))
+            if cache is not None:
+                k = (A.firma, B.firma, prevista, de_apoyo)
+                u = cache.get(k, _SIN_MEDIR)
+                if u is _SIN_MEDIR:
+                    u = _unir(A, B, espesor, a_mm, prevista, de_apoyo)
+                    cache[k] = u
             else:
-                out.append(armar("encaja", 0.0, m["tramo_contacto"], "ok"))
+                u = _unir(A, B, espesor, a_mm, prevista, de_apoyo)
+            if u is not None:
+                out.append(u)
     return out
+
+
+_SIN_MEDIR = object()
+
+
+def _unir(A: _Placa, B: _Placa, espesor: float, a_mm: float, prevista: bool, de_apoyo: bool) -> Optional[Union]:
+    """La unión entre dos placas, o None si no hay nada que informar entre ellas."""
+    if abs(float(A.n @ B.n)) > COS_PARALELAS:
+        return _medir_paralelas(A, B, espesor, prevista, a_mm)
+
+    # "Se tocan" con la misma tolerancia con la que después se juzga la luz: la holgura
+    # del kerf en una ranura deja las caras a centésimas, no a cero.
+    m = _medir_cruce(A, B, espesor, prevista, TOL_OK_MM / a_mm)
+    if m is None:
+        return None
+    armar = m["armar"]
+    choque_mm = m["choque"] * a_mm
+    if choque_mm > TOL_OK_MM:
+        return armar("choque", choque_mm, m["tramo_choque"], _estado(choque_mm))
+    if not prevista:
+        return None             # no chocan y no tenían por qué tocarse: no es una unión
+    luz_mm = m["luz"] * a_mm
+    if m["tramo_contacto"] is None or luz_mm > TOL_OK_MM:
+        if de_apoyo:
+            return None
+        return armar("luz", luz_mm, m["tramo_luz"], _estado(luz_mm))
+    # Se tocan sin pisarse. ¿Alguna atraviesa el espesor de la otra?
+    total = sum(l for _d, l, _q in m["deficit"]) or 1.0
+    sin_cubrir = sum(l for d, l, _q in m["deficit"] if d * a_mm > TOL_OK_MM)
+    if sin_cubrir > 0.5 * total:
+        peor = max(m["deficit"], key=lambda x: x[1])     # el de mayor largo acumulado
+        quien = (A, B)[peor[2]]
+        return armar(
+            "sin_cubrir", peor[0] * a_mm, m["tramo_contacto"],
+            _estado(peor[0] * a_mm, tope="revisar"), ajusta=quien.id,
+        )
+    return armar("encaja", 0.0, m["tramo_contacto"], "ok")
