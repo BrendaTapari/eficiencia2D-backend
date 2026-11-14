@@ -279,7 +279,17 @@ def _titulo(tipo: str, piezas: List[str], medida_mm: float) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _detalle(punto, tau, placas, estado_de: Dict[str, str], espesor: float) -> Optional[Dict]:
+# Una sección más corta que esto (fracción del espesor de placa) no se dibuja: es el borde
+# de una pieza que apenas roza la ventana, o el retazo de una que el corte agarra de canto.
+# En el dibujo es una astilla con una etiqueta encima de la de al lado, y no informa nada.
+SECCION_MINIMA_PLACAS = 0.5
+
+
+def _detalle(
+    punto, tau, placas, estado_de: Dict[str, str], espesor: float,
+    uniones_del_nudo: Optional[List[Tuple[int, Union]]] = None,
+    a_cm_edificio: float = 0.0,
+) -> Optional[Dict]:
     """Corte de las placas por un plano perpendicular a la unión, alrededor de `punto`.
 
     Si la unión es vertical (dos muros) el corte es una PLANTA; si es horizontal (un muro
@@ -369,6 +379,23 @@ def _detalle(punto, tau, placas, estado_de: Dict[str, str], espesor: float) -> O
             if rect.is_empty or rect.geom_type != "Polygon" or rect.area <= 1e-12:
                 continue
             secciones.append((pl.id, pl.gid, rect))
+
+    # Las piezas del nudo se dibujan siempre, midan lo que midan: son el motivo del
+    # dibujo. Las de contexto, sólo si se ven.
+    del_nudo = {
+        pid for _i, u in (uniones_del_nudo or []) for pid in (u.pieza_a, u.pieza_b)
+    }
+    minimo_area = SECCION_MINIMA_PLACAS * espesor * espesor
+    mayor_de: Dict[str, float] = {}
+    for pid, _gid, rect in secciones:
+        mayor_de[pid] = max(mayor_de.get(pid, 0.0), rect.area)
+    secciones = [
+        sec for sec in secciones
+        if sec[2].area >= minimo_area
+        # De una pieza del nudo se conserva al menos su trozo más grande, aunque sea
+        # chico; sus otras astillas se van igual que las de cualquiera.
+        or (sec[0] in del_nudo and sec[2].area >= mayor_de[sec[0]] - 1e-12)
+    ]
     if not secciones:
         return None
 
@@ -405,11 +432,122 @@ def _detalle(punto, tau, placas, estado_de: Dict[str, str], espesor: float) -> O
                 "pieza": pid, "grupo": gid,
                 "estado": estado_de.get(pid, "ok"),
                 "poligono": coords(rect),
+                # Dónde escribir la etiqueta: un punto que está DENTRO del polígono y
+                # que no coincide con el de otra placa.
+                "centro": [round(centro[0], 4), round(centro[1], 4)],
             }
-            for pid, gid, rect in secciones
+            for (pid, gid, rect), centro in zip(secciones, _etiquetas(secciones, espesor))
         ],
         "solapes": solapes,
+        "cotas": _cotas(secciones, uniones_del_nudo or [], a_cm_edificio),
     }
+
+
+def _etiquetas(secciones, espesor: float) -> List[Tuple[float, float]]:
+    """Un punto por sección donde escribir su etiqueta, sin que dos caigan en el mismo.
+
+    El punto natural es el centro de la sección. Pero dos placas montadas una sobre otra
+    —justo el caso que hay que mostrar— tienen la sección en el mismo lugar, y las dos
+    etiquetas salían encimadas e ilegibles. Las que chocan se reparten a lo largo del eje
+    largo de su propia sección: a un tercio y dos tercios si son dos, y así.
+    """
+    centros = [
+        (sec[2].representative_point().x, sec[2].representative_point().y)
+        for sec in secciones
+    ]
+    cerca = 0.8 * espesor
+    usados = [False] * len(secciones)
+    for i in range(len(secciones)):
+        if usados[i]:
+            continue
+        grupo = [i] + [
+            j for j in range(i + 1, len(secciones))
+            if not usados[j]
+            and (centros[i][0] - centros[j][0]) ** 2 + (centros[i][1] - centros[j][1]) ** 2
+            <= cerca * cerca
+        ]
+        if len(grupo) < 2:
+            continue
+        for orden, j in enumerate(grupo):
+            usados[j] = True
+            caja = secciones[j][2].minimum_rotated_rectangle
+            cs = list(caja.exterior.coords)[:4] if caja.geom_type == "Polygon" else []
+            if len(cs) != 4:
+                continue
+            l01 = (cs[1][0] - cs[0][0]) ** 2 + (cs[1][1] - cs[0][1]) ** 2
+            l12 = (cs[2][0] - cs[1][0]) ** 2 + (cs[2][1] - cs[1][1]) ** 2
+            # Extremos del eje LARGO, por el medio del lado corto.
+            if l01 >= l12:
+                e0 = ((cs[0][0] + cs[3][0]) / 2, (cs[0][1] + cs[3][1]) / 2)
+                e1 = ((cs[1][0] + cs[2][0]) / 2, (cs[1][1] + cs[2][1]) / 2)
+            else:
+                e0 = ((cs[0][0] + cs[1][0]) / 2, (cs[0][1] + cs[1][1]) / 2)
+                e1 = ((cs[3][0] + cs[2][0]) / 2, (cs[3][1] + cs[2][1]) / 2)
+            f = (orden + 1) / (len(grupo) + 1)
+            centros[j] = (e0[0] + (e1[0] - e0[0]) * f, e0[1] + (e1[1] - e0[1]) * f)
+    return centros
+
+
+def _cotas(secciones, uniones_del_nudo, a_cm_edificio: float) -> List[Dict]:
+    """Una cota por unión con problema: dónde está en el dibujo y cuánto mide.
+
+    El dibujo muestra QUE dos placas se pisan o no se tocan; la cota dice CUÁNTO. El texto
+    sale de la medición exacta de la unión, no de medir el dibujo: el corte pasa por un
+    solo punto del nudo y la unión puede variar a lo largo.
+
+    `desde` y `hasta` son los extremos del tramo a acotar: para una luz, los dos puntos más
+    cercanos entre las placas; para un choque o dos placas montadas, el ancho de lo que
+    comparten. Si en este corte las dos piezas no aparecen, la unión no lleva cota.
+    """
+    from shapely.ops import nearest_points, unary_union
+
+    por_pieza: Dict[str, List] = defaultdict(list)
+    for pid, _gid, rect in secciones:
+        por_pieza[pid].append(rect)
+
+    out: List[Dict] = []
+    for indice, u in uniones_del_nudo:
+        if u.pieza_a not in por_pieza or u.pieza_b not in por_pieza:
+            continue
+        A = unary_union(por_pieza[u.pieza_a])
+        B = unary_union(por_pieza[u.pieza_b])
+        desde = hasta = None
+        if u.tipo in ("choque", "superpuestas"):
+            try:
+                inter = A.intersection(B)
+            except Exception:
+                inter = None
+            if inter is not None and not inter.is_empty and inter.area > 1e-12:
+                # Lado corto del rectángulo que envuelve lo compartido, por su centro.
+                caja = inter.minimum_rotated_rectangle
+                cs = list(caja.exterior.coords)[:4] if caja.geom_type == "Polygon" else []
+                if len(cs) == 4:
+                    l01 = (cs[1][0] - cs[0][0]) ** 2 + (cs[1][1] - cs[0][1]) ** 2
+                    l12 = (cs[2][0] - cs[1][0]) ** 2 + (cs[2][1] - cs[1][1]) ** 2
+                    if l01 <= l12:
+                        m0 = ((cs[0][0] + cs[3][0]) / 2, (cs[0][1] + cs[3][1]) / 2)
+                        m1 = ((cs[1][0] + cs[2][0]) / 2, (cs[1][1] + cs[2][1]) / 2)
+                    else:
+                        m0 = ((cs[0][0] + cs[1][0]) / 2, (cs[0][1] + cs[1][1]) / 2)
+                        m1 = ((cs[3][0] + cs[2][0]) / 2, (cs[3][1] + cs[2][1]) / 2)
+                    desde, hasta = m0, m1
+        if desde is None:
+            try:
+                pa, pb = nearest_points(A, B)
+            except Exception:
+                continue
+            desde, hasta = (pa.x, pa.y), (pb.x, pb.y)
+        out.append({
+            "union": indice,
+            "tipo": u.tipo,
+            "piezas": [u.pieza_a, u.pieza_b],
+            "mm": _mm(u.medida_mm),
+            "cm_edificio": round(u.medida_mm * a_cm_edificio, 1),
+            "texto": f"{u.medida_mm:.1f} mm",
+            "desde": [round(desde[0], 4), round(desde[1], 4)],
+            "hasta": [round(hasta[0], 4), round(hasta[1], 4)],
+        })
+    return out
 
 
 def _direccion(u: Union, placa_de: Dict[str, object]):
@@ -770,6 +908,8 @@ def _nudos(
             centro, _direccion(peor, placa_de), placas,
             {pl.id: (estado_pieza.get(pl.id, "contexto")) for pl in placas},
             espesor,
+            uniones_del_nudo=[(i, uniones[i]) for i in sorted(indices)],
+            a_cm_edificio=a_cm_edificio,
         )
         # Acciones: las de la unión peor si es un problema suelto; si pertenece a un
         # grupo por causa, las de ese grupo.
