@@ -134,6 +134,23 @@ def test_dos_piezas_que_el_modelo_no_une_solo_se_informan_si_chocan(scale):
 # ---------------------------------------------------------------------------
 
 
+def _modelo_chapa_que_monta_poco():
+    """Esquina en L más una chapa paralela al muro A que lo pisa sólo en una punta.
+
+    Muro A: x ∈ [0, 8], z ∈ [0, 0.20] -> plano medio z = 0.10
+    Chapa:  x ∈ [7.7, 9.7], una sola cara, en z = 0.21 (a 11 cm del plano medio de A)
+
+    La chapa asoma 1.7 m más allá del muro y lo pisa en 30 cm: el 15% de su superficie.
+    Es menos de lo que el sistema toma por "la misma placa" (20%), así que NO se funde
+    sola y queda como dos piezas montadas: el caso que necesita una decisión.
+    """
+    b = te._ObjBuilder()
+    b.box(0.0, 8.0, 0.0, 3.0, 0.0, 0.20)
+    b.box(0.0, 0.20, 0.0, 3.0, 0.0, 6.0)
+    b.quad((7.7, 0.0, 0.21), (9.7, 0.0, 0.21), (9.7, 3.0, 0.21), (7.7, 3.0, 0.21))
+    return b.text()
+
+
 def _reporte(obj_text, scale, **kw):
     work, paneles, _grupos, _pjs = te._procesar(obj_text, scale, **kw)
     muros = [p for p in paneles if p.category == "wall"]
@@ -167,12 +184,12 @@ def test_un_modelo_que_arma_da_listo(modelo, scale):
 def test_el_reporte_trae_la_accion_y_aplicarla_lo_resuelve():
     """Cada problema trae qué hacer, ya como el cambio que se le manda al backend.
 
-    Muro con una chapa paralela a 11 cm. A 1:50 la placa son 15 cm de edificio: las dos
-    superficies quedan como piezas separadas (están a más de media placa) pero sus
-    volúmenes se pisan 4 cm, o sea 0.8 mm de plancha. El reporte lo tiene que decir,
-    ofrecer fusionarlas, y al mandar ESE cambio el veredicto tiene que pasar a "listo".
+    Muro con una chapa paralela a 11 cm que lo pisa sólo en una punta. A 1:50 la placa
+    son 15 cm de edificio: sus volúmenes se pisan 4 cm, o sea 0.8 mm de plancha, pero en
+    tan poca superficie que el sistema no las funde por su cuenta. El reporte lo tiene que
+    decir, ofrecer fusionarlas, y al mandar ESE cambio el veredicto pasa a "listo".
     """
-    obj = te._modelo_muro_con_revestimiento(0.11)
+    obj = _modelo_chapa_que_monta_poco()
     _work, r = _reporte(obj, 50.0)
     assert r["veredicto"] == "no_arma"
     montadas = [p for p in r["problemas"] if p["tipo"] == "superpuestas"]
@@ -255,7 +272,7 @@ def test_se_puede_bloquear_la_generacion_si_no_arma():
     Es opcional —lo pide quien genera— para no dejar sin poder cortar a un front que
     todavía no muestra el reporte. Sin pedirlo, o forzando, los archivos salen igual.
     """
-    obj = te._modelo_muro_con_revestimiento(0.11)       # a 1:50 tiene dos piezas montadas
+    obj = _modelo_chapa_que_monta_poco()                # a 1:50 tiene dos piezas montadas
     parsed = parse_obj(obj)
     p1 = parse_pipeline("sintetico.obj", parsed["faces"], parsed["warnings"], force_axis="Y")
     opts = PipelineOptions(
@@ -346,3 +363,215 @@ def test_la_probeta_trae_las_muescas_que_dice():
     archivos, nesting = generar_probeta()
     assert not nesting.unplaced and len(nesting.sheets) == 1
     assert archivos[0].name.endswith(".dxf") and len(archivos[0].blob) > 1000
+
+
+# ---------------------------------------------------------------------------
+# Reporte v2: terminaciones, nudos, quién lo arregla
+# ---------------------------------------------------------------------------
+
+
+def test_tocarse_de_canto_es_terminacion_y_no_ensucia_el_titular():
+    """Una esquina que queda con el canto a la vista arma igual: no es "para revisar".
+
+    Eran más de la mitad del amarillo en un modelo real (81 de 142 uniones con aviso), y
+    hacían que el titular dijera "144 piezas para revisar" cuando las que de verdad no
+    armaban eran muchas menos. Se informan, pero aparte.
+    """
+    scale = 100.0
+    piezas, tipo, _mm = _caso("L a medio tapar", scale)
+    assert tipo == "sin_cubrir"
+    uniones = verificar_uniones(piezas, scale, {pair_key(1, 2)})
+    r = construir_reporte(piezas, uniones, scale)
+
+    assert r["veredicto"] == "listo"
+    assert r["problemas"] == [] and r["nudos"] == []
+    assert r["resumen"]["piezas_ok"] == 2 and r["resumen"]["terminaciones"] == 1
+    assert len(r["terminaciones"]) == 1 and r["terminaciones"][0]["tipo"] == "sin_cubrir"
+    u = r["uniones"][0]
+    assert u["tipo"] == "sin_cubrir" and u["estado"] == "ok" and u["terminacion"] is True
+    assert r["piezas"]["A1"]["estado"] == "ok" and r["piezas"]["A1"]["terminaciones"] == 1
+
+
+def test_los_problemas_se_agrupan_por_lugar():
+    """Un nudo es un lugar, no una pieza: lo que está junto va junto y lo que no, no.
+
+    Una placa larga y tres que la cruzan sin ranura: dos pegadas (a una placa y media una
+    de otra) y una a 20 m. Son tres uniones que fallan, DOS lugares.
+    """
+    scale = 100.0
+    t = PLATE_THICKNESS_M * scale
+    largo = P("B1", 1, (0.0, 0.0, 0.0), (1, 0, 0), (0, 1, 0), 40.0, 3.0)
+    cruzan = [
+        P("A1", 11, (5.0, 0.0, -1.0), (0, 0, 1), (0, 1, 0), 2.0, 3.0),
+        P("A2", 12, (5.0 + 1.5 * t, 0.0, -1.0), (0, 0, 1), (0, 1, 0), 2.0, 3.0),
+        P("A3", 13, (25.0, 0.0, -1.0), (0, 0, 1), (0, 1, 0), 2.0, 3.0),
+    ]
+    todas = [largo] + cruzan
+    r = construir_reporte(todas, verificar_uniones(todas, scale), scale)
+
+    assert r["resumen"]["uniones_no_arma"] == 3
+    assert r["resumen"]["nudos"] == 2, [n["titulo"] for n in r["nudos"]]
+    por_piezas = sorted(sorted(n["piezas"]) for n in r["nudos"])
+    assert por_piezas == [["A1", "A2", "B1"], ["A3", "B1"]]
+    # Cada unión que falla está en exactamente un nudo.
+    en_nudos = sorted(i for n in r["nudos"] for i in n["uniones"])
+    assert en_nudos == sorted(u["id"] for u in r["uniones"] if u["estado"] != "ok")
+    assert all(n["acciones"] for n in r["nudos"])
+
+
+def test_el_detalle_de_un_nudo_dibuja_las_placas_con_su_espesor():
+    """El detalle en planta es el dibujo que se le muestra a la persona: tiene que ser el
+    de las piezas reales. Dos placas que se cruzan sin ranura a 1:100: cada una mide
+    30 cm de espesor en el edificio y comparten un cuadrado de 30 × 30."""
+    from shapely.geometry import Polygon
+
+    scale = 100.0
+    t = PLATE_THICKNESS_M * scale
+    a = P("A1", 1, (0.0, 0.0, 0.0), (1, 0, 0), (0, 1, 0), 4.0, 3.0)
+    b = P("A2", 2, (2.0, 0.0, -1.0), (0, 0, 1), (0, 1, 0), 2.0, 3.0)
+    r = construir_reporte([a, b], verificar_uniones([a, b], scale), scale)
+    assert len(r["nudos"]) == 1
+    n = r["nudos"][0]
+    d = n["detalle"]
+
+    assert d["vista"] == "planta", "dos muros verticales se miran en planta"
+    assert d["espesor_m"] == pytest.approx(t)
+    assert sorted(p["pieza"] for p in d["placas"]) == ["A1", "A2"]
+    R = d["ventana_m"]
+    for p in d["placas"]:
+        poly = Polygon(p["poligono"])
+        xs = [q[0] for q in p["poligono"]]; ys = [q[1] for q in p["poligono"]]
+        ancho, alto = max(xs) - min(xs), max(ys) - min(ys)
+        assert min(ancho, alto) == pytest.approx(t, abs=1e-6), "la sección no tiene el espesor de la placa"
+        assert max(abs(v) for v in xs + ys) <= R + 1e-6, "se sale de la ventana"
+        assert p["estado"] == "no_arma" and poly.is_valid
+    assert len(d["solapes"]) == 1
+    assert Polygon(d["solapes"][0]["poligono"]).area == pytest.approx(t * t, rel=1e-6)
+    assert sorted(d["solapes"][0]["piezas"]) == ["A1", "A2"]
+    # El nudo está donde se cruzan: x = 2, z = 0.
+    assert n["punto"]["x"] == pytest.approx(2.0, abs=1e-6)
+    assert n["punto"]["z"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_un_muro_contra_una_losa_se_mira_en_corte():
+    """Si la unión es horizontal el detalle es un corte en altura, con arriba hacia arriba."""
+    scale = 100.0
+    losa = P("B1", 1, (0.0, 0.0, 0.0), (1, 0, 0), (0, 0, 1), 6.0, 4.0)       # plano y = 0
+    muro = P("A1", 2, (0.0, -1.0, 2.0), (1, 0, 0), (0, 1, 0), 6.0, 3.0)      # la atraviesa
+    r = construir_reporte([losa, muro], verificar_uniones([losa, muro], scale), scale)
+    assert len(r["nudos"]) == 1
+    d = r["nudos"][0]["detalle"]
+    assert d["vista"] == "corte"
+    assert d["ejes"]["b"]["y"] == pytest.approx(1.0), "el eje vertical del dibujo no es el del edificio"
+
+
+def test_cada_problema_dice_quien_lo_puede_arreglar():
+    """Decidir, cambiar de escala o corregir el modelo: no es lo mismo y se dice cuál."""
+    scale = 100.0
+    t = PLATE_THICKNESS_M * scale
+
+    # Dos placas paralelas montadas: lo decide quien arma (fusionar o descartar). Están a
+    # 24 cm, así que a una escala donde la placa represente menos que eso ya no se pisan.
+    a = P("A1", 1, (0.0, 0.0, 0.0), (1, 0, 0), (0, 1, 0), 4.0, 3.0)
+    b = P("A2", 2, (1.0, 0.0, 0.8 * t), (1, 0, 0), (0, 1, 0), 4.0, 3.0)
+    r = construir_reporte([a, b], verificar_uniones([a, b], scale), scale,
+                          categoria_por_grupo={1: "wall", 2: "wall"})
+    pr = r["problemas"][0]
+    assert pr["quien"] == "decidir" and pr["quien_texto"]
+    assert pr["escala_sugerida"] == 75, "a 1:75 la placa son 22.5 cm: menos que los 24 de separación"
+    assert [x["tipo"] for x in pr["acciones"]][:2] == ["fusionar", "descartar"]
+    cambiar = [x for x in pr["acciones"] if x["tipo"] == "cambiar_escala"][0]
+    assert cambiar["aplicar"] == {"scale_denom": 75}
+
+    # Una pieza de 20 cm de alto: a 1:100 mide 2 mm, menos que la placa. Es de la escala.
+    tira = P("A7", 7, (0.0, 0.0, 9.0), (1, 0, 0), (0, 1, 0), 6.0, 0.20)
+    r = construir_reporte([tira], [], scale)
+    pr = r["problemas"][0]
+    assert pr["tipo"] == "pieza_fina" and pr["quien"] == "escala"
+    assert pr["escala_sugerida"] == 50, "a 1:50 esos 20 cm son 4 mm: ya es una pieza"
+
+    # Dos piezas que el modelo no une y se pisan: no hay decisión que tomar.
+    c = P("A3", 3, (2.0, 0.0, -1.0), (0, 0, 1), (0, 1, 0), 2.0, 3.0)
+    r = construir_reporte([a, c], verificar_uniones([a, c], scale), scale,
+                          categoria_por_grupo={1: "wall", 3: "wall"})
+    assert r["problemas"][0]["quien"] == "modelo"
+    assert "invertir_cede" not in [x["tipo"] for x in r["problemas"][0]["acciones"]]
+
+
+def test_no_se_ofrece_invertir_lo_que_el_resolvedor_ya_probo():
+    """Si invertir quién cede ya se probó y no mejoró, no se le ofrece a la persona."""
+    scale = 100.0
+    piezas, _tipo, _mm = _caso("T sin recortar", scale)
+    uniones = verificar_uniones(piezas, scale, {pair_key(1, 2)})
+    comun = dict(cede_por_par={pair_key(1, 2): 2}, categoria_por_grupo={1: "wall", 2: "wall"})
+
+    sin_probar = construir_reporte(piezas, uniones, scale, **comun)
+    assert sin_probar["problemas"][0]["quien"] == "decidir"
+    assert "invertir_cede" in [a["tipo"] for a in sin_probar["problemas"][0]["acciones"]]
+
+    probada = construir_reporte(
+        piezas, uniones, scale, **comun,
+        resolucion={"invertidas": [], "probadas_sin_mejora": [[1, 2]]},
+    )
+    assert probada["problemas"][0]["quien"] == "modelo"
+    assert "invertir_cede" not in [a["tipo"] for a in probada["problemas"][0]["acciones"]]
+
+    # Pero si esa unión la decidió el USUARIO, puede volver a decidirla.
+    del_usuario = construir_reporte(
+        piezas, uniones, scale, **comun,
+        resolucion={"invertidas": [], "probadas_sin_mejora": []},
+        pares_decididos_por_el_usuario={pair_key(1, 2)},
+    )
+    assert del_usuario["problemas"][0]["quien"] == "decidir"
+
+
+# ---------------------------------------------------------------------------
+# Resolvedor de uniones
+# ---------------------------------------------------------------------------
+
+
+def test_el_resolvedor_no_empeora_ni_toca_lo_que_decidio_el_usuario():
+    """Las dos garantías que hacen seguro dejarlo prendido.
+
+    Sobre demo.obj a 1:100, donde se sabe que invierte varias uniones.
+    """
+    from pathlib import Path
+
+    from core.review_generate import _pares_a_verificar, _puntaje
+
+    path = Path(__file__).parent / "demo.obj"
+    if not path.exists():
+        pytest.skip("demo.obj no está disponible")
+    parsed = parse_obj(path.read_text())
+    p1 = parse_pipeline(path.name, parsed["faces"], parsed["warnings"])
+    opts = PipelineOptions(scale_denom=100.0, paper="A4", min_area_m2=1.0, sheet_config=None)
+
+    def correr(**kw):
+        work, muros, pisos, _ = _decompose(p1, opts, None, None, None, None, **kw)
+        previstos, apoyos = _pares_a_verificar(work)
+        return work, _puntaje(verificar_uniones(muros + pisos, 100.0, previstos, apoyos))
+
+    _w0, sin = correr(resolver=False)
+    work, con = correr()
+    assert work.resolucion is not None and work.resolucion["invertidas"], (
+        "en este modelo el resolvedor tiene que haber invertido algo"
+    )
+    assert con < sin, f"con resolvedor {con}, sin resolvedor {sin}"
+    assert tuple(work.resolucion["puntaje_despues"]) == con
+    assert tuple(work.resolucion["puntaje_antes"]) == sin
+
+    # El usuario fija lo CONTRARIO a lo que eligió el resolvedor en una unión: manda él.
+    d = work.resolucion["invertidas"][0]
+    otro = d["group_b"] if d["yield_group_id"] == d["group_a"] else d["group_a"]
+    fijada = {"group_a": d["group_a"], "group_b": d["group_b"], "yield_group_id": otro}
+    work2, _ = correr(decisiones_por_par=[fijada])
+    k = pair_key(d["group_a"], d["group_b"])
+    assert [tuple(p) for p in work2.pares_decididos] == [k]
+    cede = {
+        pair_key(j.group_a, j.group_b): j.yield_group_id for j in work2.wall_wall_joints
+    }
+    assert cede[k] == otro, "el resolvedor pisó una decisión del usuario"
+    assert all(
+        pair_key(x["group_a"], x["group_b"]) != k
+        for x in (work2.resolucion or {}).get("invertidas", [])
+    )
