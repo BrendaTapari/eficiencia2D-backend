@@ -701,8 +701,14 @@ def test_el_instructivo_muestra_exactamente_lo_que_se_corta(path, scale):
 # tocan de canto dejaron de valer "revisar" y pasaron a una columna propia, terminaciones.
 # Eran 16 de las 18 a 1:50 y 10 de las 12 a 1:100. Lo que de verdad falla es lo que queda
 # en `revisar` y `no_arma`, y bajarlo sigue siendo el trabajo pendiente.
+#
+#   (63, 60, 1, 2)  (69, 63, 2, 4)   + las aberturas cerradas se cortan (test_aberturas.py)
+#
+# A 1:50 hay 6 uniones menos y no es que se hayan dejado de medir: eran contactos con
+# material que no existe. Cuatro muros se cortaban con sus ventanas rellenas, y lo que
+# pasaba por delante de una ventana "tocaba" el muro. Piezas verificadas 24 -> 26.
 LINEA_BASE_VEREDICTO = {
-    "demo.obj": {50.0: (69, 65, 2, 2, 16), 100.0: (69, 63, 2, 4, 10)},
+    "demo.obj": {50.0: (63, 60, 1, 2, 14), 100.0: (69, 63, 2, 4, 10)},
 }
 
 
