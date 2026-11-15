@@ -454,11 +454,22 @@ def _material_de_la_pieza(edges: List[Edge2D]):
     caras = sorted(polygonize(unary_union(segs)), key=lambda p: p.area, reverse=True)
     if not caras:
         return None
+    # `polygonize` ya devuelve cada cara CON sus huecos: el contorno del muro llega como
+    # "muro menos ventana" y la ventana como otra cara. Para contar en cuántas regiones
+    # está metida una cara hay que mirar el CONTORNO EXTERIOR de las otras: con la cara
+    # entera, el punto de la ventana no está "dentro" del muro (cae en su hueco), la
+    # ventana contaba como material y la unión la rellenaba. Toda abertura cerrada (una
+    # ventana, un hueco de escalera) desaparecía de cualquier pieza que pasara por el
+    # recorte de encaje. Medido: demo.obj a 1:100 cortaba un muro de 16 ventanas sin
+    # ninguna.
+    from shapely.geometry import Polygon as _Poligono
+
+    llenas = [_Poligono(c.exterior) for c in caras]
     material = []
     for i, c in enumerate(caras):
         p = c.representative_point()
         dentro = sum(
-            1 for j, o in enumerate(caras) if j != i and o.area > c.area and o.contains(p)
+            1 for j, o in enumerate(llenas) if j != i and o.area > c.area and o.contains(p)
         )
         if dentro % 2 == 0:
             material.append(c)
@@ -1163,6 +1174,105 @@ def _panels_to_nesting(panels: List[Panel], scale_denom: float) -> List[NestingP
     return out
 
 
+def _vanos_tapados_por_dentro(g, faces, normal, cache: Optional[Dict]) -> int:
+    """Cuántas aberturas de la cara principal de un grupo quedan tapadas por OTRAS caras
+    del mismo grupo.
+
+    Un vidrio modelado dentro del espesor del muro queda agrupado con el muro desde la
+    clasificación: nunca llega a ser un componente aparte. La pieza se arma con todas las
+    caras del grupo, así que la ventana sale cerrada, y sin esto nadie se entera.
+
+    Se separan las caras por su distancia al plano; la tanda de mayor área es la cara del
+    muro, y se cuenta cuántos de SUS huecos caen sobre material del conjunto.
+    """
+    from shapely.affinity import translate
+    from shapely.geometry import Polygon
+
+    from core.services.cutting_sheet import _edges_to_polygon
+
+    clave = None
+    if cache is not None:
+        clave = (
+            contenido_del_grupo(g, faces, cache),
+            round(normal.x, 6), round(normal.y, 6), round(normal.z, 6),
+        )
+        vistos = cache.setdefault("vanos_tapados", {})
+        if clave in vistos:
+            return vistos[clave]
+    tapados = 0
+    try:
+        n = normalize(normal)
+        tandas: Dict[float, list] = {}
+        for i in g.face_indices:
+            f = faces[i]
+            if not f.vertices:
+                continue
+            tandas.setdefault(round(dot(f.vertices[0], n), 3), []).append(f)
+        if len(tandas) >= 2:
+            proyectadas = [
+                (r, _edges_to_polygon(r.edges))
+                for r in (project_faces_to_2d(fs, n, "Y") for fs in tandas.values()) if r
+            ]
+            proyectadas = [(r, p) for r, p in proyectadas if p is not None and not p.is_empty]
+            todo = project_faces_to_2d([faces[i] for i in g.face_indices], n, "Y")
+            if proyectadas and todo:
+                r0, cara = max(proyectadas, key=lambda t: t[1].area)
+                material = _edges_to_polygon(todo.edges)
+                du, dv = r0.origin_u - todo.origin_u, r0.origin_v - todo.origin_v
+                for parte in getattr(cara, "geoms", [cara]):
+                    for hueco in parte.interiors:
+                        vano = translate(Polygon(hueco), du, dv)
+                        if vano.area > 1e-6 and material.intersection(vano).area >= 0.5 * vano.area:
+                            tapados += 1
+    except Exception:
+        tapados = 0
+    if clave is not None:
+        cache["vanos_tapados"][clave] = tapados
+    return tapados
+
+
+def _avisar_vanos_cerrados(
+    work: Phase1Result, en_aberturas: Dict[int, int],
+    overrides: Optional[Dict[int, str]] = None, cache: Optional[Dict] = None,
+) -> Phase1Result:
+    """Avisa qué aberturas salen CERRADAS porque el modelo trae algo adentro.
+
+    Una ventana vacía se corta abierta. Una ventana con un vidrio o una carpintería
+    modelados en el plano del muro se corta cerrada: ese elemento ocupa la misma placa que
+    el muro. Puede ser un componente aparte que se funde con el muro (`en_aberturas`, de
+    `detectar_placas_superpuestas`) o caras que ya vienen agrupadas con él
+    (`_vanos_tapados_por_dentro`). El usuario tiene que saberlo.
+    """
+    overrides = overrides or {}
+    by_id = {g.id: g for g in work.groups}
+    por_muro: Dict[int, int] = {}
+    for gid, muro in en_aberturas.items():
+        por_muro[muro] = por_muro.get(muro, 0) + 1
+    normales = orient_group_normals_outward(work.groups)
+    for g in work.groups:
+        if _effective_category(g, overrides) == "discard" or len(g.face_indices) < 2:
+            continue
+        n = _vanos_tapados_por_dentro(
+            g, work.faces, normales.get(g.id, g.representative_normal), cache
+        )
+        if n:
+            por_muro[g.id] = por_muro.get(g.id, 0) + n
+    if not por_muro:
+        return work
+    total = sum(por_muro.values())
+    detalle = "; ".join(
+        f"{by_id[m].label or m}: {n}"
+        for m, n in sorted(por_muro.items(), key=lambda t: -t[1])[:4]
+    ) + ("…" if len(por_muro) > 4 else "")
+    aviso = (
+        f"{total} abertura(s) salen CERRADAS: el modelo tiene algo dentro del vano "
+        "(vidrios, carpinterías, paños) y eso ocupa la misma placa que el muro. Para que "
+        "salgan abiertas, descartá esos elementos en el visor o quitalos del modelo. "
+        f"{detalle}"
+    )
+    return replace(work, warnings=list(work.warnings or []) + [aviso])
+
+
 def _una_placa_por_lugar(
     work: Phase1Result,
     scale_denom: float,
@@ -1185,12 +1295,14 @@ def _una_placa_por_lugar(
     from core.services.placas_superpuestas import detectar_placas_superpuestas
 
     overrides = overrides or {}
+    en_aberturas: Dict[int, int] = {}
     try:
         conjuntos = detectar_placas_superpuestas(
             work.groups, work.faces, scale_denom,
             lambda g: _effective_category(g, overrides),
             orient_group_normals_outward(work.groups),
             cache=cache,
+            en_aberturas=en_aberturas,
         )
     except Exception:
         import logging
@@ -1198,6 +1310,7 @@ def _una_placa_por_lugar(
             "detectar_placas_superpuestas falló; se sigue sin fundir"
         )
         return work, wall_wall_decisions
+    work = _avisar_vanos_cerrados(work, en_aberturas, overrides, cache)
     if not conjuntos:
         return work, wall_wall_decisions
 
