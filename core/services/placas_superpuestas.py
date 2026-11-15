@@ -56,6 +56,7 @@ from core.services.plate_intersect import PLATE_THICKNESS_M
 from core.services.recorte_csg import (
     Placa,
     construir_placa,
+    contenido_del_grupo,
     distancia_entre_planos,
     proyeccion_paralela,
 )
@@ -106,6 +107,7 @@ def detectar_placas_superpuestas(
     scale_denom: float,
     categoria: Callable[[GeometryGroup], str],
     normales: Optional[Dict[int, object]] = None,
+    cache: Optional[Dict] = None,
 ) -> List[List[int]]:
     """Conjuntos de ids de grupo que a esta escala ocupan la misma placa.
 
@@ -119,9 +121,20 @@ def detectar_placas_superpuestas(
         cat = categoria(g)
         if cat == "discard":
             continue
-        pl = construir_placa(
-            g, faces, (normales or {}).get(g.id, g.representative_normal)
-        )
+        normal = (normales or {}).get(g.id, g.representative_normal)
+        if cache is not None:
+            # La placa de un grupo depende sólo de sus caras y su normal; acá sólo se
+            # lee. Se recuerda por contenido entre un pedido y el siguiente.
+            guardadas = cache.setdefault("placas_superpuestas", {})
+            k = (
+                contenido_del_grupo(g, faces, cache),
+                round(normal.x, 9), round(normal.y, 9), round(normal.z, 9),
+            )
+            pl = guardadas.get(k, False)
+            if pl is False:
+                pl = guardadas[k] = construir_placa(g, faces, normal)
+        else:
+            pl = construir_placa(g, faces, normal)
         if pl is not None and pl.poly.area > 1e-9:
             placas.append((g, cat, pl))
 
