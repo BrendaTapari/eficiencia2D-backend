@@ -134,49 +134,74 @@ def _estado(medida_mm: float, tope: str = "no_arma") -> str:
     return "no_arma"
 
 
-def _placas(panels: Iterable[Panel]) -> List[_Placa]:
-    import numpy as np
-
+def _placas(panels: Iterable[Panel], vistas: Optional[Dict] = None) -> List[_Placa]:
+    """`vistas` recuerda la placa ya armada de cada pieza por su CONTENIDO (etiqueta,
+    contorno y marco): el resolvedor mide el conjunto varias veces por pedido y casi todas
+    las piezas son las mismas de una vez a la otra."""
     out: List[_Placa] = []
     for p in panels:
         if not p.frame or p.source_group_id is None or p.source_group_id < 0:
             continue  # refuerzos sueltos: se pegan a mano, no tienen lugar fijo
-        poly = _edges_to_polygon([e for e in p.edges if not getattr(e, "flex", False)])
-        if poly is None or poly.is_empty or poly.area <= 1e-9:
-            continue
-        m = p.frame
-        o = np.array([m["origin"]["x"], m["origin"]["y"], m["origin"]["z"]], dtype=float)
-        u = np.array([m["u_axis"]["x"], m["u_axis"]["y"], m["u_axis"]["z"]], dtype=float)
-        v = np.array([m["v_axis"]["x"], m["v_axis"]["y"], m["v_axis"]["z"]], dtype=float)
-        n = np.cross(u, v)
-        ln = float(np.linalg.norm(n))
-        if ln < 1e-9:
-            continue
-        n = n / ln
-        pts = []
-        for g in getattr(poly, "geoms", [poly]):
-            for x, y in g.exterior.coords:
-                pts.append(o + u * x + v * y)
-        if not pts:
-            continue
-        verts = np.array(pts)
-
-        def al_mundo(coords):
-            c = np.asarray(coords, dtype=float)[:, :2]
-            return o + np.outer(c[:, 0], u) + np.outer(c[:, 1], v)
-
-        anillos = [
-            (al_mundo(g.exterior.coords), [al_mundo(h.coords) for h in g.interiors])
-            for g in getattr(poly, "geoms", [poly])
-        ]
-        out.append(_Placa(
-            id=p.id, gid=p.source_group_id, categoria=p.category, poly=poly,
-            o=o, u=u, v=v, n=n, d=float(n @ o),
-            lo=verts.min(axis=0), hi=verts.max(axis=0), verts=verts,
-            anillos=anillos,
-            firma=hash((p.id, poly.wkb, o.tobytes(), u.tobytes(), v.tobytes())),
-        ))
+        if vistas is None:
+            pl = _placa_de(p)
+        else:
+            m = p.frame
+            clave = (
+                p.id, p.source_group_id, p.category,
+                tuple(
+                    (e.a.x, e.a.y, e.b.x, e.b.y) for e in p.edges
+                    if not getattr(e, "flex", False)
+                ),
+                tuple(m[k][c] for k in ("origin", "u_axis", "v_axis") for c in ("x", "y", "z")),
+            )
+            pl = vistas.get(clave, _SIN_MEDIR)
+            if pl is _SIN_MEDIR:
+                if len(vistas) > 20000:
+                    vistas.clear()
+                pl = vistas[clave] = _placa_de(p)
+        if pl is not None:
+            out.append(pl)
     return out
+
+
+def _placa_de(p: Panel) -> Optional[_Placa]:
+    import numpy as np
+
+    poly = _edges_to_polygon([e for e in p.edges if not getattr(e, "flex", False)])
+    if poly is None or poly.is_empty or poly.area <= 1e-9:
+        return None
+    m = p.frame
+    o = np.array([m["origin"]["x"], m["origin"]["y"], m["origin"]["z"]], dtype=float)
+    u = np.array([m["u_axis"]["x"], m["u_axis"]["y"], m["u_axis"]["z"]], dtype=float)
+    v = np.array([m["v_axis"]["x"], m["v_axis"]["y"], m["v_axis"]["z"]], dtype=float)
+    n = np.cross(u, v)
+    ln = float(np.linalg.norm(n))
+    if ln < 1e-9:
+        return None
+    n = n / ln
+    pts = []
+    for g in getattr(poly, "geoms", [poly]):
+        for x, y in g.exterior.coords:
+            pts.append(o + u * x + v * y)
+    if not pts:
+        return None
+    verts = np.array(pts)
+
+    def al_mundo(coords):
+        c = np.asarray(coords, dtype=float)[:, :2]
+        return o + np.outer(c[:, 0], u) + np.outer(c[:, 1], v)
+
+    anillos = [
+        (al_mundo(g.exterior.coords), [al_mundo(h.coords) for h in g.interiors])
+        for g in getattr(poly, "geoms", [poly])
+    ]
+    return _Placa(
+        id=p.id, gid=p.source_group_id, categoria=p.category, poly=poly,
+        o=o, u=u, v=v, n=n, d=float(n @ o),
+        lo=verts.min(axis=0), hi=verts.max(axis=0), verts=verts,
+        anillos=anillos,
+        firma=hash((p.id, poly.wkb, o.tobytes(), u.tobytes(), v.tobytes())),
+    )
 
 
 def _en_tau_q(pl: _Placa, tau, n_otra, d_otra):
@@ -438,7 +463,7 @@ def verificar_uniones(
     a_mm = 1000.0 / escala                        # de metros de edificio a mm de plancha
     margen = espesor * (0.5 + ALCANCE_PLACAS)
 
-    pz = _placas(panels)
+    pz = _placas(panels, cache.setdefault("placas", {}) if cache is not None else None)
     out: List[Union] = []
     for i in range(len(pz)):
         A = pz[i]
