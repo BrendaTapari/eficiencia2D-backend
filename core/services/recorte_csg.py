@@ -108,6 +108,48 @@ class Placa:
     # quién cede en cada unión, así que valen entre un armado y el siguiente del
     # resolvedor. Sin esto se recalculaban 106.000 por armado en un modelo de 300 piezas.
     huellas_cache: Dict = None
+    # Vecinas que pueden afectar el recorte de esta placa, por conjunto de placas (ver
+    # `clave_de_recorte`).
+    vecinas_cache: Dict = None
+    # Identidad de la placa por su contenido (qué caras tiene y con qué normal). La usa
+    # quien conserva placas y recortes entre un pedido y el siguiente.
+    firma: object = None
+
+
+def contenido_del_grupo(g, faces, cache: Optional[Dict]) -> int:
+    """Hash de las coordenadas de todas las caras del grupo.
+
+    Recorrer las caras de todo el modelo en cada armado costaría más que lo que ahorra,
+    así que se recuerda por OBJETO grupo. El objeto se guarda junto al hash (mientras esté
+    guardado, su `id()` no puede pasar a otro objeto) y se comprueba que sus caras de los
+    extremos sigan siendo los mismos objetos: los grupos que no cambian entre un pedido y
+    el siguiente son literalmente los mismos objetos del modelo en memoria.
+    """
+    fi = g.face_indices
+    n = len(fi)
+    primera = faces[fi[0]] if n else None
+    ultima = faces[fi[-1]] if n else None
+    vistos = cache.setdefault("contenidos", {}) if cache is not None else None
+    if vistos is not None:
+        v = vistos.get(id(g))
+        if v is not None and v[0] is g and v[1] == n and v[2] is primera and v[3] is ultima:
+            return v[4]
+    coords = []
+    for i in fi:
+        f = faces[i]
+        for p in f.vertices:
+            coords.append((p.x, p.y, p.z))
+        for anillo in f.inner_loops or ():
+            coords.append(None)
+            for p in anillo:
+                coords.append((p.x, p.y, p.z))
+        coords.append(None)
+    h = hash(tuple(coords))
+    if vistos is not None:
+        if len(vistos) > 200_000:
+            vistos.clear()
+        vistos[id(g)] = (g, n, primera, ultima, h)
+    return h
 
 
 def construir_placa(
@@ -169,7 +211,13 @@ def huella_cacheada(a: Placa, b: Placa, espesor_m: float, acotada: bool = False)
     paralelas lo que importa es el contorno ya resuelto de la otra, que sí cambia."""
     if a.huellas_cache is None:
         a.huellas_cache = {}
-    clave = (b.group_id, round(espesor_m, 9), acotada)
+    # Por CONTENIDO de la otra placa cuando se conoce: las placas viven de un pedido al
+    # siguiente y un mismo id puede ser, en otro pedido, otra pieza (dos fusiones
+    # distintas crean un grupo con el mismo id). Con el id solo, la vecina de una pieza
+    # fusionada se recortaba contra la huella de la fusión ANTERIOR.
+    clave = (
+        b.firma if b.firma is not None else b.group_id, round(espesor_m, 9), acotada,
+    )
     h = a.huellas_cache.get(clave, _SIN_HUELLA)
     if h is _SIN_HUELLA:
         h = huella(a, b, espesor_m, acotada)
@@ -614,7 +662,26 @@ def mid_plane_offset_group(grupo: GeometryGroup) -> float:
 
 
 # Las caras del modelo, para no arrastrarlas por toda la firma. Se setea por corrida.
-_FACES_CACHE: List[List[Face3D]] = [[]]
+#
+# Es POR HILO. Era una variable del módulo, compartida: con dos cálculos a la vez (el del
+# pedido y el que prevé en segundo plano el efecto de cada botón, o dos pedidos atendidos
+# en hilos distintos) uno leía las caras del modelo del OTRO y recortaba mal sin ningún
+# aviso. Lo encontró una prueba que fallaba sólo según el orden: una pieza de 7.575 m
+# salía de 7.875 m.
+class _CarasDeLaCorrida:
+    def __init__(self) -> None:
+        import threading
+
+        self._por_hilo = threading.local()
+
+    def __getitem__(self, _i: int) -> List[Face3D]:
+        return getattr(self._por_hilo, "caras", [])
+
+    def __setitem__(self, _i: int, caras: List[Face3D]) -> None:
+        self._por_hilo.caras = caras
+
+
+_FACES_CACHE = _CarasDeLaCorrida()
 
 
 def usar_caras(faces: List[Face3D]) -> None:
@@ -660,6 +727,103 @@ def _coplanar_con(gid, otro_id, placas, espesor_m: float) -> bool:
     if abs(dot(a.n, b.n)) < 0.99:
         return False
     return abs(abs(a.d) - abs(b.d)) <= max(espesor_m, 1e-6)
+
+
+def clave_de_recorte(
+    placa: "Placa", destinos, obstaculos, espesor_m: float, cede_ante=None,
+    universo=None, firma_de=None,
+):
+    """Todo de lo que depende el resultado de `aplicar_destinos` para esta placa.
+
+    Dos llamadas con la misma clave dan el mismo contorno, así que el segundo se puede
+    reusar. Es lo que permite que, cuando el usuario descarta o fusiona UNA pieza, se
+    recalculen las vecinas afectadas y no las 300 del modelo.
+
+    Qué entra en la clave, y por qué alcanza:
+
+    - la placa (por contenido) y sus destinos;
+    - las vecinas ante las que cede;
+    - las vecinas NO paralelas cuya huella cae cerca de donde la pieza puede crecer. Las
+      huellas sólo se usan para recortar lo que se agrega, y lo que se agrega nunca va más
+      allá del destino más lejano; una huella fuera de ese margen no puede cambiar nada;
+    - las vecinas PARALELAS a menos de una placa, con su contorno YA RESUELTO: si una
+      creció distinto, esta pieza tiene que cederle otra cosa.
+
+    Si falta algo acá el error es silencioso —se reusa una pieza que debía cambiar—, por
+    eso `test_api.test_la_memoria_entre_pedidos_no_cambia_ningun_resultado` (y la del
+    modelo grande) comparan el resultado con memoria contra el cálculo completo.
+    """
+    pb = placa.poly.bounds
+    margen = 2.0 * espesor_m
+    for d in destinos:
+        lo, hi = (pb[0], pb[2]) if d.eje == "u" else (pb[1], pb[3])
+        alcance = d.alcance_m or 0.0
+        fuera = max(0.0, lo - (d.objetivo_m - alcance), (d.objetivo_m + alcance) - hi)
+        margen = max(margen, fuera + 2.0 * espesor_m)
+
+    # Qué vecinas pueden importar (las que cortan el plano de esta placa y las paralelas
+    # a menos de una placa) depende sólo de las placas, no de las decisiones: se calcula
+    # una vez por conjunto de placas (`universo`) y se recuerda en la placa. Sin esto se
+    # recorrían las 300 vecinas de cada una de las 300 piezas en cada armado.
+    relevantes = None
+    if universo is not None:
+        if placa.vecinas_cache is None:
+            placa.vecinas_cache = {}
+        relevantes = placa.vecinas_cache.get((universo, round(espesor_m, 9)))
+    if relevantes is None:
+        relevantes = []
+        for otra in obstaculos or []:
+            if otra is placa:
+                continue
+            h = huella_cacheada(placa, otra, espesor_m)
+            if h is None:
+                sep = distancia_entre_planos(placa, otra)
+                if sep is not None and sep < espesor_m:
+                    relevantes.append((otra, None))
+            else:
+                relevantes.append((otra, h.bounds))
+        if universo is not None:
+            if len(placa.vecinas_cache) > 16:
+                placa.vecinas_cache.clear()
+            placa.vecinas_cache[(universo, round(espesor_m, 9))] = relevantes
+
+    cerca = []
+    for otra, hb in relevantes:
+        if hb is None:
+            # De una paralela ya resuelta entra su contorno ENTERO. Se probó dejar sólo
+            # lo que creció (que es lo que se le cede) para recalcular menos piezas, y el
+            # banco de pruebas mostró piezas reusadas que debían cambiar. Revertido.
+            cerca.append((
+                otra.firma,
+                None if otra.poly_final is None else hash(otra.poly_final.wkb),
+                otra.crecio,
+            ))
+            continue
+        if (hb[0] > pb[2] + margen or hb[2] < pb[0] - margen
+                or hb[1] > pb[3] + margen or hb[3] < pb[1] - margen):
+            continue
+        cerca.append(otra.firma)
+    # Las otras piezas se nombran por CONTENIDO, no por id: el id de una pieza fusionada
+    # se repite entre pedidos con otra geometría.
+    if firma_de is None:
+        firma_de = {o.group_id: o.firma for o in (obstaculos or [])}
+
+    def quien(gid):
+        return firma_de.get(gid, gid)
+
+    return (
+        placa.firma,
+        tuple(
+            (d.eje, d.lado, round(d.objetivo_m, 9), d.banda, quien(d.contra_group_id),
+             d.alcance_m)
+            for d in destinos
+        ),
+        tuple(sorted((quien(g) for g in (cede_ante or ())), key=repr)),
+        # Conjunto y no lista: el ORDEN de las vecinas cambia cuando el usuario fusiona
+        # dos piezas (la pieza nueva va al final de la lista) y no cambia el resultado.
+        frozenset(cerca),
+        round(espesor_m, 9),
+    )
 
 
 def _solo_poligonos(geom):
