@@ -168,8 +168,14 @@ def serialize_topology(
     wall_wall_decisions: Optional[Dict[int, int]] = None,
     decisiones_por_par: Optional[List[dict]] = None,
     pista: Optional[Dict] = None,
+    piezas: Optional[Dict] = None,
 ) -> Dict:
     """Topología para el front. Con `scale_denom`, `placements` son las piezas RECORTADAS.
+
+    `piezas` es la respuesta de `/verificacion` ya calculada para este mismo estado
+    (`placements`, `panel_id_by_group`, `absorbed_groups`, `plate_thickness_m`). Si viene,
+    se usa tal cual en lugar de volver a calcular: es la garantía de que el visor 3D, el
+    instructivo y la plancha muestran las mismas piezas.
 
     Por qué depende de la escala
     ----------------------------
@@ -213,6 +219,14 @@ def serialize_topology(
         # sugiere método kerf (simple) / auxético (doble) + spacing inicial.
         "curvature": build_curvature_map(result.groups, result.faces),
     }
+    if piezas is not None:
+        topo["placements"] = piezas["placements"]
+        topo["placements_fieles"] = True
+        topo["absorbed_groups"] = piezas["absorbed_groups"]
+        topo["plate_thickness_m"] = piezas["plate_thickness_m"]
+        topo["panel_id_by_group"] = piezas["panel_id_by_group"]
+        return topo
+
     if scale_denom:
         # Se descompone a la escala pedida y se devuelven los marcos de las piezas tal
         # como se van a cortar. Es el MISMO dato que `/nesting-preview.placements`; vive
@@ -708,6 +722,42 @@ def _calcular_verificacion(sesion: Dict, modelo: Phase1Result, request, estado: 
     return cuerpo, resumen
 
 
+def _verificacion_guardada(request, base: Phase1Result):
+    """La respuesta de `/verificacion` para el estado del pedido, calculándola si hace
+    falta. La usan `/verificacion` y `/recompute`: así el visor 3D y el instructivo
+    reciben LAS MISMAS piezas, con las mismas etiquetas, del mismo cálculo.
+
+    Devuelve `(sesion, estado, cuerpo, resumen, ya_calculada, espera_ms, calcular)`.
+    """
+    sesion = _sesion_de(request)
+    estado = sesiones.estado_de(
+        request.overrides, request.merges,
+        request.wall_wall_decisions, request.wall_wall_decisions_by_pair,
+    )
+    clave = sesiones.clave_de_estado(estado)
+
+    def calcular(otro_estado: Dict):
+        modelo = _modelo_revisado(sesion, base, request)
+        return _calcular_verificacion(sesion, modelo, request, otro_estado)
+
+    # Si el resultado ya está (el efecto de ese botón se había previsto, o el usuario
+    # volvió a un estado anterior) se responde sin esperar a ningún cálculo.
+    guardada = sesiones.respuesta_guardada(sesion, clave)
+    ya_calculada = guardada is not None
+    espera_ms = 0
+    if guardada is None:
+        t_espera = time.perf_counter()
+        with sesiones.calculo_en_primer_plano():
+            # Cuánto hubo que esperar a que el cálculo en segundo plano soltara.
+            espera_ms = round((time.perf_counter() - t_espera) * 1000)
+            guardada = sesiones.respuesta_guardada(sesion, clave)
+            if guardada is None:
+                guardada = calcular(estado)
+                sesiones.guardar_respuesta(sesion, clave, *guardada)
+    cuerpo, resumen = guardada
+    return sesion, estado, cuerpo, resumen, ya_calculada, espera_ms, calcular
+
+
 # ---------------------------------------------------------------------------
 # Caché de Phase1 en disco (pickle + gzip)
 # ---------------------------------------------------------------------------
@@ -1091,21 +1141,37 @@ async def recompute_endpoint(
                 # rescatados de "descartado" (ver apply_merges).
                 merged = apply_merges(rebuilt, request.merges or [], request.overrides)
 
-            with timer.step("panel_id_by_group"):
-                # A la escala pedida, si vino: la cantidad de piezas depende de ella (las
-                # superficies que se funden en una sola placa cambian con la escala), y las
-                # etiquetas A#/B# son correlativas. Con la escala fija de antes podían no
-                # coincidir con las de la plancha.
-                pid_opts = (
-                    PipelineOptions(
-                        scale_denom=request.scale_denom, paper="A4",
-                        min_area_m2=None, sheet_config=None,
+            piezas = None
+            pid_by_group = None
+            if request.scale_denom:
+                # Con escala, las piezas, sus etiquetas y lo absorbido salen del MISMO
+                # cálculo que /verificacion (y por lo tanto que la plancha y el DXF).
+                # Antes /recompute las calculaba por su cuenta, sin las fusiones por
+                # escala ni las etiquetas estables: el visor 3D podía llamar A13 a la
+                # pieza que el instructivo y la plancha llaman A14.
+                with timer.step("piezas"):
+                    pedido = NestingPreviewRequest(
+                        file_id=request.file_id,
+                        proyecto_id=request.proyecto_id,
+                        original_filename=request.original_filename,
+                        axis=request.axis,
+                        min_area_m2=request.min_area_m2,
+                        merges=request.merges,
+                        splits=request.splits,
+                        overrides=request.overrides,
+                        wall_wall_decisions=request.wall_wall_decisions,
+                        wall_wall_decisions_by_pair=request.wall_wall_decisions_by_pair,
+                        scale_denom=request.scale_denom,
                     )
-                    if request.scale_denom else None
-                )
-                pid_by_group = compute_panel_id_by_group(
-                    merged, pid_opts, overrides=request.overrides
-                )
+                    try:
+                        piezas = json.loads(_verificacion_guardada(pedido, base)[2])
+                    except Exception:
+                        logger.exception("[recompute] no se pudieron calcular las piezas")
+            if piezas is None:
+                with timer.step("panel_id_by_group"):
+                    pid_by_group = compute_panel_id_by_group(
+                        merged, None, overrides=request.overrides
+                    )
 
             timer.report()
             return JSONResponse(
@@ -1114,9 +1180,7 @@ async def recompute_endpoint(
                         merged,
                         pid_by_group,
                         request.overrides,
-                        scale_denom=request.scale_denom,
-                        wall_wall_decisions=request.wall_wall_decisions,
-                        decisiones_por_par=request.wall_wall_decisions_by_pair,
+                        piezas=piezas,
                     )
                 }
             )
@@ -1156,32 +1220,9 @@ def verificacion_endpoint(
     t0 = time.perf_counter()
     base = _load_phase1_for_request(request, db, credentials)
     try:
-        sesion = _sesion_de(request)
-        estado = sesiones.estado_de(
-            request.overrides, request.merges,
-            request.wall_wall_decisions, request.wall_wall_decisions_by_pair,
+        sesion, estado, cuerpo, resumen, ya_calculada, espera_ms, calcular = (
+            _verificacion_guardada(request, base)
         )
-        clave = sesiones.clave_de_estado(estado)
-
-        def calcular(otro_estado: Dict):
-            modelo = _modelo_revisado(sesion, base, request)
-            return _calcular_verificacion(sesion, modelo, request, otro_estado)
-
-        # Si el resultado ya está (el efecto de ese botón se había previsto, o el usuario
-        # volvió a un estado anterior) se responde sin esperar a ningún cálculo.
-        guardada = sesiones.respuesta_guardada(sesion, clave)
-        ya_calculada = guardada is not None
-        espera_ms = 0
-        if guardada is None:
-            t_espera = time.perf_counter()
-            with sesiones.calculo_en_primer_plano():
-                # Cuánto hubo que esperar a que el cálculo en segundo plano soltara.
-                espera_ms = round((time.perf_counter() - t_espera) * 1000)
-                guardada = sesiones.respuesta_guardada(sesion, clave)
-                if guardada is None:
-                    guardada = calcular(estado)
-                    sesiones.guardar_respuesta(sesion, clave, *guardada)
-        cuerpo, resumen = guardada
         # Apenas se responde, se empieza a calcular qué pasaría con cada botón.
         sesiones.prever_efectos(sesion, estado, resumen["acciones"], calcular)
         efectos = sesiones.efectos_de(sesion, estado)
@@ -1195,6 +1236,15 @@ def verificacion_endpoint(
                 # true = el usuario tocó un botón cuyo resultado ya estaba calculado.
                 "ya_calculada": ya_calculada,
                 "espera_ms": espera_ms,
+                # Cuántas decisiones del usuario llegaron en ESTE pedido. Si el usuario
+                # fusionó o reclasificó algo en el visor y acá figura 0, el front no lo
+                # está mandando y el instructivo no puede reflejarlo.
+                "recibido": {
+                    "overrides": len(estado["overrides"]),
+                    "merges": len(estado["merges"]),
+                    "decisiones": len(estado["wall_wall_decisions"])
+                    + len(estado["wall_wall_decisions_by_pair"]),
+                },
             },
         }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         return Response(
