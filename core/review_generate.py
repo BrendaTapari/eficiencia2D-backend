@@ -1524,6 +1524,9 @@ def _decompose(
             # Pedido sin acciones del usuario: sus etiquetas SON las de referencia.
             sesion["etiquetas"] = _etiquetas_de(wall_panels, floor_panels)
 
+    # Sólo informa: no cambia ninguna pieza. Ver `_absorbidos_completos`.
+    work = replace(work, absorbed_groups=_absorbidos_completos(phase1, work, overrides))
+
     # Una decisión que no se pudo aplicar tiene que llegar al usuario. Es su elección
     # sobre quién cede en una esquina; si se descarta en silencio, la pieza sale sin el
     # recorte que pidió y no hay forma de enterarse antes de cortar el MDF.
@@ -1606,6 +1609,38 @@ def _puntaje(uniones) -> Tuple[int, int, float]:
         else:
             otras += 1
     return (no_arma, otras, round(mm, 3))
+
+
+def _absorbidos_completos(
+    original: Phase1Result, work: Phase1Result, overrides: Optional[Dict[int, str]],
+) -> Dict[int, int]:
+    """`id de grupo sin pieza propia -> id del grupo en cuya pieza quedó`, para TODAS las
+    fusiones: las automáticas por escala y las que pidió el usuario.
+
+    Antes sólo figuraban las automáticas. Cuando el usuario fusionaba cuatro tramos de una
+    fachada en el visor, la pieza resultante conservaba el id de uno y los otros tres
+    simplemente dejaban de aparecer en `placements`, sin nada que dijera dónde habían ido:
+    para el instructivo eran piezas desaparecidas. Es sólo información para quien dibuja;
+    no interviene en el cálculo de ninguna pieza.
+    """
+    absorbe = dict(work.absorbed_groups or {})
+    vivos = {g.id for g in work.groups}
+    originales = {g.id: g for g in original.groups}
+    duenio: Dict[int, int] = {}
+    for g in work.groups:
+        o = originales.get(g.id)
+        if o is None or len(g.face_indices) != len(o.face_indices):
+            for fi in g.face_indices:       # sólo los grupos que sumaron caras de otro
+                duenio[fi] = g.id
+    for g in original.groups:
+        if g.id in vivos or g.id in absorbe or not g.face_indices:
+            continue
+        if _effective_category(g, overrides or {}) == "discard":
+            continue
+        d = duenio.get(g.face_indices[0])
+        if d is not None and d != g.id:
+            absorbe[g.id] = d
+    return absorbe
 
 
 def nueva_sesion() -> Dict:
