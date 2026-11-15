@@ -60,6 +60,17 @@ ESCALAS_USUALES = (10, 20, 25, 50, 75, 100, 125, 150, 200, 250, 500)
 _ORDEN_QUIEN = {"decidir": 0, "escala": 1, "modelo": 2}
 
 
+def id_de_accion(aplicar: Optional[Dict]) -> Optional[str]:
+    """Id estable de una acción a partir de lo que cambia. None si no cambia nada."""
+    if not aplicar:
+        return None
+    import hashlib
+    import json
+
+    texto = json.dumps(aplicar, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(texto.encode()).hexdigest()[:12]
+
+
 def _peor(a: str, b: str) -> str:
     return a if _ORDEN_ESTADO[a] <= _ORDEN_ESTADO[b] else b
 
@@ -817,6 +828,12 @@ def construir_reporte(
 
     def contar(estado: str, donde) -> int:
         return sum(1 for x in donde if x["estado"] == estado)
+
+    # Identificador de cada acción: el mismo cambio tiene el mismo id en cualquier nudo
+    # y en cualquier pedido. Con él se busca su efecto previsto (`/verificacion/efectos`).
+    for pr in problemas:
+        for a in pr["acciones"]:
+            a["id"] = id_de_accion(a.get("aplicar"))
 
     veredicto = "listo"
     if any(pr["estado"] == "no_arma" for pr in problemas):
