@@ -220,6 +220,7 @@ def generate_pipeline(
     decisiones_por_par: Optional[List[dict]] = None,
     bloquear_si_no_arma: bool = False,
     pista: Optional[Dict] = None,
+    sesion: Optional[Dict] = None,
 ) -> List[OutputFile]:
     from core.review_generate import generate_from_review
 
@@ -238,6 +239,7 @@ def generate_pipeline(
         decisiones_por_par=decisiones_por_par,
         bloquear_si_no_arma=bloquear_si_no_arma,
         pista=pista,
+        sesion=sesion,
     )
 
 
