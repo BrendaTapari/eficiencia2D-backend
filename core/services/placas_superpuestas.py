@@ -101,6 +101,45 @@ def _espalda_con_espalda(a: GeometryGroup, b: GeometryGroup) -> bool:
     return (dx * na.x + dy * na.y + dz * na.z) < 0 and (dx * nb.x + dy * nb.y + dz * nb.z) > 0
 
 
+# Parte del área de una placa que tiene que caer en las aberturas de otra para avisar que
+# es un "relleno de abertura" (vidrio, carpintería). Más de la mitad: una carpintería
+# suele pisar unos centímetros del borde del muro.
+FRACCION_EN_ABERTURA = 0.5
+
+
+def _lleno(geom):
+    """La región sin sus aberturas: cada parte reducida a su contorno exterior."""
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+
+    partes = [g for g in getattr(geom, "geoms", [geom]) if hasattr(g, "exterior")]
+    if not any(len(g.interiors) for g in partes):
+        return geom
+    return unary_union([Polygon(g.exterior) for g in partes])
+
+
+def _aberturas(placa: Placa, vistas: Dict[int, object]):
+    """Región de las aberturas CERRADAS de una placa (ventanas, huecos), en su marco.
+    None si no tiene ninguna."""
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+
+    if placa.group_id in vistas:
+        return vistas[placa.group_id]
+    vanos = None
+    try:
+        partes = list(getattr(placa.poly, "geoms", [placa.poly]))
+        if any(len(g.interiors) for g in partes):
+            lleno = unary_union([Polygon(g.exterior) for g in partes])
+            resto = lleno.difference(placa.poly)
+            if not resto.is_empty and resto.area > 1e-9:
+                vanos = resto
+    except Exception:
+        vanos = None
+    vistas[placa.group_id] = vanos
+    return vanos
+
+
 def detectar_placas_superpuestas(
     groups: List[GeometryGroup],
     faces: List[Face3D],
@@ -108,10 +147,15 @@ def detectar_placas_superpuestas(
     categoria: Callable[[GeometryGroup], str],
     normales: Optional[Dict[int, object]] = None,
     cache: Optional[Dict] = None,
+    en_aberturas: Optional[Dict[int, int]] = None,
 ) -> List[List[int]]:
     """Conjuntos de ids de grupo que a esta escala ocupan la misma placa.
 
     Devuelve listas listas para pasarle a `apply_merges`. Vacío si no hay ninguna.
+
+    Si se pasa `en_aberturas`, se llena con `id -> id del muro` de los grupos fundidos que
+    están DENTRO DE UNA ABERTURA del otro: un vidrio o una carpintería modelados en el
+    vano de una ventana. Es sólo para avisarle al usuario que ese vano sale cerrado.
     """
     escala = scale_denom or 1.0
     limite = max(0.0, (PLATE_THICKNESS_M - TOL_PLANCHA_M) * escala)
@@ -147,6 +191,7 @@ def detectar_placas_superpuestas(
         return x
 
     hubo = False
+    vanos_de: Dict[int, object] = {}
     for i in range(len(placas)):
         gi, ci, pi = placas[i]
         for j in range(i + 1, len(placas)):
@@ -171,13 +216,37 @@ def detectar_placas_superpuestas(
             otra = proyeccion_paralela(pi, pj)
             if otra is None:
                 continue
+            # El solape se mide sobre las placas SIN sus aberturas (el contorno lleno).
+            # Lo que el modelo trae dentro de un vano —un vidrio, una carpintería, los
+            # paños de un frente vidriado dentro de su marco— ocupa la misma placa que el
+            # muro aunque no pise ni un centímetro de su material: si no se funden, salen
+            # como tapones sueltos del tamaño exacto del hueco, o como un marco de barras
+            # de medio milímetro. Fundidos, la pieza se arma con las caras de los dos y
+            # el vano sale cerrado, que es lo que el modelo tiene ahí: material. Para
+            # abrirlo, el usuario descarta el vidrio y el muro conserva su ventana.
             try:
-                comun = pi.poly.intersection(otra).area
+                mio, suyo = _lleno(pi.poly), _lleno(otra)
+                comun = mio.intersection(suyo).area
             except Exception:
                 continue
-            if comun >= fraccion * min(pi.poly.area, pj.poly.area):
+            if comun >= fraccion * min(mio.area, suyo.area):
                 padre[raiz(gi.id)] = raiz(gj.id)
                 hubo = True
+                if en_aberturas is not None and sep < limite:
+                    # Sólo para avisar: ¿una de las dos está dentro de un vano de la otra?
+                    for (ga, pa), (gb, pb) in (((gi, pi), (gj, pj)), ((gj, pj), (gi, pi))):
+                        vanos = _aberturas(pb, vanos_de)
+                        if vanos is None:
+                            continue
+                        vista = proyeccion_paralela(pb, pa)
+                        try:
+                            if vista is not None and (
+                                vista.intersection(vanos).area
+                                >= FRACCION_EN_ABERTURA * vista.area
+                            ):
+                                en_aberturas[ga.id] = gb.id
+                        except Exception:
+                            pass
 
     if not hubo:
         return []
