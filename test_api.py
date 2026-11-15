@@ -291,3 +291,218 @@ def test_presupuesto_despues_de_un_clic_en_el_modelo_grande(cliente):
     sesiones.olvidar_todo()
     de_cero = _sin_lo_que_cambia_siempre(_verificar(cliente, estado)[0])
     assert de_cero == con_memoria
+
+
+# ---------------------------------------------------------------------------
+# Lo que se ve es lo que se corta: visor 3D = instructivo = plancha = DXF
+# ---------------------------------------------------------------------------
+
+def _paredes_coplanares(topologia, cuantas=4):
+    """Ids de paredes sobre un mismo plano: lo que el usuario fusiona cuando une los
+    tramos de una fachada en el visor."""
+    planos = {}
+    for g in topologia["groups"]:
+        if g["category"] != "wall":
+            continue
+        n, c = g["representative_normal"], g["centroid"]
+        d = n["x"] * c["x"] + n["y"] * c["y"] + n["z"] * c["z"]
+        planos.setdefault(
+            (round(abs(n["x"]), 2), round(abs(n["z"]), 2), round(abs(d), 1)), []
+        ).append(g["id"])
+    return max(planos.values(), key=len)[:cuantas]
+
+
+def _piezas_del_dxf(texto):
+    """Caja (x0, y0, x1, y1) en metros de plancha de cada contorno EXTERIOR dibujado en
+    un DXF de corte, y los textos grabados."""
+    import io
+
+    ezdxf = pytest.importorskip("ezdxf")
+    doc = ezdxf.read(io.StringIO(texto))
+    padre = {}
+
+    def raiz(x):
+        while padre.setdefault(x, x) != x:
+            padre[x] = padre[padre[x]]
+            x = padre[x]
+        return x
+
+    lineas, textos = [], []
+    for e in doc.modelspace():
+        if e.dxftype() == "TEXT":
+            textos.append(e.dxf.text)
+        elif e.dxftype() == "LINE" and e.dxf.layer.startswith("CUT"):
+            a = (round(e.dxf.start.x, 6), round(e.dxf.start.y, 6))
+            b = (round(e.dxf.end.x, 6), round(e.dxf.end.y, 6))
+            lineas.append((a, b))
+            padre[raiz(a)] = raiz(b)
+    cajas = {}
+    for a, b in lineas:
+        c = cajas.setdefault(raiz(a), [a[0], a[1], a[0], a[1]])
+        for x, y in (a, b):
+            c[0], c[1], c[2], c[3] = min(c[0], x), min(c[1], y), max(c[2], x), max(c[3], y)
+    cajas = list(cajas.values())
+    # Los huecos (aberturas, ranuras) caen dentro de la caja de su pieza: no son piezas.
+    exteriores = [
+        c for c in cajas
+        if not any(
+            o is not c and o[0] <= c[0] + 1e-9 and o[1] <= c[1] + 1e-9
+            and o[2] >= c[2] - 1e-9 and o[3] >= c[3] - 1e-9
+            for o in cajas
+        )
+    ]
+    return [tuple(c) for c in exteriores], textos
+
+
+def test_visor_instructivo_plancha_y_dxf_son_las_mismas_piezas(cliente):
+    """Lo que el usuario cambia en el visor 3D (fusionar tramos, rescatar un descartado,
+    descartar una pieza) tiene que verse en el instructivo, y lo que ve en el instructivo
+    tiene que ser, medida por medida, lo que sale en la plancha y en el DXF.
+
+    Origen: el usuario fusionó una fachada en el visor y en el instructivo "desaparecieron
+    3 de las 4 paredes"; y el visor podía llamar A13 a la pieza que la plancha llama A14.
+    """
+    import base64
+    import io
+    import zipfile
+
+    sesiones.olvidar_todo()
+    with open(CHICO, "rb") as fh:
+        subida = cliente.post(
+            "/api/upload", files={"file": ("demo.obj", fh, "application/octet-stream")}
+        ).json()
+    topo = subida["topology"]
+    escala = 100.0
+    base = {**_base(subida["file_id"], CHICO, escala), "page_mode": "single_page"}
+
+    fusion = _paredes_coplanares(topo)
+    assert len(fusion) >= 2
+    descartado = max(
+        (g for g in topo["groups"] if g["category"] == "discard"),
+        key=lambda g: g["total_area"],
+    )["id"]
+    j0, _, _ = _verificar(cliente, base)
+    una_accion = _acciones(j0["verificacion"])[0]
+    estados = {
+        "sin cambios": base,
+        "fusión en el visor": {**base, "merges": [fusion]},
+        "descartado rescatado como pared": {**base, "overrides": {str(descartado): "wall"}},
+        "todo junto": _con(
+            {**base, "merges": [fusion], "overrides": {str(descartado): "wall"}}, una_accion
+        ),
+    }
+    for nombre, cuerpo in estados.items():
+        v, _, _ = _verificar(cliente, cuerpo)
+        n = cliente.post("/api/nesting-preview", json=cuerpo).json()
+        r = cliente.post("/api/recompute", json=cuerpo).json()["topology"]
+        assert v["servidor"]["recibido"]["merges"] == len(cuerpo.get("merges", []))
+
+        # 1. Visor 3D, instructivo y plancha: las mismas piezas y las mismas etiquetas.
+        assert r["placements_fieles"] is True, nombre
+        assert r["placements"] == v["placements"] == n["placements"], nombre
+        assert r["panel_id_by_group"] == v["panel_id_by_group"], nombre
+        assert r["absorbed_groups"] == v["absorbed_groups"] == n["absorbed_groups"], nombre
+
+        # 2. Ninguna pieza "desaparece": todo grupo que no está descartado tiene pieza
+        #    propia o figura dentro de la pieza de otro.
+        ov = cuerpo.get("overrides", {})
+        for g in topo["groups"]:
+            gid = str(g["id"])
+            if ov.get(gid, g["category"]) == "discard":
+                continue
+            if gid in v["placements"]:
+                continue
+            duenio = v["absorbed_groups"].get(gid)
+            if duenio is not None:
+                assert str(duenio) in v["placements"], f"{nombre}: {gid} absorbido por una pieza que no existe"
+        if "merges" in cuerpo:
+            con_pieza = [g for g in fusion if str(g) in v["placements"]]
+            for g in fusion:
+                if g not in con_pieza:
+                    assert v["absorbed_groups"].get(str(g)) in con_pieza, (
+                        f"{nombre}: el tramo {g} no tiene pieza ni figura absorbido"
+                    )
+        if "overrides" in cuerpo and str(descartado) in cuerpo["overrides"]:
+            assert (
+                str(descartado) in v["placements"]
+                or str(descartado) in v["absorbed_groups"]
+            ), f"{nombre}: el descartado rescatado no aparece"
+
+        # 3. Instructivo = plancha, medida por medida.
+        en_plancha = {}
+        for clave in ("wall_nesting", "floor_nesting"):
+            for hoja in n[clave]["sheets"]:
+                for p in hoja["panels"]:
+                    en_plancha[p["panel"]["id"]] = p["panel"]
+            assert not n[clave]["unplaced"], f"{nombre}: piezas sin ubicar"
+        for gid, pl in v["placements"].items():
+            pieza = en_plancha[pl["panel_id"]]
+            # El instructivo va en metros de edificio; la plancha, en metros de plancha.
+            assert pl["width_m"] == pytest.approx(pieza["width_m"] * escala, abs=1e-6), (nombre, pl["panel_id"])
+            assert pl["height_m"] == pytest.approx(pieza["height_m"] * escala, abs=1e-6), (nombre, pl["panel_id"])
+        assert set(v["panel_id_by_group"].values()) == set(en_plancha), nombre
+
+        # 4. Plancha = DXF: cada pieza sale dibujada con su medida, a escala.
+        g = cliente.post("/api/generate", json=cuerpo)
+        assert g.status_code == 200, g.text[:300]
+        z = zipfile.ZipFile(io.BytesIO(base64.b64decode(g.json()["zip_base64"])))
+        dibujadas, grabadas = [], []
+        for archivo in z.namelist():
+            if archivo.endswith("_corte.dxf"):
+                dibujadas += _piezas_del_dxf(z.read(archivo).decode("latin-1"))[0]
+            elif archivo.endswith(".dxf"):
+                grabadas += _piezas_del_dxf(z.read(archivo).decode("latin-1"))[1]
+        esperadas = sorted(
+            tuple(sorted((p["width_m"], p["height_m"])))
+            for p in en_plancha.values()
+        )
+        # Cada pieza de la plancha tiene que estar dibujada con su medida. 0.02 mm de
+        # plancha de tolerancia: muy por debajo del ancho de corte del láser. Una pieza
+        # fusionada puede ser dos o tres contornos sueltos (tramos que no se tocan) que
+        # se cortan con una sola etiqueta: ahí la medida es la de la caja del conjunto.
+        import itertools
+
+        def lados(cajas):
+            x0, y0 = min(c[0] for c in cajas), min(c[1] for c in cajas)
+            x1, y1 = max(c[2] for c in cajas), max(c[3] for c in cajas)
+            return tuple(sorted((x1 - x0, y1 - y0)))
+
+        libres = list(dibujadas)
+        pendientes = []
+        for c, d in esperadas:
+            igual = next(
+                (x for x in libres
+                 if abs(lados([x])[0] - c) <= 2e-5 and abs(lados([x])[1] - d) <= 2e-5),
+                None,
+            )
+            if igual is None:
+                pendientes.append((c, d))
+            else:
+                libres.remove(igual)
+        for c, d in pendientes:
+            grupo = next(
+                (combo for k in (2, 3, 4) for combo in itertools.combinations(libres, k)
+                 if abs(lados(combo)[0] - c) <= 2e-5 and abs(lados(combo)[1] - d) <= 2e-5),
+                None,
+            )
+            assert grupo is not None, (
+                f"{nombre}: la pieza de {c * 1000:.2f} x {d * 1000:.2f} mm no está en el "
+                "DXF con esa medida"
+            )
+            for x in grupo:
+                libres.remove(x)
+        assert not libres, f"{nombre}: el DXF dibuja {len(libres)} contornos que no son de ninguna pieza"
+        if grabadas:
+            # Las piezas muy angostas salen sin etiqueta grabada a propósito: el texto no
+            # entra (menos de 2 mm de alto). Todas las demás tienen que llevar la suya.
+            sin_grabar = set(en_plancha) - set(grabadas)
+            for etiqueta in sin_grabar:
+                p = en_plancha[etiqueta]
+                assert min(p["width_m"], p["height_m"]) < 0.006, (
+                    f"{nombre}: {etiqueta} mide "
+                    f"{p['width_m'] * 1000:.1f} x {p['height_m'] * 1000:.1f} mm y no "
+                    "lleva etiqueta grabada"
+                )
+            assert not (set(grabadas) - set(en_plancha)) & {
+                t for t in grabadas if t[:1] in "AB" and t[1:].isdigit()
+            }, f"{nombre}: el DXF graba etiquetas que no están en la plancha"
