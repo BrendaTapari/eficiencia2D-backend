@@ -417,6 +417,26 @@ def proyeccion_paralela(a: Placa, b: Placa, poly=None):
 
     if abs(dot(a.n, b.n)) < COS_PARALELAS:
         return None
+    # El resultado depende sólo de las dos placas y de la región proyectada: se recuerda
+    # en `a`, por contenido de `b` (ver `huella_cacheada`). Una pieza con varias vecinas
+    # paralelas repetía esta proyección en cada armado: eran 10.000 llamadas por clic.
+    clave = None
+    if b.firma is not None:
+        clave = ("paralela", b.firma, None if poly is None else hash(poly.wkb))
+        if a.huellas_cache is None:
+            a.huellas_cache = {}
+        guardada = a.huellas_cache.get(clave, _SIN_HUELLA)
+        if guardada is not _SIN_HUELLA:
+            return guardada
+        if len(a.huellas_cache) > 4000:
+            a.huellas_cache.clear()
+    resultado = _proyectar_paralela(a, b, poly, Polygon, unary_union)
+    if clave is not None:
+        a.huellas_cache[clave] = resultado
+    return resultado
+
+
+def _proyectar_paralela(a: Placa, b: Placa, poly, Polygon, unary_union):
     bu_au, bu_av = dot(b.u, a.u), dot(b.u, a.v)
     bv_au, bv_av = dot(b.v, a.u), dot(b.v, a.v)
     rel = Vec3(b.o.x - a.o.x, b.o.y - a.o.y, b.o.z - a.o.z)
