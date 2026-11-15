@@ -10,16 +10,18 @@ import pickle
 import shutil
 import logging
 import dataclasses
+import json
 from pathlib import Path
 from typing import Dict, List, Optional
 from uuid import UUID
 
 from pydantic import BaseModel
 from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Depends
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 
+from api import sesiones
 from api.deps import bearer_scheme, get_current_user
 from database import Proyecto, get_db
 
@@ -605,42 +607,105 @@ class NestingPreviewRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Pistas del resolvedor entre un pedido y el siguiente
-#
-# Cada vez que el usuario toca un botón del instructivo (fusionar, descartar, invertir
-# quién cede) el front vuelve a pedir. Sin memoria, el resolvedor de uniones redescubre
-# desde cero todo lo que ya había resuelto en el pedido anterior, aunque el 99% del modelo
-# siga igual: en un modelo de 300 piezas eso eran unos 25 s por clic, con todos los
-# botones deshabilitados mientras tanto.
-#
-# Se guarda lo último que resolvió, por modelo y escala, y se le pasa como punto de
-# partida. Es memoria del proceso: se pierde al reiniciar y entonces el primer pedido
-# vuelve a tardar lo que tardaba. No cambia qué se calcula, sólo desde dónde se empieza.
+# Sesión del pedido: lo ya calculado para este modelo, escala y cortes manuales
+# (ver api/sesiones.py)
 # ---------------------------------------------------------------------------
 
-_PISTAS_DEL_RESOLVEDOR: Dict[tuple, Dict] = {}
-_MAX_PISTAS = 64
+def _sesion_de(request, crear: bool = True) -> Optional[Dict]:
+    quien = getattr(request, "proyecto_id", None) or getattr(request, "file_id", None)
+    buscar = sesiones.sesion_para if crear else sesiones.sesion_si_existe
+    return buscar(sesiones.clave_de_sesion(
+        str(quien), request.scale_denom,
+        axis=request.axis,
+        min_area_m2=request.min_area_m2,
+        splits=[sp.dict() for sp in (request.splits or [])],
+        marks=request.marks,
+        user_cuts=request.user_cuts,
+        flex=request.flex,
+        mark_lines=request.mark_lines,
+        ribs=request.ribs,
+        columns=request.columns,
+    ))
 
 
-def _clave_de_pista(request, scale_denom) -> Optional[tuple]:
-    quien = getattr(request, "file_id", None) or getattr(request, "proyecto_id", None)
-    if not quien or not scale_denom:
-        return None
-    return (str(quien), round(float(scale_denom), 6), getattr(request, "axis", None))
+def _modelo_revisado(sesion: Dict, base: Phase1Result, request) -> Phase1Result:
+    """El modelo con eje, área mínima y divisiones aplicados. Depende sólo de cosas que
+    están en la clave de la sesión, así que se calcula una vez por sesión."""
+    guardado = sesion.get("modelo")
+    if guardado is not None and guardado[0] is base:
+        return guardado[1]
+    from core.pipeline import apply_review_edits
+
+    modelo = apply_review_edits(
+        base,
+        axis=request.axis,
+        min_real_area=request.min_area_m2,
+        splits=[sp.dict() for sp in (request.splits or [])],
+    )
+    sesion["modelo"] = (base, modelo)
+    return modelo
 
 
-def _pista_para(request, scale_denom) -> Optional[Dict]:
-    clave = _clave_de_pista(request, scale_denom)
-    return _PISTAS_DEL_RESOLVEDOR.get(clave) if clave else None
+def _opciones_de(request) -> PipelineOptions:
+    sheet = request.sheet_config
+    sheet_cfg = (
+        SheetConfig(width_m=sheet.width_m, height_m=sheet.height_m, gap_m=sheet.gap_m)
+        if sheet
+        else SheetConfig(width_m=1.0, height_m=0.6, gap_m=0.003)
+    )
+    return PipelineOptions(
+        scale_denom=request.scale_denom,
+        paper=request.paper,
+        include_cutting_sheet=True,
+        sheet_config=sheet_cfg,
+        min_area_m2=request.min_area_m2,
+        page_mode=request.page_mode,
+        combine_sheets=request.combine_sheets,
+    )
 
 
-def _guardar_pista(request, scale_denom, resolucion: Optional[Dict]) -> None:
-    clave = _clave_de_pista(request, scale_denom)
-    if not clave or not resolucion:
-        return
-    if clave not in _PISTAS_DEL_RESOLVEDOR and len(_PISTAS_DEL_RESOLVEDOR) >= _MAX_PISTAS:
-        _PISTAS_DEL_RESOLVEDOR.pop(next(iter(_PISTAS_DEL_RESOLVEDOR)))
-    _PISTAS_DEL_RESOLVEDOR[clave] = resolucion
+def _calcular_verificacion(sesion: Dict, modelo: Phase1Result, request, estado: Dict):
+    """Calcula la respuesta de `/verificacion` para un estado de revisión.
+
+    Devuelve `(cuerpo JSON ya serializado, resumen)`. Se guarda serializado porque la
+    misma respuesta se entrega tal cual cuando el usuario toca el botón cuyo efecto ya se
+    había previsto.
+    """
+    from core.review_generate import compute_verificacion
+
+    opts = _opciones_de(request)
+    work, panel_id_by_group, plate_joints, places = compute_verificacion(
+        modelo,
+        opts,
+        overrides={int(k): v for k, v in estado["overrides"].items()} or None,
+        wall_wall_decisions={
+            int(k): v for k, v in estado["wall_wall_decisions"].items()
+        } or None,
+        merges=estado["merges"] or None,
+        marks=request.marks,
+        user_cuts=request.user_cuts,
+        flex=request.flex,
+        mark_lines=request.mark_lines,
+        ribs=request.ribs,
+        columns=request.columns,
+        decisiones_por_par=estado["wall_wall_decisions_by_pair"] or None,
+        sesion=sesion["calculo"],
+    )
+    contenido = {
+        "verificacion": work.verificacion,
+        "placements": places,
+        "panel_id_by_group": {str(k): v for k, v in panel_id_by_group.items()},
+        "absorbed_groups": {str(k): v for k, v in (work.absorbed_groups or {}).items()},
+        "warnings": list(work.warnings or []),
+        "plate_thickness_m": PLATE_THICKNESS_M * (opts.scale_denom or 1.0),
+        "plate_joints": serialize_plate_joints(plate_joints),
+    }
+    cuerpo = json.dumps(
+        contenido, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+    ).encode("utf-8")
+    resumen = sesiones.resumen_de(work.verificacion)
+    resumen["acciones"] = sesiones.acciones_a_prever(work.verificacion)
+    return cuerpo, resumen
 
 
 # ---------------------------------------------------------------------------
@@ -660,10 +725,23 @@ def save_phase1_cache(file_id: str, result: Phase1Result) -> None:
     size_kb = os.path.getsize(path) / 1024
     ms = (time.perf_counter() - t0) * 1000
     logger.info(f"[cache] Phase1 guardado: {path} ({size_kb:.0f} KB) en {ms:.0f} ms")
+    # El modelo de este id cambió: lo calculado sobre el anterior no sirve.
+    sesiones.olvidar_modelo(file_id)
+    sesiones.recordar_modelo(file_id, result)
 
 
 def load_phase1_cache(file_id: str) -> Optional[Phase1Result]:
-    """Carga el Phase1Result desde caché. Retorna None si no existe."""
+    """Carga el Phase1Result desde caché. Retorna None si no existe.
+
+    Primero mira la memoria: leer y descomprimir el archivo son 5 s en un modelo de 300
+    piezas, y se pagaban en CADA pedido aunque fuera el mismo modelo que en el anterior.
+    Nadie modifica un Phase1Result (todo el flujo trabaja sobre copias con `replace`), así
+    que compartir el mismo objeto entre pedidos es seguro; lo vigila
+    `test_api.test_un_pedido_no_modifica_el_modelo_en_memoria`.
+    """
+    en_memoria = sesiones.modelo_en_memoria(file_id)
+    if en_memoria is not None:
+        return en_memoria
     path = _cache_path(file_id)
     if not os.path.exists(path):
         return None
@@ -673,6 +751,7 @@ def load_phase1_cache(file_id: str) -> Optional[Phase1Result]:
             result = pickle.load(f)
         ms = (time.perf_counter() - t0) * 1000
         logger.info(f"[cache] Phase1 cargado desde caché en {ms:.0f} ms")
+        sesiones.recordar_modelo(file_id, result)
         return result
     except Exception as e:
         logger.warning(f"[cache] Error al cargar caché {path}: {e}")
@@ -861,36 +940,16 @@ async def generate_pdf_endpoint(
 
     try:
         # Re-derivar topología determinística: eje → área mínima → splits.
-        from core.pipeline import apply_review_edits
+        # La MISMA sesión que /verificacion y /nesting-preview: además de no recalcular
+        # las piezas, garantiza que la etiqueta grabada en la plancha sea la que el
+        # usuario vio en el instructivo.
+        sesion = _sesion_de(request)
         with timer.step("apply_review_edits"):
-            phase1 = apply_review_edits(
-                base,
-                axis=request.axis,
-                min_real_area=request.min_area_m2,
-                splits=[s.dict() for s in (request.splits or [])],
-            )
+            phase1 = _modelo_revisado(sesion, base, request)
 
-        sheet = request.sheet_config
-        sheet_cfg = (
-            SheetConfig(
-                width_m=sheet.width_m,
-                height_m=sheet.height_m,
-                gap_m=sheet.gap_m,
-            )
-            if sheet
-            else SheetConfig(width_m=1.0, height_m=0.6, gap_m=0.003)
-        )
-        opts = PipelineOptions(
-            scale_denom=request.scale_denom,
-            paper=request.paper,
-            include_cutting_sheet=True,
-            sheet_config=sheet_cfg,
-            min_area_m2=request.min_area_m2,
-            page_mode=request.page_mode,
-            combine_sheets=request.combine_sheets,
-        )
+        opts = _opciones_de(request)
 
-        with timer.step("generate_pipeline"):
+        with timer.step("generate_pipeline"), sesiones.calculo_en_primer_plano():
             files = generate_pipeline(
                 phase1,
                 opts,
@@ -905,7 +964,7 @@ async def generate_pdf_endpoint(
                 columns=request.columns,
                 decisiones_por_par=request.wall_wall_decisions_by_pair,
                 bloquear_si_no_arma=request.bloquear_si_no_arma and not request.forzar,
-                pista=_pista_para(request, request.scale_denom),
+                sesion=sesion["calculo"],
             )
 
         if not files:
@@ -1013,52 +1072,54 @@ async def recompute_endpoint(
         base = _load_phase1_for_request(request, db, credentials)
 
     try:
-        from core.pipeline import apply_review_edits
-        from core.review_generate import apply_merges, compute_panel_id_by_group
+        # Todo el pedido con prioridad sobre el trabajo en segundo plano: si no, las
+        # dos cosas compiten por el procesador y ésta tarda el doble.
+        with sesiones.calculo_en_primer_plano():
+            from core.pipeline import apply_review_edits
+            from core.review_generate import apply_merges, compute_panel_id_by_group
 
-        with timer.step("apply_review_edits"):
-            rebuilt = apply_review_edits(
-                base,
-                axis=request.axis,
-                min_real_area=request.min_area_m2,
-                splits=[s.dict() for s in (request.splits or [])],
-            )
-
-        with timer.step("apply_merges"):
-            # Los overrides también entran acá: una fusión puede involucrar grupos
-            # rescatados de "descartado" (ver apply_merges).
-            merged = apply_merges(rebuilt, request.merges or [], request.overrides)
-
-        with timer.step("panel_id_by_group"):
-            # A la escala pedida, si vino: la cantidad de piezas depende de ella (las
-            # superficies que se funden en una sola placa cambian con la escala), y las
-            # etiquetas A#/B# son correlativas. Con la escala fija de antes podían no
-            # coincidir con las de la plancha.
-            pid_opts = (
-                PipelineOptions(
-                    scale_denom=request.scale_denom, paper="A4",
-                    min_area_m2=None, sheet_config=None,
+            with timer.step("apply_review_edits"):
+                rebuilt = apply_review_edits(
+                    base,
+                    axis=request.axis,
+                    min_real_area=request.min_area_m2,
+                    splits=[s.dict() for s in (request.splits or [])],
                 )
-                if request.scale_denom else None
-            )
-            pid_by_group = compute_panel_id_by_group(
-                merged, pid_opts, overrides=request.overrides
-            )
 
-        timer.report()
-        return JSONResponse(
-            content={
-                "topology": serialize_topology(
-                    merged,
-                    pid_by_group,
-                    request.overrides,
-                    scale_denom=request.scale_denom,
-                    wall_wall_decisions=request.wall_wall_decisions,
-                    decisiones_por_par=request.wall_wall_decisions_by_pair,
-                    pista=_pista_para(request, request.scale_denom),
+            with timer.step("apply_merges"):
+                # Los overrides también entran acá: una fusión puede involucrar grupos
+                # rescatados de "descartado" (ver apply_merges).
+                merged = apply_merges(rebuilt, request.merges or [], request.overrides)
+
+            with timer.step("panel_id_by_group"):
+                # A la escala pedida, si vino: la cantidad de piezas depende de ella (las
+                # superficies que se funden en una sola placa cambian con la escala), y las
+                # etiquetas A#/B# son correlativas. Con la escala fija de antes podían no
+                # coincidir con las de la plancha.
+                pid_opts = (
+                    PipelineOptions(
+                        scale_denom=request.scale_denom, paper="A4",
+                        min_area_m2=None, sheet_config=None,
+                    )
+                    if request.scale_denom else None
                 )
-            }
-        )
+                pid_by_group = compute_panel_id_by_group(
+                    merged, pid_opts, overrides=request.overrides
+                )
+
+            timer.report()
+            return JSONResponse(
+                content={
+                    "topology": serialize_topology(
+                        merged,
+                        pid_by_group,
+                        request.overrides,
+                        scale_denom=request.scale_denom,
+                        wall_wall_decisions=request.wall_wall_decisions,
+                        decisiones_por_par=request.wall_wall_decisions_by_pair,
+                    )
+                }
+            )
 
     except HTTPException:
         raise
@@ -1074,6 +1135,97 @@ async def recompute_endpoint(
 # de exportar DXF/PDF devuelve la distribución de paneles en planchas.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Endpoint /verificacion — lo que cambia cuando el usuario toma una decisión
+#
+# Es el pedido que el instructivo hace después de cada botón (fusionar, no cortar,
+# invertir quién cede), EN LUGAR DE /recompute + /nesting-preview. Recibe el mismo cuerpo
+# que /nesting-preview y devuelve sólo lo que una decisión puede cambiar: el reporte, las
+# piezas recortadas y sus etiquetas. Sin caras del modelo, sin planchas.
+#
+# No es `async`: corre en un hilo aparte, así el servidor sigue atendiendo otros pedidos
+# (por ejemplo, la consulta de efectos) mientras éste calcula.
+# ---------------------------------------------------------------------------
+
+@router.post("/verificacion")
+def verificacion_endpoint(
+    request: NestingPreviewRequest,
+    db: Session = Depends(get_db),
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+):
+    t0 = time.perf_counter()
+    base = _load_phase1_for_request(request, db, credentials)
+    try:
+        sesion = _sesion_de(request)
+        estado = sesiones.estado_de(
+            request.overrides, request.merges,
+            request.wall_wall_decisions, request.wall_wall_decisions_by_pair,
+        )
+        clave = sesiones.clave_de_estado(estado)
+
+        def calcular(otro_estado: Dict):
+            modelo = _modelo_revisado(sesion, base, request)
+            return _calcular_verificacion(sesion, modelo, request, otro_estado)
+
+        # Si el resultado ya está (el efecto de ese botón se había previsto, o el usuario
+        # volvió a un estado anterior) se responde sin esperar a ningún cálculo.
+        guardada = sesiones.respuesta_guardada(sesion, clave)
+        ya_calculada = guardada is not None
+        espera_ms = 0
+        if guardada is None:
+            t_espera = time.perf_counter()
+            with sesiones.calculo_en_primer_plano():
+                # Cuánto hubo que esperar a que el cálculo en segundo plano soltara.
+                espera_ms = round((time.perf_counter() - t_espera) * 1000)
+                guardada = sesiones.respuesta_guardada(sesion, clave)
+                if guardada is None:
+                    guardada = calcular(estado)
+                    sesiones.guardar_respuesta(sesion, clave, *guardada)
+        cuerpo, resumen = guardada
+        # Apenas se responde, se empieza a calcular qué pasaría con cada botón.
+        sesiones.prever_efectos(sesion, estado, resumen["acciones"], calcular)
+        efectos = sesiones.efectos_de(sesion, estado)
+
+        cabecera = json.dumps({
+            # Efecto previsto de cada acción (por `accion.id`) que ya se llegó a
+            # calcular. El resto se consulta en /verificacion/efectos.
+            "efectos": efectos,
+            "servidor": {
+                "ms": round((time.perf_counter() - t0) * 1000),
+                # true = el usuario tocó un botón cuyo resultado ya estaba calculado.
+                "ya_calculada": ya_calculada,
+                "espera_ms": espera_ms,
+            },
+        }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        return Response(
+            content=cabecera[:-1] + b"," + cuerpo[1:], media_type="application/json"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"[verificacion] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error en verificación: {str(e)}")
+
+
+@router.post("/verificacion/efectos")
+def efectos_endpoint(request: NestingPreviewRequest):
+    """Efecto previsto de cada acción del estado enviado. No calcula nada: informa lo
+    que el trabajo en segundo plano lleva hecho. Se puede consultar cada 1 o 2 segundos
+    hasta que `listo` sea true. No expone geometría, sólo conteos, por eso no pide el
+    modelo ni credenciales."""
+    sesion = _sesion_de(request, crear=False)
+    if sesion is None:
+        # Nunca se pidió /verificacion para este modelo (o el servidor se reinició).
+        return JSONResponse(content={
+            "listo": False, "calculadas": 0, "total": 0, "efectos": {}, "sin_sesion": True,
+        })
+    estado = sesiones.estado_de(
+        request.overrides, request.merges,
+        request.wall_wall_decisions, request.wall_wall_decisions_by_pair,
+    )
+    return JSONResponse(content=sesiones.efectos_de(sesion, estado))
+
+
 @router.post("/nesting-preview")
 async def nesting_preview_endpoint(
     request: NestingPreviewRequest,
@@ -1086,38 +1238,15 @@ async def nesting_preview_endpoint(
         base = _load_phase1_for_request(request, db, credentials)
 
     try:
-        from core.pipeline import apply_review_edits
         from core.review_generate import compute_nesting
 
+        sesion = _sesion_de(request)
         with timer.step("apply_review_edits"):
-            rebuilt = apply_review_edits(
-                base,
-                axis=request.axis,
-                min_real_area=request.min_area_m2,
-                splits=[s.dict() for s in (request.splits or [])],
-            )
+            rebuilt = _modelo_revisado(sesion, base, request)
 
-        sheet = request.sheet_config
-        sheet_cfg = (
-            SheetConfig(
-                width_m=sheet.width_m,
-                height_m=sheet.height_m,
-                gap_m=sheet.gap_m,
-            )
-            if sheet
-            else SheetConfig(width_m=1.0, height_m=0.6, gap_m=0.003)
-        )
-        opts = PipelineOptions(
-            scale_denom=request.scale_denom,
-            paper=request.paper,
-            include_cutting_sheet=True,
-            sheet_config=sheet_cfg,
-            min_area_m2=request.min_area_m2,
-            page_mode=request.page_mode,
-            combine_sheets=request.combine_sheets,
-        )
+        opts = _opciones_de(request)
 
-        with timer.step("compute_nesting"):
+        with timer.step("compute_nesting"), sesiones.calculo_en_primer_plano():
             (
                 work, wall_nesting, floor_nesting, cfg, panel_id_by_group,
                 plate_joints, final_places, interferencias,
@@ -1134,9 +1263,8 @@ async def nesting_preview_endpoint(
                 ribs=request.ribs,
                 columns=request.columns,
                 decisiones_por_par=request.wall_wall_decisions_by_pair,
-                pista=_pista_para(request, request.scale_denom),
+                sesion=sesion["calculo"],
             )
-            _guardar_pista(request, request.scale_denom, work.resolucion)
 
         # Chequeo automático de ensamble: huecos/solapes/piezas sin apoyo (world coords),
         # para avisar ANTES de mandar a cortar. Vacío = ensamble verificado.
