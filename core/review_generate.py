@@ -39,7 +39,9 @@ from core.services.plate_intersect import (
 )
 from core.services.recorte_csg import (
     aplicar_destinos,
+    clave_de_recorte,
     construir_placa,
+    contenido_del_grupo,
     destinos_de_ajustes,
     paralela_ya_resuelta_que_la_pisa,
     registrar_final,
@@ -740,29 +742,57 @@ def decompose_panels_from_groups(
 
     # Placas para el motor booleano: marco 3D + contorno 2D de cada grupo, una sola vez.
     usar_caras(phase1.faces)
-    placas_csg: Dict[int, object] = cache.get("placas") if cache is not None else None
-    if placas_csg is None:
-        placas_csg = {}
-        for _g in phase1.groups:
-            if _effective_category(_g, overrides) == "discard":
-                continue
-            _pl = construir_placa(
-                _g, phase1.faces,
-                oriented_normals.get(_g.id, _g.representative_normal),
-            )
+    # Las placas se conservan POR CONTENIDO (las coordenadas de las caras del grupo y su
+    # normal), no por id ni por índices de cara: así sobreviven de un pedido al siguiente
+    # dentro de una sesión. Ni el id ni los índices alcanzan: dos fusiones distintas
+    # producen un grupo nuevo con EL MISMO id y EL MISMO índice de cara (el siguiente
+    # libre) y geometría distinta. Confundirlos cortaba la pieza de la otra fusión.
+    por_firma: Optional[Dict] = None
+    recortes: Optional[Dict] = None
+    if cache is not None:
+        por_firma = cache.setdefault("placas", {})
+        recortes = cache.setdefault("recortes", {})
+    placas_csg: Dict[int, object] = {}
+    for _g in phase1.groups:
+        if _effective_category(_g, overrides) == "discard":
+            continue
+        _n = oriented_normals.get(_g.id, _g.representative_normal)
+        # Sin el id: cuando el usuario fusiona dos piezas, los grupos que se funden solos
+        # por escala reciben OTRO id (el siguiente libre se corre) y son exactamente las
+        # mismas piezas. Con el id en la firma se recalculaban unas 85 piezas por una
+        # fusión que toca 4.
+        _firma = (
+            contenido_del_grupo(_g, phase1.faces, cache),
+            round(_n.x, 6), round(_n.y, 6), round(_n.z, 6),
+        )
+        _pl = por_firma.get(_firma, False) if por_firma is not None else False
+        if _pl is False:
+            _pl = construir_placa(_g, phase1.faces, _n)
             if _pl is not None:
-                placas_csg[_g.id] = _pl
-        if cache is not None:
-            cache["placas"] = placas_csg
-    else:
-        # Mismas placas que el armado anterior: se olvida lo que SÍ depende de las
-        # decisiones (el contorno resuelto) y se conserva lo que no (las huellas).
-        for _pl in placas_csg.values():
+                _pl.firma = _firma
+            if por_firma is not None:
+                por_firma[_firma] = _pl
+        elif _pl is not None:
+            # Misma placa que en un armado anterior: se olvida lo que SÍ depende de las
+            # decisiones (el contorno resuelto) y se conserva lo que no (las huellas).
             _pl.poly_final = None
             _pl.crecio = False
+            _pl.group_id = _g.id      # mismo contenido, pero el id es el de ESTE armado
+        if _pl is not None:
+            placas_csg[_g.id] = _pl
 
 
+    # Las placas no cambian durante el armado (sólo su contorno resuelto): la lista, el
+    # nombre de cada una y la identidad del conjunto se calculan una vez.
+    todas_las_placas = list(placas_csg.values())
+    firma_de_placa = {pl.group_id: pl.firma for pl in todas_las_placas}
+    universo = hash(tuple(pl.firma for pl in todas_las_placas)) if cache is not None else None
+    bordes: Dict = cache.setdefault("bordes", {}) if cache is not None else {}
+
+    cancelar = cache.get("cancelar") if cache else None
     for group in phase1.groups:
+        if cancelar is not None:
+            cancelar()          # cálculo en segundo plano: se abandona si llega un pedido
         cat = _effective_category(group, overrides)
         if cat == "discard":
             continue
@@ -772,9 +802,25 @@ def decompose_panels_from_groups(
         if not faces:
             continue
 
-        result = project_faces_to_2d(
-            faces, oriented_normals.get(group.id, group.representative_normal), "Y"
-        )
+        # La proyección cruda y el marco 3D dependen sólo de las caras del grupo y de su
+        # normal: no de la escala, ni de quién cede, ni de lo que haya decidido el
+        # usuario. Eran la mitad del costo de cada armado y el resolvedor arma varias
+        # veces por pedido. Se recuerdan por contenido, igual que las placas. Nadie los
+        # modifica: todo lo que sigue trabaja sobre copias.
+        normal_g = oriented_normals.get(group.id, group.representative_normal)
+        if cache is not None:
+            firma_g = (
+                contenido_del_grupo(group, phase1.faces, cache),
+                round(normal_g.x, 9), round(normal_g.y, 9), round(normal_g.z, 9),
+            )
+            proyecciones = cache.setdefault("proyecciones", {})
+            result = proyecciones.get(firma_g, False)
+            if result is False:
+                result = project_faces_to_2d(faces, normal_g, "Y")
+                proyecciones[firma_g] = result
+        else:
+            firma_g = None
+            result = project_faces_to_2d(faces, normal_g, "Y")
         if not result:
             continue
 
@@ -880,27 +926,48 @@ def decompose_panels_from_groups(
         if placa is not None and (
             ajustes_pieza
             or paralela_ya_resuelta_que_la_pisa(
-                placa, placas_csg.values(), espesor_edif
+                placa, todas_las_placas, espesor_edif
             )
         ):
             destinos = destinos_de_ajustes(
                 ajustes_pieza, placa, opts.scale_denom or 1.0, group_by_id
             )
-            res_csg = aplicar_destinos(
-                placa, destinos,
-                obstaculos=list(placas_csg.values()),
-                espesor_m=espesor_edif,
-                # Cede = el ajuste de ancho le QUITA la media placa (la que pasa la suma).
-                cede_ante={
-                    a.against_group_id for a in ajustes_pieza
-                    if a.axis == "width" and getattr(a, "delta_plate", 0.0) < 0
-                    and a.against_group_id is not None
-                },
-            )
+            # Cede = el ajuste de ancho le QUITA la media placa (la que pasa la suma).
+            cede_ante = {
+                a.against_group_id for a in ajustes_pieza
+                if a.axis == "width" and getattr(a, "delta_plate", 0.0) < 0
+                and a.against_group_id is not None
+            }
+            obstaculos = todas_las_placas
+            clave = None
+            if recortes is not None:
+                clave = clave_de_recorte(
+                    placa, destinos, obstaculos, espesor_edif, cede_ante,
+                    universo=universo, firma_de=firma_de_placa,
+                )
+                res_csg = recortes.get(clave, False)
+                if res_csg is False:
+                    res_csg = aplicar_destinos(
+                        placa, destinos, obstaculos=obstaculos,
+                        espesor_m=espesor_edif, cede_ante=cede_ante,
+                    )
+                    recortes[clave] = res_csg
+            else:
+                res_csg = aplicar_destinos(
+                    placa, destinos, obstaculos=obstaculos,
+                    espesor_m=espesor_edif, cede_ante=cede_ante,
+                )
             if res_csg is not None:
                 poly_csg, width_m, height_m, off_u, off_v = res_csg
                 registrar_final(placa, poly_csg)
-                edges = _poly_a_edges(poly_csg, off_u, off_v)
+                if clave is not None:
+                    # Mismo recorte, mismos bordes. La lista no se toca: lo que sigue
+                    # (espejado) crea bordes nuevos.
+                    edges = bordes.get(clave)
+                    if edges is None:
+                        edges = bordes[clave] = _poly_a_edges(poly_csg, off_u, off_v)
+                else:
+                    edges = _poly_a_edges(poly_csg, off_u, off_v)
                 clip_off_u += off_u
                 clip_off_v += off_v
 
@@ -980,9 +1047,14 @@ def decompose_panels_from_groups(
         # Marco 3D de la pieza YA RECORTADA, para que el instructivo dibuje lo que se
         # corta y no la proyección cruda del modelo. Sale del MISMO cálculo que la
         # plancha: no hay una segunda ruta que pueda discrepar.
-        marco = compute_group_placement(
-            faces, oriented_normals.get(group.id, group.representative_normal), "Y"
-        )
+        if firma_g is not None:
+            marcos = cache.setdefault("marcos", {})
+            marco = marcos.get(firma_g, False)
+            if marco is False:
+                marco = compute_group_placement(faces, normal_g, "Y")
+                marcos[firma_g] = marco
+        else:
+            marco = compute_group_placement(faces, normal_g, "Y")
         if marco is not None:
             marco = shift_placement(
                 marco, clip_off_u, clip_off_v, width_m, height_m,
@@ -1096,6 +1168,7 @@ def _una_placa_por_lugar(
     scale_denom: float,
     overrides: Optional[Dict[int, str]],
     wall_wall_decisions: Optional[Dict[int, int]],
+    cache: Optional[Dict] = None,
 ) -> Tuple[Phase1Result, Optional[Dict[int, int]]]:
     """Funde los grupos paralelos que a esta escala son la misma placa de MDF.
 
@@ -1117,6 +1190,7 @@ def _una_placa_por_lugar(
             work.groups, work.faces, scale_denom,
             lambda g: _effective_category(g, overrides),
             orient_group_normals_outward(work.groups),
+            cache=cache,
         )
     except Exception:
         import logging
@@ -1329,8 +1403,17 @@ def _decompose(
     decisiones_por_par: Optional[List[dict]] = None,
     resolver: bool = True,
     pista: Optional[Dict] = None,
+    sesion: Optional[Dict] = None,
 ) -> Tuple[Phase1Result, List[Panel], List[Panel], List]:
     """Aplica merges, resuelve encastres 3D y descompone a paneles 2D.
+
+    `sesion` es un diccionario que el llamador conserva entre pedidos sobre el MISMO
+    modelo, escala y cortes del usuario (ver `nueva_sesion`). Con ella una acción del
+    usuario deja de ser "recalcular el modelo": se reusan las placas, el recorte de cada
+    pieza cuyos datos no cambiaron y lo ya medido entre piezas que siguen igual. El
+    resultado es idéntico al del cálculo completo. Además fija las ETIQUETAS: una pieza conserva la suya
+    aunque otras se fusionen o se descarten. Sin sesión todo se calcula de cero y las
+    etiquetas son correlativas, como siempre.
 
     `pista` es el `resolucion` de una corrida ANTERIOR sobre el mismo modelo y la misma
     escala (lo conserva la API entre un pedido y el siguiente). El resolvedor arranca de
@@ -1342,9 +1425,11 @@ def _decompose(
     queda con la que el verificador mide mejor. Lo que resolvió queda en
     `work.resolucion`.
     """
+    cache_de_armado: Dict = sesion.setdefault("armado", {}) if sesion is not None else {}
     work = apply_merges(phase1, merges or [], overrides)
     work, wall_wall_decisions = _una_placa_por_lugar(
-        work, opts.scale_denom or 1.0, overrides, wall_wall_decisions
+        work, opts.scale_denom or 1.0, overrides, wall_wall_decisions,
+        cache=cache_de_armado if sesion is not None else None,
     )
     work, wall_wall_decisions = _fusiones_pendientes_del_usuario(
         work, merges, overrides, wall_wall_decisions
@@ -1353,9 +1438,37 @@ def _decompose(
         work, wall_wall_decisions, decisiones_por_par
     )
 
-    cache_de_armado: Dict = {}
+    # Con sesión NO se usa pista. La pista hace que el resolvedor parta de lo que resolvió
+    # en otro estado, y con eso el resultado depende del camino: medido sobre un modelo de
+    # 295 piezas, la misma fusión daba 208 piezas verificadas calculada de cero y 206
+    # viniendo del estado anterior. Un resultado que depende del orden de los clics no se
+    # puede guardar ni prever, y la plancha podría no ser la que el usuario revisó. La
+    # sesión consigue la velocidad de otra manera (no recalcula las piezas que no
+    # cambian) y devuelve EXACTAMENTE lo mismo que el cálculo completo.
+    if sesion is not None:
+        pista = None
+
+    # Etiquetas de referencia: las que tiene cada pieza SIN acciones del usuario. Si este
+    # pedido no trae fusiones ni descartes, salen de este mismo armado; si trae, hay que
+    # calcularlas una vez (queda guardado en la sesión).
+    etiquetas_base: Optional[Dict[int, List[str]]] = None
+    if sesion is not None:
+        etiquetas_base = sesion.get("etiquetas")
+        if etiquetas_base is None and (merges or overrides):
+            _w, m0, p0, _pj = _decompose(
+                phase1, opts, None, None, None, marks, user_cuts, flex, mark_lines,
+                ribs, columns, resolver=False,
+                sesion={"armado": cache_de_armado, "etiquetas": {}},
+            )
+            etiquetas_base = _etiquetas_de(m0, p0)
+            sesion["etiquetas"] = etiquetas_base
 
     def armar(decisiones: Optional[Dict[int, int]]):
+        # Un cálculo en segundo plano se abandona si llega un pedido del usuario: quien
+        # conserva la sesión deja acá una función que levanta una excepción en ese caso.
+        cancelar = cache_de_armado.get("cancelar")
+        if cancelar is not None:
+            cancelar()
         """Decisiones -> piezas. Es la parte que depende de quién cede; todo lo de
         arriba (fusiones, traducción de decisiones) se hace una sola vez."""
         # ORDEN IMPORTANTE: primero se decide quién cede en cada junta, y recién después
@@ -1381,6 +1494,8 @@ def _decompose(
             user_cuts, flex, mark_lines, ribs, columns,
             adj_result=adj, cache=cache_de_armado,
         )
+        if etiquetas_base:
+            _aplicar_etiquetas(muros, pisos, etiquetas_base)
         return adj, muros, pisos, pjs
 
     resolucion = None
@@ -1390,6 +1505,9 @@ def _decompose(
         try:
             resultado, resolucion, uniones_medidas = _resolver_uniones(
                 work, opts.scale_denom or 1.0, wall_wall_decisions, armar, pista,
+                cache_de_medicion=(
+                    sesion.setdefault("medicion", {}) if sesion is not None else None
+                ),
             )
         except Exception:
             import logging
@@ -1401,6 +1519,10 @@ def _decompose(
         resultado = armar(wall_wall_decisions)
         resolucion = uniones_medidas = None
     adj_result, wall_panels, floor_panels, plate_joints = resultado
+    if sesion is not None:
+        if sesion.get("etiquetas") is None:
+            # Pedido sin acciones del usuario: sus etiquetas SON las de referencia.
+            sesion["etiquetas"] = _etiquetas_de(wall_panels, floor_panels)
 
     # Una decisión que no se pudo aplicar tiene que llegar al usuario. Es su elección
     # sobre quién cede en una esquina; si se descarta en silencio, la pieza sale sin el
@@ -1486,7 +1608,57 @@ def _puntaje(uniones) -> Tuple[int, int, float]:
     return (no_arma, otras, round(mm, 3))
 
 
-def _resolver_uniones(work, scale_denom, decisiones_usuario, armar, pista=None):
+def nueva_sesion() -> Dict:
+    """Sesión vacía para `_decompose`. Vale para UN modelo, UNA escala y unos cortes
+    manuales dados: quien la conserva es responsable de no mezclarla con otros."""
+    return {}
+
+
+def _etiquetas_de(muros: List[Panel], pisos: List[Panel]) -> Dict[int, List[str]]:
+    """`id de grupo -> etiquetas de sus piezas`, en el orden en que salieron."""
+    out: Dict[int, List[str]] = {}
+    for p in list(muros) + list(pisos):
+        if p.source_group_id is not None and p.source_group_id >= 0:
+            out.setdefault(p.source_group_id, []).append(p.id)
+    return out
+
+
+def _aplicar_etiquetas(muros: List[Panel], pisos: List[Panel], base: Dict[int, List[str]]) -> None:
+    """Le devuelve a cada pieza la etiqueta que tenía en el armado de referencia.
+
+    Las etiquetas son correlativas (A1, A2, …) en el orden en que salen las piezas. Si el
+    usuario descarta una pieza o fusiona dos, todas las que venían después se corrían un
+    lugar: la que estaba mirando como A84 pasaba a ser A83, en el visor y en la plancha.
+
+    Acá cada grupo conserva la etiqueta de referencia. La pieza que desaparece deja un
+    hueco en la numeración. Una pieza que en la referencia no existía (un descartado que
+    el usuario rescata, un grupo que cambió de categoría) recibe un número nuevo, después
+    del último usado, para no chocar con ninguna.
+    """
+    ultimo = {"A": 0, "B": 0}
+    for etiquetas in base.values():
+        for e in etiquetas:
+            if e[:1] in ultimo and e[1:].isdigit():
+                ultimo[e[:1]] = max(ultimo[e[:1]], int(e[1:]))
+    for lista, prefijo in ((muros, "A"), (pisos, "B")):
+        vistos: Dict[int, int] = {}
+        for p in lista:
+            gid = p.source_group_id
+            if gid is None or gid < 0:
+                continue                      # refuerzos (R#, C#): numeración propia
+            propias = [e for e in base.get(gid, []) if e.startswith(prefijo)]
+            k = vistos.get(gid, 0)
+            vistos[gid] = k + 1
+            if k < len(propias):
+                p.id = propias[k]
+            else:
+                ultimo[prefijo] += 1
+                p.id = f"{prefijo}{ultimo[prefijo]}"
+
+
+def _resolver_uniones(
+    work, scale_denom, decisiones_usuario, armar, pista=None, cache_de_medicion=None,
+):
     """Prueba la decisión contraria donde la sugerida no cierra, y conserva lo que mejora.
 
     Por qué existe
@@ -1528,7 +1700,8 @@ def _resolver_uniones(work, scale_denom, decisiones_usuario, armar, pista=None):
     from core.services.verificacion_uniones import verificar_uniones
 
     previstos, apoyos = _pares_a_verificar(work)
-    cache_de_medicion: Dict = {}
+    if cache_de_medicion is None:
+        cache_de_medicion = {}
 
     def medir(resultado):
         _adj, muros, pisos, _pjs = resultado
@@ -1795,6 +1968,7 @@ def compute_nesting(
     columns: Optional[List[dict]] = None,
     decisiones_por_par: Optional[List[dict]] = None,
     pista: Optional[Dict] = None,
+    sesion: Optional[Dict] = None,
 ) -> Tuple[Phase1Result, NestingResult, NestingResult, SheetConfig, Dict[int, str], List, Dict[str, Dict], List]:
     """Descompone y anida paneles. Compartido por /generate y /nesting-preview.
 
@@ -1803,7 +1977,7 @@ def compute_nesting(
     work, wall_panels, floor_panels, plate_joints = _decompose(
         phase1, opts, overrides, wall_wall_decisions, merges, marks,
         user_cuts, flex, mark_lines, ribs, columns,
-        decisiones_por_par=decisiones_por_par, pista=pista,
+        decisiones_por_par=decisiones_por_par, pista=pista, sesion=sesion,
     )
     work = replace(
         work,
@@ -1860,6 +2034,47 @@ def compute_nesting(
         # ambas cosas: a escalas gruesas la placa ocupa más edificio y aparecen choques
         # que a escalas finas no existen.
         _verificar(work, wall_panels, floor_panels, plate_joints, opts.scale_denom or 1.0),
+    )
+
+
+def compute_verificacion(
+    phase1: Phase1Result,
+    opts: PipelineOptions,
+    overrides: Optional[Dict[int, str]] = None,
+    wall_wall_decisions: Optional[Dict[int, int]] = None,
+    merges: Optional[List[List[int]]] = None,
+    marks: Optional[List[int]] = None,
+    user_cuts: Optional[List[dict]] = None,
+    flex: Optional[List[dict]] = None,
+    mark_lines: Optional[List[dict]] = None,
+    ribs: Optional[List[dict]] = None,
+    columns: Optional[List[dict]] = None,
+    decisiones_por_par: Optional[List[dict]] = None,
+    pista: Optional[Dict] = None,
+    sesion: Optional[Dict] = None,
+) -> Tuple[Phase1Result, Dict[int, str], List, Dict[str, Dict]]:
+    """Lo que cambia cuando el usuario toma una decisión, y nada más.
+
+    Es `compute_nesting` sin acomodar las piezas en planchas y sin el verificador viejo
+    por muestreo: quien está resolviendo un nudo necesita ver las piezas y el reporte, no
+    la plancha. Devuelve `(work con .verificacion, etiqueta por grupo, encastres,
+    placements)`.
+    """
+    work, wall_panels, floor_panels, plate_joints = _decompose(
+        phase1, opts, overrides, wall_wall_decisions, merges, marks,
+        user_cuts, flex, mark_lines, ribs, columns,
+        decisiones_por_par=decisiones_por_par, pista=pista, sesion=sesion,
+    )
+    escala = opts.scale_denom or 1.0
+    work = replace(
+        work,
+        verificacion=reporte_de_verificacion(work, wall_panels, floor_panels, escala),
+    )
+    return (
+        work,
+        panel_ids_by_group(wall_panels, floor_panels),
+        plate_joints,
+        final_placements(wall_panels, floor_panels, escala),
     )
 
 
@@ -2045,11 +2260,12 @@ def generate_from_review(
     decisiones_por_par: Optional[List[dict]] = None,
     bloquear_si_no_arma: bool = False,
     pista: Optional[Dict] = None,
+    sesion: Optional[Dict] = None,
 ) -> List[OutputFile]:
     work, wall_nesting, floor_nesting, sheet_cfg, _, _, _, _ = compute_nesting(
         phase1, opts, overrides, wall_wall_decisions, merges, marks,
         user_cuts, flex, mark_lines, ribs, columns,
-        decisiones_por_par=decisiones_por_par, pista=pista,
+        decisiones_por_par=decisiones_por_par, pista=pista, sesion=sesion,
     )
     # Pedido original del usuario: si una unión no tiene solución, frenar ANTES de
     # entregar el archivo de corte, y sólo seguir si quien genera lo fuerza a conciencia.
