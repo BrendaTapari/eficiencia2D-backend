@@ -83,8 +83,16 @@ def snap3(v: float) -> float:
 
 
 def r_str(n: float) -> str:
-    # Evitar notación científica y limitar a 4 decimales
-    return f"{n:.4f}".rstrip("0").rstrip(".") if "." in f"{n:.4f}" else f"{n:.4f}"
+    # Evitar notación científica y limitar a 6 decimales.
+    #
+    # Eran 4. El DXF va en METROS de plancha, así que 4 decimales son décimas de
+    # milímetro: cada coordenada se redondeaba hasta 0.05 mm y una pieza podía salir hasta
+    # 0.1 mm más larga o más corta que la calculada (medido: una pieza de 31.357 mm se
+    # dibujaba de 31.3). La holgura de encastre es de 0.1 mm y el verificador da por buena
+    # una unión hasta 0.2 mm: el redondeo solo se comía la mitad. Con 6 decimales es
+    # 1 micrón. Lo vigila `test_api.test_visor_instructivo_plancha_y_dxf_son_las_mismas_piezas`.
+    t = f"{n:.6f}"
+    return t.rstrip("0").rstrip(".") if "." in t else t
 
 
 MIN_HOLE_AREA = 0.0025
