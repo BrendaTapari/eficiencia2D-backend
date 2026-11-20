@@ -560,7 +560,11 @@ def test_el_resolvedor_no_empeora_ni_toca_lo_que_decidio_el_usuario():
     def correr(**kw):
         work, muros, pisos, _ = _decompose(p1, opts, None, None, None, None, **kw)
         previstos, apoyos = _pares_a_verificar(work)
-        return work, _puntaje(verificar_uniones(muros + pisos, 100.0, previstos, apoyos))
+        # Con la misma medición que usa el resolvedor (la parte más grande de cada pieza):
+        # lo que se prueba acá es que su puntaje interno sea el que dice.
+        return work, _puntaje(verificar_uniones(
+            muros + pisos, 100.0, previstos, apoyos, todas_las_partes=False,
+        ))
 
     _w0, sin = correr(resolver=False)
     work, con = correr()
