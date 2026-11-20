@@ -134,7 +134,9 @@ def _estado(medida_mm: float, tope: str = "no_arma") -> str:
     return "no_arma"
 
 
-def _placas(panels: Iterable[Panel], vistas: Optional[Dict] = None) -> List[_Placa]:
+def _placas(
+    panels: Iterable[Panel], vistas: Optional[Dict] = None, todas_las_partes: bool = True,
+) -> List[_Placa]:
     """`vistas` recuerda la placa ya armada de cada pieza por su CONTENIDO (etiqueta,
     contorno y marco): el resolvedor mide el conjunto varias veces por pedido y casi todas
     las piezas son las mismas de una vez a la otra."""
@@ -143,11 +145,11 @@ def _placas(panels: Iterable[Panel], vistas: Optional[Dict] = None) -> List[_Pla
         if not p.frame or p.source_group_id is None or p.source_group_id < 0:
             continue  # refuerzos sueltos: se pegan a mano, no tienen lugar fijo
         if vistas is None:
-            pl = _placa_de(p)
+            pl = _placa_de(p, todas_las_partes)
         else:
             m = p.frame
             clave = (
-                p.id, p.source_group_id, p.category,
+                todas_las_partes, p.id, p.source_group_id, p.category,
                 tuple(
                     (e.a.x, e.a.y, e.b.x, e.b.y) for e in p.edges
                     if not getattr(e, "flex", False)
@@ -158,16 +160,26 @@ def _placas(panels: Iterable[Panel], vistas: Optional[Dict] = None) -> List[_Pla
             if pl is _SIN_MEDIR:
                 if len(vistas) > 20000:
                     vistas.clear()
-                pl = vistas[clave] = _placa_de(p)
+                pl = vistas[clave] = _placa_de(p, todas_las_partes)
         if pl is not None:
             out.append(pl)
     return out
 
 
-def _placa_de(p: Panel) -> Optional[_Placa]:
+def _placa_de(p: Panel, todas_las_partes: bool = True) -> Optional[_Placa]:
     import numpy as np
 
-    poly = _edges_to_polygon([e for e in p.edges if not getattr(e, "flex", False)])
+    aristas = [e for e in p.edges if not getattr(e, "flex", False)]
+    if todas_las_partes:
+        # TODAS las partes de la pieza, con sus huecos. `_edges_to_polygon` (el de la
+        # plancha) se queda sólo con la parte más grande: una pieza fusionada de varios
+        # tramos o una losa de dos paños se verificaba a medias. Medido en un modelo real:
+        # 7 piezas y 11 m² de material que el verificador no veía; de una pieza, el 68 %.
+        from core.review_generate import _material_de_la_pieza
+
+        poly = _material_de_la_pieza(aristas)
+    else:
+        poly = _edges_to_polygon(aristas)
     if poly is None or poly.is_empty or poly.area <= 1e-9:
         return None
     m = p.frame
@@ -434,6 +446,8 @@ def verificar_uniones(
     pares_previstos: Optional[Set[Tuple[int, int]]] = None,
     pares_de_apoyo: Optional[Set[Tuple[int, int]]] = None,
     cache: Optional[Dict] = None,
+    todas_las_partes: bool = True,
+    solo_piezas: Optional[Set[str]] = None,
 ) -> List[Union]:
     """Estado de cada unión entre las piezas que se van a cortar.
 
@@ -455,6 +469,11 @@ def verificar_uniones(
 
     Devuelve TODAS las uniones evaluadas, incluidas las que encajan: el que consume esto
     tiene que poder decir "287 de 295 verificadas", no sólo listar las que fallan.
+
+    `todas_las_partes=False` mide sólo la parte más grande de cada pieza, como antes. Lo
+    usa el resolvedor de uniones para que las piezas que se cortan no cambien; el reporte
+    mide con todas. `solo_piezas` limita la medición a los pares en los que interviene
+    alguna de esas etiquetas.
     """
     pares_previstos = pares_previstos or set()
     pares_de_apoyo = (pares_de_apoyo or set()) - pares_previstos
@@ -463,12 +482,17 @@ def verificar_uniones(
     a_mm = 1000.0 / escala                        # de metros de edificio a mm de plancha
     margen = espesor * (0.5 + ALCANCE_PLACAS)
 
-    pz = _placas(panels, cache.setdefault("placas", {}) if cache is not None else None)
+    pz = _placas(
+        panels, cache.setdefault("placas", {}) if cache is not None else None,
+        todas_las_partes,
+    )
     out: List[Union] = []
     for i in range(len(pz)):
         A = pz[i]
         for j in range(i + 1, len(pz)):
             B = pz[j]
+            if solo_piezas is not None and A.id not in solo_piezas and B.id not in solo_piezas:
+                continue
             if ((A.hi + margen) < (B.lo - margen)).any() or ((B.hi + margen) < (A.lo - margen)).any():
                 continue
             clave = pair_key(A.gid, B.gid)
