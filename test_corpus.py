@@ -707,8 +707,13 @@ def test_el_instructivo_muestra_exactamente_lo_que_se_corta(path, scale):
 # A 1:50 hay 6 uniones menos y no es que se hayan dejado de medir: eran contactos con
 # material que no existe. Cuatro muros se cortaban con sus ventanas rellenas, y lo que
 # pasaba por delante de una ventana "tocaba" el muro. Piezas verificadas 24 -> 26.
+#   (64, 60, 1, 3)  (69, 63, 2, 4)   + el reporte ve todas las partes de cada pieza
+#
+# A 1:50 aparece una unión que no arma y NO es un empeoramiento: las piezas son idénticas.
+# A19 se corta en dos partes y el verificador sólo miraba la más grande; la otra choca.
+# Juzgadas las dos versiones con el verificador completo dan lo mismo.
 LINEA_BASE_VEREDICTO = {
-    "demo.obj": {50.0: (63, 60, 1, 2, 14), 100.0: (69, 63, 2, 4, 10)},
+    "demo.obj": {50.0: (64, 60, 1, 3, 14), 100.0: (69, 63, 2, 4, 10)},
 }
 
 
