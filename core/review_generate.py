@@ -1853,9 +1853,12 @@ def _resolver_uniones(
 
     def medir(resultado):
         _adj, muros, pisos, _pjs = resultado
+        # Con la parte más grande de cada pieza, como siempre: así las decisiones del
+        # resolvedor, y por lo tanto las piezas que se cortan, no cambian. El reporte
+        # vuelve a medir con todas las partes (ver `reporte_de_verificacion`).
         return verificar_uniones(
             list(muros) + list(pisos), scale_denom, previstos, apoyos,
-            cache=cache_de_medicion,
+            cache=cache_de_medicion, todas_las_partes=False,
         )
 
     fijas = {
@@ -2130,7 +2133,8 @@ def compute_nesting(
     work = replace(
         work,
         verificacion=reporte_de_verificacion(
-            work, wall_panels, floor_panels, opts.scale_denom or 1.0
+            work, wall_panels, floor_panels, opts.scale_denom or 1.0,
+            sesion.setdefault("armado", {}) if sesion is not None else None,
         ),
     )
 
@@ -2216,7 +2220,10 @@ def compute_verificacion(
     escala = opts.scale_denom or 1.0
     work = replace(
         work,
-        verificacion=reporte_de_verificacion(work, wall_panels, floor_panels, escala),
+        verificacion=reporte_de_verificacion(
+            work, wall_panels, floor_panels, escala,
+            sesion.setdefault("armado", {}) if sesion is not None else None,
+        ),
     )
     return (
         work,
@@ -2226,7 +2233,9 @@ def compute_verificacion(
     )
 
 
-def reporte_de_verificacion(work, wall_panels, floor_panels, scale_denom) -> Optional[Dict]:
+def reporte_de_verificacion(
+    work, wall_panels, floor_panels, scale_denom, cache: Optional[Dict] = None,
+) -> Optional[Dict]:
     """Reporte por unión de las piezas que se van a cortar (ver `reporte_verificacion`).
 
     Igual que `_verificar`, no puede tumbar la generación: si falla devuelve None y el
@@ -2238,11 +2247,24 @@ def reporte_de_verificacion(work, wall_panels, floor_panels, scale_denom) -> Opt
 
         piezas = list(wall_panels) + list(floor_panels)
         uniones = getattr(work, "uniones_medidas", None)
+        previstos, apoyos = _pares_a_verificar(work)
         if uniones is None:
-            # No pasó por el resolvedor (o falló): se mide acá. Si pasó, ésta es la misma
-            # medición con la que el resolvedor eligió, y repetirla era un 20% del tiempo.
-            previstos, apoyos = _pares_a_verificar(work)
+            # No pasó por el resolvedor (o falló): se mide acá, con todas las partes.
             uniones = verificar_uniones(piezas, scale_denom, previstos, apoyos)
+        else:
+            # Pasó por el resolvedor, que mide sólo la parte más grande de cada pieza. Se
+            # reusa esa medición salvo en los pares donde interviene una pieza de VARIAS
+            # partes, que se vuelven a medir enteras: son pocas, y antes el reporte no
+            # veía el resto de su material.
+            varias = _piezas_de_varias_partes(piezas)
+            if varias:
+                uniones = [
+                    u for u in uniones if u.pieza_a not in varias and u.pieza_b not in varias
+                ] + verificar_uniones(
+                    piezas, scale_denom, previstos, apoyos,
+                    cache=cache.setdefault("medicion_completa", {}) if cache is not None else None,
+                    solo_piezas=varias,
+                )
         cede = {
             pair_key(j.group_a, j.group_b): j.yield_group_id
             for j in work.wall_wall_joints
@@ -2262,7 +2284,7 @@ def reporte_de_verificacion(work, wall_panels, floor_panels, scale_denom) -> Opt
                 and _floor_between(mayor, menor, losas, work.faces) is None
             )
 
-        return construir_reporte(
+        reporte = construir_reporte(
             piezas, uniones, scale_denom, cede,
             {g.id: g.category for g in work.groups},
             puede_fusionar=puede_fusionar,
@@ -2270,10 +2292,42 @@ def reporte_de_verificacion(work, wall_panels, floor_panels, scale_denom) -> Opt
             pares_decididos_por_el_usuario={tuple(p) for p in (work.pares_decididos or [])},
             espesor_modelo={g.id: float(g.thickness or 0.0) for g in work.groups},
         )
+        return _con_huecos(reporte, piezas, scale_denom, cache)
     except Exception:
         import logging
         logging.getLogger("eficiencia2d.pipeline").exception("reporte_de_verificacion falló")
         return None
+
+
+def _piezas_de_varias_partes(piezas) -> set:
+    """Etiquetas de las piezas cuyo material tiene más de una parte."""
+    out = set()
+    for p in piezas:
+        aristas = [e for e in p.edges if not getattr(e, "flex", False)]
+        m = _material_de_la_pieza(aristas) if aristas else None
+        if m is not None and len(getattr(m, "geoms", [m])) > 1:
+            out.add(p.id)
+    return out
+
+
+def _con_huecos(reporte: Dict, piezas, scale_denom, cache: Optional[Dict]) -> Dict:
+    """Agrega al reporte los HUECOS que quedan en la maqueta (ver
+    `core.services.sospechas_modelo`). Son avisos aparte: no cambian el veredicto ni
+    ninguna pieza. Si fallan, el reporte sale igual, sin la lista."""
+    try:
+        from core.services.sospechas_modelo import detectar_huecos
+
+        huecos = detectar_huecos(
+            piezas, scale_denom,
+            cache.setdefault("huecos", {}) if cache is not None else None,
+        )
+    except Exception:
+        import logging
+        logging.getLogger("eficiencia2d.pipeline").exception("detectar_huecos falló")
+        return reporte
+    reporte["huecos"] = huecos
+    reporte["resumen"]["huecos"] = len(huecos)
+    return reporte
 
 
 class EnsambleNoArma(Exception):
