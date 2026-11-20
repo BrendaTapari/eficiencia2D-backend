@@ -1,6 +1,9 @@
 # Contrato backend → front: verificación de la maqueta (versión 2)
 
-Estado del backend: implementado y con tests (`test_verificacion.py`, `test_corpus.py`).
+Estado del backend: implementado y con tests (`test_verificacion.py`, `test_corpus.py`
+y, de punta a punta por HTTP, `test_api.py`).
+
+**Lo primero que hay que hacer está en §0.**
 
 **Compatibilidad con la versión 1:** no se quitó ni se renombró ninguna clave. Un front que
 ya lee `resumen`, `piezas`, `problemas` y `uniones` sigue funcionando; va a ver menos
@@ -23,16 +26,153 @@ nombre viejo, hay que renombrarlo.
 
 ---
 
+## 0. CAMBIO URGENTE: qué pedir después de cada botón
+
+**Después de que el usuario toca una acción, pedir `POST /api/verificacion`. No pedir
+`/recompute` ni `/nesting-preview`.** Es lo que hacía aparecer "El backend no respondió a
+tiempo": esos dos pedidos tardaban 16 a 43 s y devolvían hasta 121 MB.
+
+| Momento | Pedido |
+|---|---|
+| Se carga el modelo o cambia eje / área mínima / divisiones | `/upload`, `/recompute` (como hoy) |
+| Se abre el instructivo, o cambia la escala | `/verificacion` |
+| **El usuario toca una acción (fusionar, no cortar, invertir, deshacer)** | **`/verificacion`** |
+| Se abre la pantalla de planchas | `/nesting-preview` (como hoy) |
+| Generar | `/generate` (como hoy) |
+
+Medido de punta a punta sobre un modelo de 295 piezas a 1:100:
+
+| Pedido | Tiempo | Tamaño |
+|---|---|---|
+| `/verificacion`, primera vez para ese modelo y escala | 9 a 19 s | 1 MB |
+| `/verificacion` después de un clic cuyo efecto ya estaba previsto (§3.2) | **menos de 0.3 s** | 1 MB |
+| `/verificacion` después de un clic todavía no previsto | 4 a 8 s | 1 MB |
+| `/verificacion` volviendo a un estado anterior (Deshacer) | menos de 0.3 s | 1 MB |
+
+**Subir el tiempo de espera del front a 60 s** para `/verificacion`, `/nesting-preview`,
+`/recompute` y `/generate`. El primer pedido de un modelo grande sigue tardando.
+
+### 0.1 `POST /api/verificacion`
+
+**Cuerpo:** exactamente el mismo que `/nesting-preview` (`file_id` o `proyecto_id`,
+`scale_denom`, `min_area_m2`, `axis`, `splits`, `overrides`, `merges`,
+`wall_wall_decisions`, `wall_wall_decisions_by_pair`, `marks`, `user_cuts`, `flex`,
+`mark_lines`, `ribs`, `columns`…). Los campos de plancha se ignoran.
+
+**Respuesta:**
+
+```jsonc
+{
+  "verificacion": { … },            // §2. Reemplazar la anterior entera.
+  "placements": { "245": { … } },   // piezas YA RECORTADAS, igual que /nesting-preview
+  "panel_id_by_group": { "245": "A84" },   // etiqueta de cada grupo (ESTABLE, §0.2)
+  "absorbed_groups": { "301": 245 },
+  "warnings": [ "…" ],
+  "plate_thickness_m": 0.3,
+  "plate_joints": [ … ],
+  "efectos": { "listo": false, "calculadas": 3, "total": 18, "efectos": { … } },  // §3.2
+  "servidor": { "ms": 4715, "ya_calculada": false, "espera_ms": 473 }   // diagnóstico
+}
+```
+
+No trae caras del modelo ni planchas: las caras no cambian con una acción (usar las de
+`/upload`) y la plancha se pide cuando el usuario va a esa pantalla.
+
+`verificacion`, `placements` y `absorbed_groups` son **idénticos** a los que devolvería
+`/nesting-preview` para el mismo cuerpo. Hay una prueba automática que lo comprueba.
+
+### 0.2 Las etiquetas ya no se renumeran
+
+Una pieza conserva su etiqueta aunque el usuario fusione o descarte otras: si descarta
+`A14`, la `A15` sigue siendo `A15` (queda un hueco en la numeración). Vale para
+`/verificacion`, `/nesting-preview` y `/generate`: la etiqueta que el usuario ve en el
+instructivo es la que sale grabada en la plancha.
+
+- Una pieza que nace de una fusión conserva la etiqueta de una de las dos; la otra
+  etiqueta desaparece.
+- Una pieza que no existía antes (un descartado que el usuario rescata) recibe un número
+  nuevo, después del último.
+- Las etiquetas **sí** cambian con la escala, el eje, el área mínima y las divisiones.
+- Después de una acción usar `panel_id_by_group` de `/verificacion`. El de `/recompute`
+  no conoce esta numeración: no mezclarlos.
+
+### 0.3 Lo que se cambia en el visor 3D tiene que llegar al instructivo
+
+El instructivo refleja las fusiones, reclasificaciones y descartes hechos en el visor
+**sólo si el pedido los trae**. `/verificacion`, `/nesting-preview`, `/generate` y
+`/recompute` tienen que recibir siempre el MISMO estado de revisión:
+
+- `merges`: todas las fusiones hechas en el visor, `[[id, id, …], …]`.
+- `overrides`: todas las reclasificaciones, `{"id": "wall" | "floor" | "discard"}`. Un
+  descartado que el usuario pasa a pared va como `"wall"`, no alcanza con quitarlo.
+- `wall_wall_decisions_by_pair`.
+
+Para comprobarlo sin adivinar, `/verificacion` devuelve cuánto recibió:
+
+```jsonc
+"servidor": { "recibido": { "overrides": 1, "merges": 1, "decisiones": 0 }, … }
+```
+
+Si el usuario fusionó algo en el visor y `recibido.merges` es 0, el front no lo mandó.
+
+**Piezas fusionadas.** Cuando se fusionan cuatro tramos, la pieza resultante conserva el
+id de UNO (el de mayor área). Los otros tres no tienen entrada en `placements`: figuran en
+`absorbed_groups` apuntando al que quedó.
+
+```jsonc
+"placements":      { "180": { … } },                       // la pieza fusionada, entera
+"absorbed_groups": { "179": 180, "236": 180, "181": 180 }  // están DENTRO de la 180
+```
+
+`absorbed_groups` ahora incluye las fusiones del usuario además de las automáticas por
+escala (antes sólo las automáticas: los tramos fusionados "desaparecían"). Regla para
+dibujar un grupo `g` en el instructivo:
+
+1. Si está en `placements` → dibujar ese placement.
+2. Si está en `absorbed_groups` → no dibujar nada propio: ya está dentro del placement
+   del grupo indicado. Al seleccionarlo, resaltar ese.
+3. Si no está en ninguno → no se corta (descartado, o más chico que el mínimo).
+
+**`/recompute` con `scale_denom`** devuelve en `topology` exactamente los mismos
+`placements`, `panel_id_by_group` y `absorbed_groups` que `/verificacion` para el mismo
+estado (antes los calculaba aparte y el visor podía llamar A13 a la pieza que la plancha
+llama A14). `topology.groups` sigue listando los grupos del modelo; para saber qué se
+corta, mirar `placements` y `absorbed_groups`.
+
+Una pieza fusionada puede estar formada por dos o tres contornos que no se tocan (tramos
+separados por un vano): se corta como varias partes con una sola etiqueta.
+
+### 0.4 Aberturas: ventanas abiertas y ventanas cerradas
+
+Las aberturas cerradas del modelo (ventanas, huecos de escalera) ahora salen **cortadas**
+en la pieza. Antes se perdían: `placements[..].outline` y la plancha traían el muro
+macizo. El front no tiene que cambiar nada para esto: los contornos ya traen las aristas
+con `hole: true`, sólo que ahora llegan.
+
+Excepción, con aviso: si el modelo tiene algo **dentro** del vano (un vidrio, una
+carpintería, los paños de un frente vidriado), ese elemento ocupa la misma placa que el
+muro y la abertura sale **cerrada**. Llega en `warnings`:
+
+> 5 abertura(s) salen CERRADAS: el modelo tiene algo dentro del vano (vidrios,
+> carpinterías, paños) y eso ocupa la misma placa que el muro. Para que salgan abiertas,
+> descartá esos elementos en el visor o quitalos del modelo. Pared Vertical - Norte #194: 4
+
+Conviene mostrar este aviso en el instructivo, no sólo en la pantalla de planchas: es la
+diferencia entre una maqueta con ventanas y una sin ventanas.
+
+---
+
 ## 1. Dónde llega
 
-`POST /nesting-preview` → clave `verificacion`.
+`POST /verificacion` → clave `verificacion` (también viene en `/nesting-preview`).
 
 - Es un objeto (§2) o `null`. `null` significa **"no se pudo verificar"**: estado gris,
   nunca verde.
 - Depende de la escala y de cada fusión, descarte o decisión: hay que volver a pedirlo.
-- **Tarda más que antes** en modelos grandes, porque ahora el backend prueba decisiones
-  por su cuenta. En un modelo de 300 piezas: unos 20 s (antes 7). Mostrar un estado de
-  "verificando" y no bloquear el resto de la pantalla.
+- El resultado depende **sólo** del estado enviado, no del orden en que el usuario tocó
+  los botones ni de lo que se pidió antes.
+- Cambiar de escala, o reiniciar el servidor, vuelve a ser un primer pedido (lento).
+- Mientras espera, **no dejar los botones grises sin explicación** (ver §3.1).
 
 `assembly_warnings` e `interferencias` siguen viniendo por compatibilidad y **no hay que
 mostrarlos**.
@@ -82,8 +222,8 @@ terminaciones no lo cambian.
 
 Titular sugerido, con los campos de `resumen`:
 
-> **206 de 295 piezas verificadas** · 50 lugares para mirar · 27 uniones resueltas
-> automáticamente · 68 avisos de terminación
+> **206 de 295 piezas verificadas** · 50 lugares para mirar (9 para decidir) · 27 uniones
+> resueltas automáticamente · 68 avisos de terminación
 
 ### 2.1 `piezas`
 
@@ -115,6 +255,7 @@ primero los que no arman y, dentro de eso, primero los que se resuelven con una 
   "peor_mm": 0.8,
   "peor_cm_edificio": 8.0,
   "piezas": ["A9", "A12"],
+  "grupos": [180, 245],
   "punto": { "x": 5.1393, "y": 0.6452, "z": 2.946 },
   "uniones": [38],
   "terminaciones": [],
@@ -133,6 +274,7 @@ primero los que no arman y, dentro de eso, primero los que se resuelven con una 
 | `titulo`, `quien_texto` | Texto listo para mostrar. |
 | `quien` | `decidir`, `escala` o `modelo`. Ver tabla de abajo. Sirve para separar la lista en tres bloques. |
 | `piezas` | Las piezas con problema en este lugar. Al abrir el nudo: mostrar **sólo éstas** en el 3D, en su posición, y ocultar el resto. |
+| `grupos` | Ids de grupo de esas piezas. **Las etiquetas (`A43`) se renumeran** cuando una pieza se fusiona o se descarta; los ids no. Para reconocer el mismo nudo antes y después de una acción, comparar `grupos`, no `piezas`. |
 | `punto` | Centro del nudo, en el espacio de `faces_packed` (Y arriba). Llevar la cámara acá. |
 | `uniones` | Índices en `verificacion.uniones` de lo que falla acá. |
 | `terminaciones` | Índices de uniones de canto en el mismo lugar. Son contexto, no problema. |
@@ -167,13 +309,20 @@ dibujar en un SVG o un canvas 2D, **sin** depender de la cámara 3D.
   },
   "placas": [
     { "pieza": "A9",  "grupo": 180, "estado": "no_arma",
-      "poligono": [[-0.0021, -0.15], [-0.0021, 0.15], [1.5, 0.15], [1.5, -0.15]] },
+      "poligono": [[-0.0021, -0.15], [-0.0021, 0.15], [1.5, 0.15], [1.5, -0.15]],
+      "centro": [0.7489, 0.0] },
     { "pieza": "A11", "grupo": 179, "estado": "contexto",
-      "poligono": [[-1.5, -0.0699], [-1.5, 0.2301], [-0.15, 0.2301], [-0.15, -0.0699]] }
+      "poligono": [[-1.5, -0.0699], [-1.5, 0.2301], [-0.15, 0.2301], [-0.15, -0.0699]],
+      "centro": [-0.825, 0.0801] }
   ],
   "solapes": [
     { "piezas": ["A9", "A12"],
       "poligono": [[-0.0021, -0.0699], [0.15, -0.0699], [0.15, -0.15], [-0.0021, -0.15]] }
+  ],
+  "cotas": [
+    { "union": 38, "tipo": "choque", "piezas": ["A9", "A12"],
+      "mm": 0.8, "cm_edificio": 8.0, "texto": "0.8 mm",
+      "desde": [0.0739, -0.15], "hasta": [0.0739, -0.0699] }
   ]
 }
 ```
@@ -191,7 +340,21 @@ Cómo dibujarlo:
 - `vista: "planta"` se mira desde arriba. En `vista: "corte"` el eje `b` apunta hacia
   arriba del edificio.
 - Para rotular en milímetros de plancha: `mm = metros × 1000 / escala`.
-- Escribir la etiqueta de cada pieza dentro de su rectángulo.
+- `placas[].centro`: dónde escribir la etiqueta de la pieza. Está dentro de su polígono y
+  el backend ya lo corre cuando dos placas montadas caerían en el mismo punto. Usarlo tal
+  cual en vez de calcular el centro.
+- `cotas`: una por cada unión con problema que se ve en este corte. Dibujar una línea de
+  cota de `desde` a `hasta` y un globo con `texto` al lado. Es lo que dice CUÁNTO.
+  - `texto` y `mm` salen de la medición exacta de la unión, no de medir el dibujo: no
+    recalcularlos a partir de `desde` y `hasta`.
+  - En un `choque` o en dos placas montadas, la línea marca el ancho de lo compartido. En
+    una `luz`, va de una placa a la otra.
+  - Si `desde` y `hasta` coinciden (en este corte las placas se tocan y la luz está en
+    otro punto de la unión), dibujar sólo el globo en ese punto.
+  - `union` es el índice en `verificacion.uniones`; `cm_edificio` es la misma medida para
+    quien corrige el modelo.
+- Las piezas vecinas que apenas rozan la ventana no se mandan: lo que llega se puede
+  dibujar y rotular sin filtrar nada.
 
 ### 2.3 `problemas`
 
@@ -253,12 +416,65 @@ Todas las uniones medidas, incluidas las que encajan. Campos nuevos respecto de 
 
 ---
 
+### 2.6 `huecos` — lo que el modelo deja abierto en la maqueta
+
+**Nuevo.** Lista aparte, con su cuenta en `resumen.huecos`. **No cambia el veredicto**: un
+modelo con huecos puede dar "listo".
+
+Por qué existe: el veredicto contesta "¿las piezas encajan tal como las une el modelo?".
+Si el modelo tiene un muro que no llega a la esquina, para el veredicto esas dos piezas no
+tienen por qué tocarse (podría ser un vano) y da "listo". En la maqueta queda el hueco.
+Esto lo avisa.
+
+```jsonc
+{
+  "id": 0,
+  "tipo": "hueco",
+  "piezas": ["A3", "A5"],        // las dos piezas que casi se tocan
+  "grupos": [84, 89],
+  "medida_cm_edificio": 10.0,     // separación entre las dos
+  "medida_mm": 2.0,               // la misma, en la maqueta
+  "largo_cm_edificio": 277.5,     // a lo largo de cuánto
+  "punto": {"x": 9.85, "y": 4.2, "z": 0.2},   // dónde, para la cámara
+  "texto": "A3 y A5 casi se tocan: queda un hueco de 10 cm (2.0 mm en la maqueta) a lo largo de 278 cm.",
+  "pregunta": "¿Tienen que encontrarse? Si es un error del modelo (un muro corto, una esquina abierta, un muro que no apoya), corregilo en el modelo: en la maqueta queda ese hueco."
+}
+```
+
+Ordenados del más grande al más chico (separación × largo).
+
+Cómo mostrarlo: una sección propia, **después** de los nudos, con el título "Huecos que
+quedan en la maqueta" y una línea de explicación: "Puede ser diseño (un vano, una junta) o
+un error del modelo. Revisalos antes de cortar". Al tocar uno: el 3D con las dos piezas y
+la cámara en `punto`. No hay acciones: se arregla en el modelo.
+
+Qué se avisa y qué no (medido con dos edificios armados con 16 errores a propósito):
+
+| Caso | ¿Se avisa? |
+|---|---|
+| Modelo correcto | No (0 avisos en todos los modelos de prueba, a 1:50 y 1:100) |
+| Muro corto, esquina abierta, tabique que no llega, muro levantado, muro corrido | Sí, si el hueco sobrevive en las piezas |
+| Hueco más chico que lo que cubre la placa a esa escala (5 cm a 1:100) | No: en la maqueta no queda hueco |
+| Error que el motor corrige solo (piel duplicada, losa unos cm corta) | No: la maqueta sale bien |
+| Error que las piezas reproducen tal cual y encajan (un muro corrido hacia adentro, un tabique sobre el hueco de la escalera) | No: no se puede saber si era la idea |
+| Hueco de menos de 50 cm de largo | No: son los encuentros de esquina |
+
+En un modelo grande real (`Prueba app.obj`, 295 piezas) da unos 100 avisos: no todos se
+pudieron revisar a mano. Conviene mostrarlos plegados con la cuenta en el título.
+
+---
+
 ## 3. Acciones
 
-Cada acción tiene `tipo`, `etiqueta` (texto del botón) y `aplicar`.
+Cada acción tiene `tipo`, `etiqueta` (texto del botón), `aplicar` e `id`.
 
-`aplicar` trae **las mismas claves que ya se mandan** a `/recompute`, `/nesting-preview` y
-`/generate`. Aplicar es fusionar ese objeto con el estado de la revisión y volver a pedir:
+`id` es un texto estable (`"3f9a1c0b7e2d"`) que identifica **el cambio**: la misma acción
+tiene el mismo `id` en cualquier nudo y en cualquier pedido. Es `null` en las acciones
+informativas. Sirve para buscar su efecto previsto (§3.2).
+
+`aplicar` trae **las mismas claves que ya se mandan** a `/verificacion`, `/nesting-preview`
+y `/generate`. Aplicar es fusionar ese objeto con el estado de la revisión y pedir
+`/verificacion` (§0):
 
 | Clave en `aplicar` | Cómo se fusiona |
 |---|---|
@@ -277,6 +493,88 @@ Tipos de acción:
 | `cambiar_escala` | `scale_denom` o `null` | Con valor: botón "Probar a 1:N". Con `null`: llevar al selector de escala. (En v1 se llamaba `escala_mas_fina`; ya no se emite.) |
 | `revisar_modelo` | `null` | Informativa: mostrar la medida en cm y las piezas. No modifica nada. |
 
+Las acciones que llegan son las que **sirven**:
+
+- `fusionar` sólo se ofrece si la fusión se va a aplicar. (Antes se ofrecía para tramos
+  separados por una losa, el backend la rechazaba y el problema volvía igual.)
+- `invertir_cede` sólo se ofrece en uniones que el backend **no** evaluó. Si no aparece,
+  invertir ya se probó y no mejora, o es una unión que el backend ya dejó invertida.
+- Una acción puede igual no mejorar el conjunto, o empeorarlo. El backend ahora la
+  **prueba en segundo plano** y avisa qué va a pasar antes de que el usuario la toque
+  (§3.2).
+
+### 3.1 Mientras se recalcula
+
+Aplicar una acción dispara un pedido que puede tardar varios segundos (§0). En ese lapso:
+
+1. Marcar **el botón tocado** con un indicador de progreso ("Recalculando…").
+2. Deshabilitar los demás botones de acción, pero con el mismo indicador visible en la
+   cabecera de la lista: que se entienda que el sistema está trabajando y no trabado.
+3. Si el pedido **falla o vence**, volver a habilitar todo y mostrar el error. No dejar
+   los botones grises.
+4. Cuando llega la respuesta, **reemplazar** `verificacion` entera. El nudo puede haber
+   desaparecido, cambiado de estado o seguir igual.
+5. Si el nudo sigue igual (mismos `grupos`, mismo `estado`), decirlo: "No cambió nada con
+   esa acción". Es mejor que dejar a la persona mirando una pantalla idéntica.
+
+Las etiquetas ya **no** se renumeran después de fusionar o descartar (§0.2).
+
+### 3.2 Efecto previsto de cada botón
+
+Apenas responde `/verificacion`, el backend empieza a calcular en segundo plano qué pasa
+con cada acción de los nudos **"para decidir"** (no las de cambiar de escala). Dos
+consecuencias:
+
+1. **El clic es inmediato**: cuando el usuario toca un botón cuyo efecto ya se calculó,
+   `/verificacion` responde en menos de 0.3 s (`servidor.ya_calculada: true`).
+2. **El botón puede decir qué va a pasar** antes de tocarlo.
+
+Los efectos llegan en `efectos` dentro de la respuesta de `/verificacion` (los que ya
+estén) y completos en:
+
+`POST /api/verificacion/efectos` — mismo cuerpo que `/verificacion`. No calcula nada,
+responde al instante. Consultar cada 1 a 2 s hasta que `listo` sea `true`.
+
+```jsonc
+{
+  "listo": false,          // true = ya están todos
+  "calculadas": 7,
+  "total": 18,
+  "efectos": {
+    "3f9a1c0b7e2d": {      // clave: accion.id
+      "resultado": "mejora",        // "mejora" | "igual" | "empeora" | "desconocido"
+      "este_lugar": "resuelto",     // "resuelto" | "sigue" | null
+      "texto": "Resuelve este lugar y 1 otro más",   // listo para mostrar
+      "veredicto": "no_arma",       // veredicto que quedaría
+      "uniones_no_arma": -1,        // diferencias contra el estado actual
+      "uniones_revisar": 0,
+      "nudos": -2,
+      "piezas_ok": 2
+    }
+  }
+}
+```
+
+Si llega `"sin_sesion": true`, todavía no se pidió `/verificacion` para ese modelo (o el
+servidor se reinició): pedirla.
+
+Cómo mostrarlo, debajo o al lado de cada botón:
+
+| `resultado` | Sugerencia |
+|---|---|
+| `mejora` | Texto en verde: "Resuelve este lugar". Si hay una sola acción que mejora, destacarla. |
+| `igual` | Texto gris: "No cambia el resultado…". |
+| `empeora` | Texto en rojo y botón atenuado (no deshabilitado): "Empeora: 2 uniones más no arman". |
+| sin entrada todavía | Nada, o un punto de carga. El botón funciona igual. |
+
+En el modelo de 295 piezas son 18 acciones y terminan de calcularse en unos 90 s; se van
+completando de a una, en el orden de la lista de nudos. Si el usuario toca un botón antes,
+el backend interrumpe lo que estaba previendo, atiende el clic y sigue con el estado nuevo.
+
+Ejemplo real de ese modelo: en un nudo, "Cortarlas como una sola pieza" **empeora** (2
+uniones más no arman) y "No cortar A176" **resuelve ese lugar y otro más**. Sin este dato
+el usuario no tiene cómo saberlo.
+
 ### Antes y después
 
 Cambiar quién cede sólo mueve un extremo de dos piezas, así que su efecto es local. Fusionar,
@@ -285,8 +583,9 @@ allá", después de aplicar una acción comparar el `resumen` nuevo con el anter
 
 > Resolvió 3 lugares · no apareció ninguno nuevo
 
-Alcanza con restar `resumen.nudos` y `resumen.uniones_no_arma` de antes y después. Guardar
-el estado anterior permite ofrecer **Deshacer** sin pedir nada al backend.
+Alcanza con restar `resumen.nudos` y `resumen.uniones_no_arma` de antes y después (es lo
+mismo que anticipa `efectos`). **Deshacer** es volver a mandar el estado anterior a
+`/verificacion`: el backend lo tiene guardado y responde al instante.
 
 ---
 
@@ -361,21 +660,24 @@ constantes del backend.
 
 | Campo | Dónde | Qué es |
 |---|---|---|
-| `absorbed_groups` | `/nesting-preview`; `topology` de `/recompute` con `scale_denom` | `{ "id absorbido": id del grupo que lo incluye }`. No dibujarlo aparte ni caer a la malla cruda. |
+| `absorbed_groups` | `/verificacion`; `/nesting-preview`; `topology` de `/recompute` con `scale_denom` | `{ "id absorbido": id del grupo que lo incluye }`, por fusión automática **o del usuario** (§0.3). No dibujarlo aparte ni caer a la malla cruda. |
 | `warnings` | `/nesting-preview` | Avisos de la generación a esa escala. |
-| `panel_id_by_group` | `/recompute` | Calculado a la escala pedida. Las etiquetas cambian con la escala. |
+| `panel_id_by_group` | `/verificacion` (usar éste después de una acción, §0.2); `/recompute` | Calculado a la escala pedida. Las etiquetas cambian con la escala. |
 
 ---
 
 ## 8. Qué construir, en orden
 
+0. **Cambiar el pedido de las acciones a `/verificacion` y subir el tiempo de espera a
+   60 s (§0).** Sin esto nada de lo demás se ve.
 1. **Titular** con `resumen` (texto de §2).
 2. **Lista de nudos** en tres bloques por `quien`: "Para decidir", "Depende de la escala",
    "Para corregir en el modelo". Cada fila: `titulo`, medida y botones.
 3. **Ficha de nudo** al tocar una fila: a la izquierda el 3D con sólo `piezas` visibles y
    la cámara en `punto`; a la derecha el `detalle` en 2D. Debajo, `quien_texto` y
    `acciones`.
-4. **Antes y después** al aplicar una acción, con Deshacer (§3).
+4. **Antes y después** al aplicar una acción, con Deshacer (§3), y el **efecto previsto**
+   en cada botón (§3.2).
 5. **Terminaciones** en sección plegada.
 6. **Selector de quién cede** leyendo `decisiones_automaticas` (§4.1).
 7. **Pintar las piezas** del visor general por `piezas[etiqueta].estado`.
@@ -391,6 +693,9 @@ constantes del backend.
   cortadas.
 - El resolvedor sólo prueba invertir quién cede. No prueba fusionar ni descartar: eso
   cambia qué piezas existen y es decisión de la persona.
+- La memoria entre pedidos vive en el proceso del servidor. Con más de un proceso, o tras
+  un reinicio, un pedido puede caer sin memoria y tardar como el primero. El resultado
+  puede variar levemente entre un pedido con memoria y uno sin ella.
 - `quien: "modelo"` quiere decir "no encontramos un arreglo automático". A veces la causa
   es el modelo y a veces un límite del procesamiento; el backend no los distingue todavía.
 - `quien: "escala"` y `escala_sugerida` salen de una cuenta, no de haber probado esa
