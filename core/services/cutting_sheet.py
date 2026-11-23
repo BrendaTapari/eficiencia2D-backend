@@ -732,11 +732,30 @@ def panel_cut_area_m2(edges: List[Edge2D], width_m: float, height_m: float) -> f
     from shapely.geometry import LineString
     from shapely.ops import polygonize, unary_union
 
-    segs = [
-        LineString([(e.a.x, e.a.y), (e.b.x, e.b.y)])
+    usadas = [
+        (e.a.x, e.a.y, e.b.x, e.b.y)
         for e in edges
         if not getattr(e, "flex", False) and not getattr(e, "score", False)
     ]
+    # El resolvedor arma las piezas varias veces por pedido y casi todas salen iguales:
+    # el área se recuerda por contenido. Eran 1470 poligonizaciones por clic en el modelo
+    # grande, para ~300 piezas distintas.
+    clave = (tuple(usadas), round(width_m, 9), round(height_m, 9))
+    if clave in _AREAS:
+        return _AREAS[clave]
+    if len(_AREAS) > 20000:
+        _AREAS.clear()
+    segs = [LineString([(x0, y0), (x1, y1)]) for x0, y0, x1, y1 in usadas]
+    _AREAS[clave] = r = _area_de_segmentos(segs, width_m, height_m)
+    return r
+
+
+_AREAS: Dict[tuple, float] = {}
+
+
+def _area_de_segmentos(segs, width_m: float, height_m: float) -> float:
+    from shapely.ops import polygonize, unary_union
+
     if not segs:
         return width_m * height_m
     caras = sorted(polygonize(unary_union(segs)), key=lambda p: p.area, reverse=True)
