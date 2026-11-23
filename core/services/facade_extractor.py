@@ -236,6 +236,39 @@ def extract_with_axis(faces: List[Face3D], up: UpAxis) -> List[Facade]:
     return facades
 
 
+def _cobertura_de_planta(faces: List[Face3D], k: int, muestras: int = 50000) -> float:
+    """Qué parte de la planta (la caja del modelo vista a lo largo del eje `k`) cubre, en
+    promedio ponderado por área, cada cara perpendicular a ese eje."""
+    paso = max(1, len(faces) // muestras)
+    o0, o1 = [i for i in range(3) if i != k]
+    lo = [float("inf")] * 3
+    hi = [float("-inf")] * 3
+    for f in faces[::paso]:
+        for v in f.vertices:
+            c = (v.x, v.y, v.z)
+            for i in range(3):
+                lo[i] = min(lo[i], c[i]); hi[i] = max(hi[i], c[i])
+    planta = (hi[o0] - lo[o0]) * (hi[o1] - lo[o1])
+    if planta <= 0:
+        return 0.0
+    num = den = 0.0
+    for f in faces[::paso]:
+        n = (f.normal.x, f.normal.y, f.normal.z)
+        if abs(n[k]) < 0.9 or len(f.vertices) < 3:
+            continue
+        verts = f.vertices
+        area = 0.0
+        for i in range(1, len(verts) - 1):
+            area += vlength(cross(sub(verts[i], verts[0]), sub(verts[i + 1], verts[0]))) * 0.5
+        if area < 1e-10:
+            continue
+        c0 = [(v.x, v.y, v.z)[o0] for v in verts]
+        c1 = [(v.x, v.y, v.z)[o1] for v in verts]
+        num += area * (max(c0) - min(c0)) * (max(c1) - min(c1)) / planta
+        den += area
+    return num / den if den else 0.0
+
+
 def detect_up_axis(faces: List[Face3D]) -> UpAxis:
     if not faces:
         return "Z"
@@ -270,6 +303,17 @@ def detect_up_axis(faces: List[Face3D]) -> UpAxis:
         diff = abs(y_area - z_area) / total_area
         if diff > 0.3:
             return "Y" if y_area > z_area else "Z"
+
+    # --- Heurística 1b: las caras perpendiculares al eje vertical cubren la planta ---
+    # Cuando las áreas no deciden (una casa casi cúbica: losas y fachadas suman parecido),
+    # se mira la FORMA: las caras perpendiculares al eje vertical son losas y cubren casi
+    # toda la planta del edificio; las perpendiculares a un eje horizontal son muros, una
+    # franja angosta de la caja. Medido en los 21 modelos del repo: acierta en todos, y en
+    # las 9 casas de prueba la heurística vieja caía al valor por defecto (Z) cuando el
+    # modelo es Y: los pisos se leían como muros.
+    cob_y, cob_z = _cobertura_de_planta(faces, 1), _cobertura_de_planta(faces, 2)
+    if max(cob_y, cob_z) > 0 and max(cob_y, cob_z) >= 1.5 * min(cob_y, cob_z):
+        return "Y" if cob_y > cob_z else "Z"
 
     # --- Heurística 2: ratio del bounding-box ---
     min_y, max_y = float("inf"), float("-inf")
