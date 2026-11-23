@@ -299,6 +299,8 @@ def build_group_adjacency(joints: List[Joint]) -> Dict[int, List[int]]:
 # de diseño: a 5 cm los muros están de verdad separados y recortarlos abriría una luz
 # visible en la maqueta en vez de cerrarla.
 CONTACT_TOL_M = 0.02
+# Cada cuánto se prueba un punto a lo largo de las aristas (ver `detect_contact_joints`).
+ARISTA_PASO_M = 0.1
 # Altura mínima del contacto para que la unión sea relevante al cortar.
 MIN_VERTICAL_OVERLAP_M = 0.30
 # Ángulo mínimo entre dos muros para tratarlos como unión real. Por debajo son casi
@@ -392,20 +394,58 @@ def detect_contact_joints(
         nn = (n * n).sum(1)
         nn[nn < 1e-18] = 1e-18
         out: List[Tuple[float, float, float]] = []
-        for p in P:
-            AP = p - A
-            # Coordenadas baricéntricas de la proyección, recortadas al triángulo.
-            u = np.clip((np.cross(AP, AC) * n).sum(1) / nn, 0.0, 1.0)
-            v = np.clip((np.cross(AB, AP) * n).sum(1) / nn, 0.0, 1.0)
-            s = u + v
-            f = s > 1.0
-            if f.any():
-                u[f] /= s[f]
-                v[f] /= s[f]
-            Q = A + u[:, None] * AB + v[:, None] * AC
-            if float(((p - Q) ** 2).sum(1).min()) <= tol * tol:
+        # Sólo los puntos que caen en la caja de la otra superficie: el resto no puede
+        # tocarla, y probarlos uno por uno contra todos sus triángulos era la mayor parte
+        # del costo.
+        lo_ = T.reshape(-1, 3).min(0) - tol
+        hi_ = T.reshape(-1, 3).max(0) + tol
+        P = P[((P >= lo_) & (P <= hi_)).all(1)]
+        if not len(P):
+            return out
+        # En bloques de puntos contra todos los triángulos a la vez (antes, punto por
+        # punto en Python: un grupo grande recién fusionado tardaba segundos).
+        bloque = max(1, 500_000 // max(1, len(A)))
+        for k0 in range(0, len(P), bloque):
+            Pk = P[k0:k0 + bloque]
+            AP = Pk[:, None, :] - A[None, :, :]
+            u = np.clip((np.cross(AP, AC[None]) * n[None]).sum(2) / nn[None], 0.0, 1.0)
+            v = np.clip((np.cross(AB[None], AP) * n[None]).sum(2) / nn[None], 0.0, 1.0)
+            s_ = u + v
+            f = s_ > 1.0
+            u = np.where(f, u / np.where(f, s_, 1.0), u)
+            v = np.where(f, v / np.where(f, s_, 1.0), v)
+            Q = A[None] + u[..., None] * AB[None] + v[..., None] * AC[None]
+            d2 = ((Pk[:, None, :] - Q) ** 2).sum(2).min(1)
+            for p in Pk[d2 <= tol * tol]:
                 out.append((float(p[0]), float(p[1]), float(p[2])))
         return out
+
+    # Los puntos que se prueban contra la cara del otro muro: los vértices Y puntos a lo
+    # largo de las aristas. Con sólo vértices se perdían los contactos de una arista que
+    # apoya entera sobre una cara cuyos extremos caen fuera de ella: un muro que llega a
+    # una fachada partida en franjas horizontales (zócalo, franja, dintel) toca a cada
+    # franja con un tramo de su arista vertical, pero sus dos vértices quedan arriba y
+    # abajo de todas. Medido en demo.obj: esa esquina no tenía ninguna unión.
+    cache_muestras: Dict[int, "np.ndarray"] = {}
+
+    def muestras(gid: int) -> "np.ndarray":
+        if gid in cache_muestras:
+            return cache_muestras[gid]
+        T = tris[gid]
+        pts = [verts[gid]]
+        for i0, i1 in ((0, 1), (1, 2), (2, 0)):
+            A_, B_ = T[:, i0], T[:, i1]
+            largo = np.sqrt(((B_ - A_) ** 2).sum(1))
+            k = np.maximum(1, np.ceil(largo / ARISTA_PASO_M)).astype(int)
+            for n_ in np.unique(k):
+                if n_ <= 1:
+                    continue
+                sel = k == n_
+                t = (np.arange(1, n_) / n_)[None, :, None]
+                pts.append((A_[sel][:, None, :] + t * (B_[sel] - A_[sel])[:, None, :]).reshape(-1, 3))
+        P_ = np.unique(np.round(np.concatenate(pts), 4), axis=0)
+        cache_muestras[gid] = P_
+        return P_
 
     ids = sorted(tris)
     out: List[Joint] = []
@@ -438,8 +478,8 @@ def detect_contact_joints(
             clave = (firma[a], firma[b])
             contact = _CONTACTOS.get(clave)
             if contact is None:
-                contact = touching_points(verts[b], tris[a])
-                contact += touching_points(verts[a], tris[b])
+                contact = touching_points(muestras(b), tris[a])
+                contact += touching_points(muestras(a), tris[b])
                 if len(_CONTACTOS) >= _MAX_CONTACTOS:
                     _CONTACTOS.clear()
                 _CONTACTOS[clave] = contact
@@ -447,7 +487,10 @@ def detect_contact_joints(
                 continue
             ys = [p[1] for p in contact]
             y_lo, y_hi = min(ys), max(ys)
-            if y_hi - y_lo < MIN_VERTICAL_OVERLAP_M:
+            # Una franja más baja que el mínimo (un zócalo de 38 cm) se toca en toda su
+            # altura y es una unión: el mínimo es relativo a la más baja de las dos.
+            alto_min = min(ay1 - ay0, by1 - by0)
+            if y_hi - y_lo < min(MIN_VERTICAL_OVERLAP_M, 0.5 * alto_min):
                 continue
 
             # edge_mid DEBE ser el punto de contacto: decompose lo proyecta sobre el eje

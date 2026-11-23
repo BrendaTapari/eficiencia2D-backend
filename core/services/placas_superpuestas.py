@@ -52,7 +52,7 @@ from __future__ import annotations
 from typing import Callable, Dict, List, Optional, Tuple
 
 from core.group_classifier import GeometryGroup
-from core.services.plate_intersect import PLATE_THICKNESS_M
+from core.services.plate_intersect import PLATE_THICKNESS_M, plano_alineado
 from core.services.recorte_csg import (
     Placa,
     construir_placa,
@@ -173,6 +173,7 @@ def detectar_placas_superpuestas(
             k = (
                 contenido_del_grupo(g, faces, cache),
                 round(normal.x, 9), round(normal.y, 9), round(normal.z, 9),
+                plano_alineado(g, faces, normal),
             )
             pl = guardadas.get(k, False)
             if pl is False:

@@ -114,6 +114,9 @@ class Placa:
     # Identidad de la placa por su contenido (qué caras tiene y con qué normal). La usa
     # quien conserva placas y recortes entre un pedido y el siguiente.
     firma: object = None
+    # Capa que el grupo ocupa EN EL MODELO a lo largo de `n`: (mín, máx) de n·x de sus
+    # vértices. Dice qué otras pieles caen dentro del espesor real del muro.
+    capa: Optional[Tuple[float, float]] = None
 
 
 def contenido_del_grupo(g, faces, cache: Optional[Dict]) -> int:
@@ -189,6 +192,7 @@ def construir_placa(
         return None
 
     d = mid_plane_offset_faces(gfaces, n)
+    proy = [n.x * q.x + n.y * q.y + n.z * q.z for f in gfaces for q in f.vertices]
     ou, ov = res.origin_u, res.origin_v
     u, v = res.u_axis, res.v_axis
     o = Vec3(
@@ -199,7 +203,7 @@ def construir_placa(
     return Placa(
         group_id=grupo.id, o=o, u=u, v=v, n=n, d=d,
         poly=poly, width_m=res.width_m, height_m=res.height_m,
-        v_up=res.v_up,
+        v_up=res.v_up, capa=(min(proy), max(proy)),
     )
 
 
@@ -732,6 +736,9 @@ def _banda(a, marco: "Placa", eje: str, group_by_id) -> Optional[Tuple[float, fl
     return (lo, hi)
 
 
+_INDICE_DE_PLACAS: Dict[int, tuple] = {}
+
+
 def _coplanar_con(gid, otro_id, placas, espesor_m: float) -> bool:
     """¿`gid` es otra piel del mismo muro que `otro_id`?
 
@@ -740,13 +747,36 @@ def _coplanar_con(gid, otro_id, placas, espesor_m: float) -> bool:
     """
     if otro_id is None:
         return False
-    a = next((p for p in placas if p.group_id == gid), None)
-    b = next((p for p in placas if p.group_id == otro_id), None)
+    # Índice por id, una vez por lista de placas: buscar recorriendo la lista eran
+    # 240.000 búsquedas lineales por armado en el modelo grande.
+    indice = _INDICE_DE_PLACAS.get(id(placas))
+    if indice is None or indice[0] is not placas or indice[1] != len(placas):
+        indice = (placas, len(placas), {p.group_id: p for p in placas})
+        _INDICE_DE_PLACAS.clear()
+        _INDICE_DE_PLACAS[id(placas)] = indice
+    a = indice[2].get(gid)
+    b = indice[2].get(otro_id)
     if a is None or b is None:
         return False
-    if abs(dot(a.n, b.n)) < 0.99:
+    c = dot(a.n, b.n)
+    if abs(c) < 0.99:
         return False
-    return abs(abs(a.d) - abs(b.d)) <= max(espesor_m, 1e-6)
+    if abs(abs(a.d) - abs(b.d)) <= max(espesor_m, 1e-6) + 1e-4:
+        return True
+    # Una piel suelta cae DENTRO del espesor que el muro tiene en el modelo, a cualquier
+    # escala. Comparar sólo contra una placa dependía de la escala: la piel de un muro de
+    # 30 cm queda a 15 cm de su plano medio, que a 1:50 es exactamente una placa y el
+    # redondeo la dejaba afuera. Medido: esa piel bloqueaba el crecimiento de los muros
+    # que llegan en T y quedaban 7.5 cm cortos (luz de 1.5 mm en la plancha).
+    s = 1.0 if c > 0 else -1.0
+    for x, y, sy in ((a, b, s), (b, a, s)):
+        if y.capa is None:
+            continue
+        dx = x.d * sy                      # plano medio de x en el marco de y
+        lo, hi = y.capa
+        if lo - 1e-3 <= dx <= hi + 1e-3:
+            return True
+    return False
 
 
 def clave_de_recorte(
@@ -844,6 +874,79 @@ def clave_de_recorte(
         frozenset(cerca),
         round(espesor_m, 9),
     )
+
+
+BORDE_TOL_M = 1e-4
+RESTITUIR_DENTRO = True
+
+
+def _cerrar_ranuras_finas(poly, espesor_m: float):
+    """Cierra las ranuras y huecos del contorno más angostos que media placa.
+
+    A la escala de corte no existen: 5 cm de edificio son 0.5 mm de MDF a 1:100, menos que
+    el corte del láser, y nadie los puede armar. Pero partían la pieza: un muro del modelo
+    traía una ranura vertical de 5.6 cm a toda la altura entre su punta y el resto, y al
+    recortarlo contra el vecino la punta quedaba suelta, se descartaba por astilla y el
+    muro terminaba 13.9 cm antes de la cara contra la que tenía que apoyar.
+
+    Cierre morfológico con esquinas rectas: no toca nada de una placa o más de ancho
+    (ventanas, muescas de encastre, vanos).
+    """
+    if poly is None or poly.is_empty or espesor_m <= 0:
+        return poly
+    r = espesor_m / 4.0
+    try:
+        cerrado = poly.buffer(r, join_style=2, mitre_limit=10.0).buffer(
+            -r, join_style=2, mitre_limit=10.0
+        )
+    except Exception:
+        return poly
+    cerrado = _solo_poligonos(cerrado)
+    if cerrado is None or cerrado.is_empty:
+        return poly
+    # Sólo agrega lo que estaba entre partes de la pieza; nunca la agranda por fuera.
+    return _solo_poligonos(poly.union(cerrado.intersection(poly.envelope)))
+
+
+def _agujeros(poly):
+    """Los agujeros interiores de la pieza (ventanas), como una sola geometría, o None."""
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+
+    partes = list(poly.geoms) if hasattr(poly, "geoms") else [poly]
+    hs = [Polygon(r) for p in partes if p.geom_type == "Polygon" for r in p.interiors]
+    return unary_union(hs) if hs else None
+
+
+def _tramos_del_borde(poly, eje: str, lado: str, actual: float, b0: float, b1: float,
+                      hondo: float = BORDE_TOL_M):
+    """Intervalos, sobre el OTRO eje, donde la pieza tiene material cerca de su borde.
+
+    Se mira una franja de `hondo` hacia adentro del borde `actual`: lo que el polígono
+    ocupa ahí es el canto que crece. Devuelve [(t0, t1), ...] dentro de la banda [b0, b1].
+    """
+    from shapely.geometry import box
+
+    t = hondo
+    if eje == "u":
+        franja = box(actual, b0, actual + t, b1) if lado == "bajo" else box(actual - t, b0, actual, b1)
+    else:
+        franja = box(b0, actual, b1, actual + t) if lado == "bajo" else box(b0, actual - t, b1, actual)
+    borde = _solo_poligonos(poly.intersection(franja))
+    if borde is None or borde.is_empty:
+        return []
+    partes = list(borde.geoms) if hasattr(borde, "geoms") else [borde]
+    ivs = sorted(
+        ((p.bounds[1], p.bounds[3]) if eje == "u" else (p.bounds[0], p.bounds[2]))
+        for p in partes if not p.is_empty
+    )
+    out: list = []
+    for a, b in ivs:
+        if out and a <= out[-1][1] + 1e-9:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return [(a, b) for a, b in out if b - a > 1e-9]
 
 
 def _solo_poligonos(geom):
@@ -1002,6 +1105,8 @@ def aplicar_destinos(
 
     apoyados = {d.contra_group_id for d in destinos if d.alcance_m is not None}
     cede_ante = cede_ante or set()
+    poly = _cerrar_ranuras_finas(poly, espesor_m)
+    original = poly        # el contorno del modelo, antes de cualquier destino
 
     for d in destinos:
         if poly.is_empty:
@@ -1083,10 +1188,75 @@ def aplicar_destinos(
             )
             if not crece:
                 continue
-            falta = (
-                caja(d.objetivo_m, actual) if d.lado == "bajo"
-                else caja(actual, d.objetivo_m)
+            # Qué se agrega:
+            #
+            # - DENTRO del contorno original de la pieza (lo que otro destino recortó y éste
+            #   vuelve a pedir) se restituye el material del modelo, con sus vanos. Tender
+            #   la franja llena rellenaba ventanas y puertas. La primera vez que se probó
+            #   salió peor, pero por otra causa: destinos espurios que recortaban metros de
+            #   muro (ver `assembly_adjuster.cruza_de_verdad`); sin ellos, mide mejor.
+            # - MÁS ALLÁ del contorno original, un alargue CORTO (hasta media placa: el
+            #   ajuste a la cara de la losa o del vecino) crece sólo donde el borde original
+            #   tiene material. Un muro con un vacío que llega al borde (el
+            #   muro levantado 30 cm sobre la losa salvo en las esquinas) no tiene borde en
+            #   ese tramo: tender la franja de lado a lado le cerraba el vacío y lo dejaba
+            #   como agujero interior. Medido en `casa_error_flotante` (el hueco de 30 cm
+            #   desaparecía) y en demo.obj (una losa en L colgaba una tira de 4.6 m sobre
+            #   el vacío). "En el borde" es a menos de media placa: un escalón de pocos cm
+            #   (ruido del modelo) crece entero.
+            hondo = max(BORDE_TOL_M, espesor_m / 2.0)
+            partes_falta = []
+            banda_orig = original.intersection(caja(-G, G))
+            borde_orig = None
+            if not banda_orig.is_empty:
+                ob = banda_orig.bounds
+                borde_orig = (ob[0] if d.eje == "u" else ob[1]) if d.lado == "bajo" else (
+                    ob[2] if d.eje == "u" else ob[3]
+                )
+            if borde_orig is None:
+                lim = d.objetivo_m
+            elif d.lado == "bajo":
+                lim = max(d.objetivo_m, borde_orig)
+            else:
+                lim = min(d.objetivo_m, borde_orig)
+            if (lim < actual - 1e-12) if d.lado == "bajo" else (lim > actual + 1e-12):
+                dentro_ = caja(lim, actual) if d.lado == "bajo" else caja(actual, lim)
+                if RESTITUIR_DENTRO:
+                    # Dentro del contorno original se restituye el material del MODELO, con
+                    # sus vanos: tender la franja llena rellenaba ventanas y puertas.
+                    dentro_ = _solo_poligonos(dentro_.intersection(original))
+                if dentro_ is not None and not dentro_.is_empty:
+                    partes_falta.append(dentro_)
+            alargue = (
+                0.0 if borde_orig is None
+                else (borde_orig - d.objetivo_m if d.lado == "bajo" else d.objetivo_m - borde_orig)
             )
+            if alargue > hondo:
+                # Un alargue largo (cerrar una junta a otra pieza) sigue tendiendo la franja
+                # de lado a lado: restringirlo también se midió peor en el modelo grande
+                # (menos caras representadas, más uniones que no arman), por decisiones de
+                # junta que cambian en cascada. Queda pendiente.
+                partes_falta.append(
+                    caja(d.objetivo_m, borde_orig) if d.lado == "bajo"
+                    else caja(borde_orig, d.objetivo_m)
+                )
+            elif alargue > 1e-12:
+                tramos = _tramos_del_borde(original, d.eje, d.lado, borde_orig, b0, b1, hondo)
+                fin = borde_orig + hondo if d.lado == "bajo" else borde_orig - hondo
+                for t0, t1 in tramos:
+                    falta_t = (
+                        (box(d.objetivo_m, t0, fin, t1) if d.lado == "bajo"
+                         else box(fin, t0, d.objetivo_m, t1)) if d.eje == "u" else
+                        (box(t0, d.objetivo_m, t1, fin) if d.lado == "bajo"
+                         else box(t0, fin, t1, d.objetivo_m))
+                    )
+                    agujeros = _agujeros(original)
+                    partes_falta.append(
+                        falta_t if agujeros is None else falta_t.difference(agujeros)
+                    )
+            if not partes_falta:
+                continue
+            falta = unary_union(partes_falta)
             # No bloquean: ni la vecina de ESTE destino —crecer hasta su cara exterior es
             # exactamente lo que se pide— ni ninguna placa COPLANAR con ella. Un muro del
             # modelo tiene dos pieles, así que llega como dos grupos con el mismo plano:
