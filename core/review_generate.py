@@ -34,7 +34,12 @@ from core.services.cutting_sheet import (
 )
 from core.services.plate_intersect import (
     PLATE_THICKNESS_M,
+    alinear_tramos,
+    fijar_planos_por_volumen,
+    fijar_solido,
+    olvidar_alineacion,
     pair_key,
+    plano_alineado,
     resolve_plate_joints,
 )
 from core.services.recorte_csg import (
@@ -775,6 +780,7 @@ def decompose_panels_from_groups(
         _firma = (
             contenido_del_grupo(_g, phase1.faces, cache),
             round(_n.x, 6), round(_n.y, 6), round(_n.z, 6),
+            plano_alineado(_g, phase1.faces, _n),
         )
         _pl = por_firma.get(_firma, False) if por_firma is not None else False
         if _pl is False:
@@ -823,6 +829,7 @@ def decompose_panels_from_groups(
             firma_g = (
                 contenido_del_grupo(group, phase1.faces, cache),
                 round(normal_g.x, 9), round(normal_g.y, 9), round(normal_g.z, 9),
+                plano_alineado(group, phase1.faces, normal_g),
             )
             proyecciones = cache.setdefault("proyecciones", {})
             result = proyecciones.get(firma_g, False)
@@ -1501,6 +1508,11 @@ def _decisiones_por_par_a_indice(
     return work, out
 
 
+# Qué categorías ubican su placa por el VOLUMEN del modelo (ver `planos_por_volumen`).
+# Vacío = todas por sus caras, como antes.
+PLANOS_POR_VOLUMEN: tuple = ("floor",)
+
+
 def _decompose(
     phase1: Phase1Result,
     opts: PipelineOptions,
@@ -1539,17 +1551,78 @@ def _decompose(
     `work.resolucion`.
     """
     cache_de_armado: Dict = sesion.setdefault("armado", {}) if sesion is not None else {}
+
+    def ceder_al_usuario():
+        # Un cálculo en segundo plano se abandona si llega un pedido. También ENTRE las
+        # etapas de preparación (fusiones, placas superpuestas, alineación, planos de
+        # losa): con un estado nuevo pueden tardar segundos, y el pedido esperaba a que
+        # terminaran (medido: 6.6 s de espera en un clic de fusión).
+        c = cache_de_armado.get("cancelar")
+        if c is not None:
+            c()
+
+    olvidar_alineacion()
+    if cache_de_armado.get("cancelar") is not None:
+        from core.services.plate_intersect import fijar_ceder
+
+        fijar_ceder(cache_de_armado["cancelar"])
+    # El sólido del modelo, ANTES de cualquier cuenta de planos: el plano medio de un
+    # grupo le pregunta qué niveles de cara tienen material detrás (ver
+    # `plate_intersect._extension_por_niveles`), y lo usan las fusiones y la alineación.
+    if PLANOS_POR_VOLUMEN and getattr(phase1, "raw_faces", None):
+        from core.services.planos_por_volumen import solido_del_modelo
+
+        try:
+            fijar_solido(solido_del_modelo(phase1.raw_faces, phase1.applied_axis or "Y"))
+        except Exception:
+            import logging
+            logging.getLogger("eficiencia2d.pipeline").exception("sólido del modelo")
+    ceder_al_usuario()
     work = apply_merges(phase1, merges or [], overrides)
     work, wall_wall_decisions = _una_placa_por_lugar(
         work, opts.scale_denom or 1.0, overrides, wall_wall_decisions,
         cache=cache_de_armado if sesion is not None else None,
     )
+    ceder_al_usuario()
     work, wall_wall_decisions = _fusiones_pendientes_del_usuario(
         work, merges, overrides, wall_wall_decisions
     )
     work, wall_wall_decisions = _decisiones_por_par_a_indice(
         work, wall_wall_decisions, decisiones_por_par
     )
+    # Con los grupos ya definitivos (después de todas las fusiones): los tramos de un
+    # mismo muro pasan a compartir el plano de su placa (ver `alinear_tramos`).
+    ceder_al_usuario()
+    alinear_tramos(
+        work.groups, work.faces, lambda g: _effective_category(g, overrides or {}),
+        PLATE_THICKNESS_M * (opts.scale_denom or 1.0),
+    )
+    # La placa de cada losa va en el medio de su capa de MATERIAL (ver
+    # `planos_por_volumen`), no en el medio de sus caras: el grupo puede traer caras de
+    # otros elementos (vigas, marcos) o sólo la cara de arriba.
+    ceder_al_usuario()
+    if PLANOS_POR_VOLUMEN and getattr(work, "raw_faces", None):
+        from core.services.planos_por_volumen import (
+            planos_por_volumen_del_modelo,
+            solido_del_modelo,
+        )
+
+        try:
+            fijar_planos_por_volumen(work.groups, work.faces, planos_por_volumen_del_modelo(
+                work.groups, work.faces, work.raw_faces,
+                lambda g: _effective_category(g, overrides or {}),
+                orient_group_normals_outward(work.groups),
+                sesion.setdefault("armado", {}) if sesion is not None else None,
+                eje=work.applied_axis or "Y",
+                categorias=PLANOS_POR_VOLUMEN,
+            ))
+        except Exception:
+            import logging
+            logging.getLogger("eficiencia2d.pipeline").exception("planos por volumen")
+
+    from core.services.plate_intersect import marcar_planos_definitivos
+
+    marcar_planos_definitivos()
 
     # Con sesión NO se usa pista. La pista hace que el resolvedor parta de lo que resolvió
     # en otro estado, y con eso el resultado depende del camino: medido sobre un modelo de
@@ -1870,6 +1943,8 @@ def _resolver_uniones(
     for ji, j in enumerate(work.joints):
         indice.setdefault(pair_key(j.group_a, j.group_b), ji)
     vivos = {g.id for g in work.groups}
+    grupo_por_id = {g.id: g for g in work.groups}
+    from core.services.assembly_adjuster import cruza_de_verdad
 
     decisiones = dict(decisiones_usuario or {})
     invertidas: Dict[Tuple[int, int], int] = {}
@@ -1931,7 +2006,18 @@ def _resolver_uniones(
                     ahora[0] < antes[0] or ahora[1] > antes[1] + 0.05
                 ):
                     continue        # está como cuando se la aceptó: no hay nada nuevo
-            candidatas[k] = u.grupo_b if cede[k] == u.grupo_a else u.grupo_a
+            nueva = u.grupo_b if cede[k] == u.grupo_a else u.grupo_a
+            # Invertir no puede convertir un cruce en un recorte de metros: ceder acorta
+            # el muro hasta la cara del vecino, y si asoma más que una esquina se borra
+            # muro que el modelo tiene (ver `cruza_de_verdad`). Medido: el resolvedor
+            # devolvía los recortes de 3.2 y 4.5 m que la sugerencia ya no proponía.
+            otro = u.grupo_a if nueva == u.grupo_b else u.grupo_b
+            if nueva in grupo_por_id and otro in grupo_por_id and cruza_de_verdad(
+                grupo_por_id[nueva], grupo_por_id[otro], work.faces
+            ):
+                probadas.add(k)
+                continue
+            candidatas[k] = nueva
         if not candidatas:
             break
         rondas += 1
