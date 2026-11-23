@@ -3,7 +3,7 @@ from typing import List, Dict, Optional, Literal, Tuple
 from dataclasses import dataclass, field
 
 # Importamos nuestros tipos y servicios
-from core.services.types import Face3D, normalize
+from core.services.types import Face3D, Vec3, normalize
 from core.services.joint_detector import Joint, MIN_JOINT_ANGLE_DEG
 from core.group_classifier import GeometryGroup
 from core.services.joint_topology_classifier import (
@@ -142,7 +142,11 @@ def compute_adjustments(
     wall_wall_joints: List[WallWallJoint] = []
     decisiones_ignoradas: List[str] = []
 
+    from core.services.plate_intersect import ceder
+
     for ji, joint in enumerate(joints):
+        if ji % 50 == 0:
+            ceder()
         # Muro-muro admite uniones OBLICUAS (ver MIN_JOINT_ANGLE_DEG); muro-losa sigue
         # restringido a ~90° más abajo, para no alterar el trato de techos inclinados.
         if joint.dihedral_angle < MIN_JOINT_ANGLE_DEG or joint.dihedral_angle > 95:
@@ -311,6 +315,25 @@ def compute_adjustments(
                     decision = min(g_a.id, g_b.id)
                 else:
                     decision = g_a.id if a_at_end else g_b.id
+            if decision is not None and wall_wall_decisions_map.get(ji) != decision:
+                # Ceder es acortar el muro hasta la cara del vecino: se le quita lo que
+                # asoma más allá de su plano, que en una esquina es el espesor del vecino.
+                # Si lo que asoma son metros y el modelo tiene muro ahí, no es una esquina
+                # sino un CRUCE cerca de la punta de un muro largo, y el recorte borra muro
+                # del modelo (ver `cruza_de_verdad`). Medido en `Prueba app.obj`: las
+                # esquinas reales asoman hasta 400 mm y después no hay nada hasta 950; de
+                # ahí 75 recortes de 0.95 a 4.5 m. Cede el otro si a él le alcanza con un
+                # recorte de esquina; si no, lo resuelve la ranura. La elección del usuario
+                # no se toca.
+                otro_id = g_b.id if decision == g_a.id else g_a.id
+                if cruza_de_verdad(group_by_id[decision], group_by_id[otro_id], faces):
+                    otro_en_punta = b_at_end if otro_id == g_b.id else a_at_end
+                    if otro_en_punta and not cruza_de_verdad(
+                        group_by_id[otro_id], group_by_id[decision], faces
+                    ):
+                        decision = otro_id
+                    else:
+                        decision = None
             if decision is not None:
                 yield_group = group_by_id.get(decision)
                 other_group_id = g_b.id if decision == g_a.id else g_a.id
@@ -388,7 +411,10 @@ def compute_adjustments(
                     eje_p = eje_b if decision == g_a.id else eje_a
                     if pasante_al_extremo and eje_p is not None:
                         vol_p = overshoot_past_plane_m(other_group, yield_group, faces)
-                        if vol_p is not None:
+                        # Si sigue de verdad más allá del plano no termina acá: es un
+                        # cruce cerca de su punta, y acortarlo borra muro del modelo
+                        # (medido: 32 recortes de 0.95 a 2 m en `Prueba app.obj`).
+                        if vol_p is not None and not cruza_de_verdad(other_group, yield_group, faces):
                             adjustments.append(
                                 DimensionAdjustment(
                                     group_id=other_group.id,
@@ -607,7 +633,48 @@ def wall_end_fit_adjustments(
     media_placa = PLATE_THICKNESS_M / 2.0
     cajas = {g.id: caja(g) for g in floors + walls}
 
+    # Muros COPLANARES con cada muro (mismo plano, otra pieza). Se usan sólo para la viga:
+    # el material entre el extremo de un muro y la losa puede ser OTRA pieza del mismo
+    # plano —el dintel sobre un vano, la franja que el modelo trae aparte— y ésa ya está
+    # representada; estirar el muro encima la duplica. Se calcula a pedido y una vez.
+    # Se conserva entre las llamadas de un mismo armado (son una docena, con las mismas
+    # caras): el plano medio de cada muro no cambia.
+    clave_planos = (id(faces), len(faces), tuple(g.id for g in walls))
+    if _PLANOS_DE_MUROS.get("clave") != clave_planos:
+        _PLANOS_DE_MUROS.clear()
+        _PLANOS_DE_MUROS["clave"] = clave_planos
+        _PLANOS_DE_MUROS["planos"] = {}
+        _PLANOS_DE_MUROS["faces"] = faces
+    planos_de_muros: Dict[int, tuple] = _PLANOS_DE_MUROS["planos"]
+
+    coplanares_de: Dict[int, list] = {}
+    plano_de_losa: Dict[int, float] = {}
+
+    def otras_del_plano(w: GeometryGroup):
+        if w.id in coplanares_de:
+            return coplanares_de[w.id]
+        if not planos_de_muros:
+            for g in walls:
+                n = normalize(g.representative_normal)
+                planos_de_muros[g.id] = (
+                    (n.x, n.y, n.z), _mid_plane_offset(g, faces, n), cajas.get(g.id)
+                )
+        nw, dw, _ = planos_de_muros[w.id]
+        out_ = []
+        for gid, (n, d, c) in planos_de_muros.items():
+            if gid == w.id or c is None:
+                continue
+            k = n[0] * nw[0] + n[1] * nw[1] + n[2] * nw[2]
+            if abs(k) < 0.99 or abs(d * (1.0 if k > 0 else -1.0) - dw) > COPLANAR_TOL_M:
+                continue
+            out_.append(c)
+        coplanares_de[w.id] = out_
+        return out_
+
+    from core.services.plate_intersect import ceder
+
     for w in walls:
+        ceder()
         cw = cajas.get(w.id)
         if cw is None:
             continue
@@ -621,9 +688,14 @@ def wall_end_fit_adjustments(
                     or min(cw[5], cf[5]) - max(cw[4], cf[4]) < -tol):
                 continue
 
-            # Plano medio de la losa, en Y (las losas son horizontales, así que el eje es
-            # el vertical y no hace falta arrastrar el signo de su normal).
-            d_y = (cf[2] + cf[3]) / 2.0
+            # Plano medio de la losa, en Y. De la FUENTE ÚNICA (`plate_intersect.
+            # mid_plane_offset`), no del centro de su caja: si la placa de la losa se ubica
+            # por su volumen o se alinea, el muro tiene que terminar contra ESA placa. Con
+            # el centro de la caja había dos planos para la misma losa: medido, un muro
+            # cortado 10.5 cm dentro de la platea.
+            d_y = plano_de_losa.get(f.id)
+            if d_y is None:
+                d_y = plano_de_losa[f.id] = _mid_plane_offset(f, faces, Vec3(0.0, 1.0, 0.0))
             w_lo, w_hi = cw[2], cw[3]
             if w_hi - w_lo <= 1e-6:
                 continue
@@ -639,7 +711,11 @@ def wall_end_fit_adjustments(
                 s = w_hi - d_y
                 eje = "height_top"
                 extremo = w_hi
-            if abs(extremo - d_y) > FLOOR_REACH_TOL_M:
+            lejos = abs(extremo - d_y)
+            if lejos > FLOOR_REACH_TOL_M and (
+                lejos > RELLENO_MAX_M
+                or not _relleno_hasta_la_losa(w, faces, extremo, d_y, otras_del_plano(w))
+            ):
                 continue  # el extremo del muro no llega a la losa: no se encuentran
 
             out.append(
@@ -657,6 +733,133 @@ def wall_end_fit_adjustments(
                 )
             )
     return out
+
+
+_PLANOS_DE_MUROS: Dict[str, object] = {}
+
+# Hasta dónde se busca material entre el extremo de un muro y la losa.
+RELLENO_MAX_M = 1.0
+# Parte del espacio entre el muro y la losa que tiene que ser material.
+RELLENO_FRACCION = 0.85
+# Dos muros están en el mismo plano si sus planos medios difieren menos que esto.
+COPLANAR_TOL_M = 0.02
+
+
+def _relleno_hasta_la_losa(wall, faces, extremo: float, d_y: float, coplanares=()) -> bool:
+    """¿El espacio entre el extremo del muro y la losa es MATERIAL en el modelo?
+
+    Es el caso de una viga: el muro termina en la cara de abajo de la viga y la viga
+    llega a la losa. En la maqueta, muro y viga en el mismo plano son una sola placa, así
+    que el muro tiene que llegar a la losa. Medido en un modelo real: con la losa en su
+    lugar, muros que terminaban 30 a 40 cm bajo la losa (con la viga en el medio) quedaban
+    sin llegar y aparecía un hueco de 34 cm donde el modelo tiene viga.
+
+    Se responde con el sólido del modelo (`plate_intersect.solido_actual`); sin sólido,
+    no hay forma de saberlo y se responde que no.
+    """
+    from core.services.plate_intersect import planos_definitivos, solido_actual
+
+    solido = solido_actual()
+    if solido is None or not faces or abs(extremo - d_y) > RELLENO_MAX_M:
+        return False
+    if not planos_definitivos():
+        return False
+    import numpy as np
+
+    # La respuesta depende del muro (sus caras), los dos niveles y las piezas coplanares;
+    # se recuerda en el sólido para no rehacer ni el muestreo en cada llamado del armado.
+    memo_r = solido.__dict__.setdefault("_memo_relleno_muro", {})
+    fi0 = wall.face_indices[0] if wall.face_indices else -1
+    v0 = faces[fi0].vertices[0] if 0 <= fi0 < len(faces) else None
+    clave_r = (
+        tuple(wall.face_indices[:3]), len(wall.face_indices),
+        None if v0 is None else (round(v0.x, 5), round(v0.y, 5), round(v0.z, 5)),
+        round(extremo, 5),
+        round(d_y, 5), tuple(tuple(round(x, 4) for x in c) for c in coplanares),
+    )
+    if clave_r in memo_r:
+        return memo_r[clave_r]
+    memo_r[clave_r] = r = _relleno_calculado(solido, wall, faces, extremo, d_y, coplanares)
+    return r
+
+
+_VERTICES: Dict[tuple, object] = {}
+
+
+def _vertices_de(wall, faces):
+    """Vértices del grupo como arreglo, una vez por grupo y lista de caras."""
+    import numpy as np
+
+    fi = [i for i in wall.face_indices if 0 <= i < len(faces)]
+    if not fi:
+        return np.zeros((0, 3))
+    # Por las CARAS mismas (objetos que viven todo el modelo), no por la lista: una
+    # fusión arma una lista de caras nueva con las mismas caras, y la memoria no acertaba.
+    f0, f1 = faces[fi[0]], faces[fi[-1]]
+    k = (id(f0), id(f1), len(fi))
+    e = _VERTICES.get(k)
+    if e is not None and e[0] is f0 and e[1] is f1:
+        return e[2]
+    V = np.array([(v.x, v.y, v.z) for i in fi for v in faces[i].vertices], dtype=float).reshape(-1, 3)
+    if len(_VERTICES) > 50_000:
+        _VERTICES.clear()
+    _VERTICES[k] = (f0, f1, V)
+    return V
+
+
+def _relleno_calculado(solido, wall, faces, extremo, d_y, coplanares) -> bool:
+    import numpy as np
+
+    n = normalize(wall.representative_normal)
+    nn = np.array([n.x, n.y, n.z], dtype=float)
+    d = _mid_plane_offset(wall, faces, n)
+    todos = _vertices_de(wall, faces)
+    B = todos[np.abs(todos[:, 1] - extremo) <= 0.01] if len(todos) else todos
+    if len(B) < 2:
+        return False
+    u = np.cross(np.array([0.0, 1.0, 0.0]), nn)
+    if np.linalg.norm(u) < 1e-6:
+        return False
+    u /= np.linalg.norm(u)
+    # Se muestrea a lo ancho de TODA la pieza, no sólo de los vértices que están en el
+    # extremo: el alargue se aplica al borde entero. Medido en un tabique que atraviesa la
+    # losa: su único vértice a esa altura era una tira de 5 cm metida en el muro exterior,
+    # el muestreo veía material y el tabique entero subía 67 cm por el aire.
+    s = todos @ u
+    s0, s1 = float(s.min()), float(s.max())
+    if s1 - s0 < 0.05:
+        return False
+    base = B[0] - (float(B[0] @ nn) - d) * nn          # sobre el plano medio
+    base = base - float(base @ u) * u
+    posiciones = np.linspace(s0 + 0.05, s1 - 0.05, 12)
+    signo = 1.0 if d_y > extremo else -1.0
+    # Cada 5 cm: alcanza para decidir si hay 85% de material, y cada consulta al sólido
+    # cuesta por punto (con 2 cm, 0.14 s por muro en un clic).
+    alturas = np.arange(extremo + signo * 0.01, d_y, signo * 0.05)
+    if not len(alturas):
+        return False
+    pts = np.array([
+        [base[0] + p * u[0], y, base[2] + p * u[2]] for p in posiciones for y in alturas
+    ])
+    # El sólido no cambia entre los varios llamados de un armado ni entre clics del mismo
+    # modelo; la pregunta se repite igual. Se recuerda en el propio sólido, por geometría.
+    memo = solido.__dict__.setdefault("_memo_relleno", {})
+    # Al centímetro: una fusión o una alineación mueve el plano de un muro décimas de
+    # milímetro, y eso no cambia si hay viga o no; con más decimales la memoria no acertaba.
+    clave = np.round(pts, 2).tobytes()
+    material = memo.get(clave)
+    if material is None:
+        material = memo[clave] = solido.contiene_varios(pts)
+    # Lo que ocupa otra pieza del mismo plano no es viga: ya tiene su placa.
+    ocupado = np.zeros(len(pts), dtype=bool)
+    t = 0.01
+    for c in coplanares:
+        ocupado |= (
+            (pts[:, 0] >= c[0] - t) & (pts[:, 0] <= c[1] + t)
+            & (pts[:, 1] >= c[2] - t) & (pts[:, 1] <= c[3] + t)
+            & (pts[:, 2] >= c[4] - t) & (pts[:, 2] <= c[5] + t)
+        )
+    return bool((material & ~ocupado).mean() >= RELLENO_FRACCION)
 
 
 def floor_reach_adjustments(
@@ -830,6 +1033,101 @@ def joint_position_frac(
 
 # Un cruce se considera "en el extremo" si cae dentro de este margen de una punta.
 END_ZONE_FRAC = 0.15
+# Lo más que un muro puede asomar más allá del plano del vecino y seguir siendo una
+# esquina (ver `adjust_dimensions_for_joints`): las reales llegan a 400 mm.
+VOLADIZO_MAX_M = 0.6
+# Más allá del plano del vecino, la densidad de material tiene que ser al menos esta parte
+# de la del muro entero para que sea un cruce (un muro con vanos tiene poca en todos lados).
+CRUCE_DENSIDAD_RELATIVA = 0.5
+CRUCE_PASO_M = 0.25
+CRUCE_MUESTRAS_MAX = 200
+
+
+def _firma_rapida(g: GeometryGroup, faces) -> tuple:
+    """Identidad de un grupo por su contenido, sin recorrer todas sus caras."""
+    fi = g.face_indices
+    if not fi:
+        return (g.id,)
+
+    def v(i):
+        if 0 <= i < len(faces) and faces[i].vertices:
+            q = faces[i].vertices[0]
+            return (round(q.x, 4), round(q.y, 4), round(q.z, 4))
+        return None
+
+    n = g.representative_normal
+    return (len(fi), v(fi[0]), v(fi[-1]), v(fi[len(fi) // 2]),
+            round(n.x, 3), round(n.y, 3), round(n.z, 3))
+
+
+def cruza_de_verdad(group: GeometryGroup, other: GeometryGroup, faces) -> bool:
+    """¿`group` sigue de verdad más allá del plano de `other`, o sólo lo dicen sus vértices?
+
+    Ceder (o pasar) acorta la pieza hasta la cara del vecino. Si lo que asoma es una
+    esquina —el espesor del vecino— hay que recortarlo. Si son metros puede ser:
+      - un CRUCE: el muro sigue, y recortarlo borra muro del modelo. Medido en `Prueba
+        app.obj`: un muro de 12 m con vanos perdía 4.5 m de dintel y pilares;
+      - caras sueltas del grupo que estiran su caja sobre el vacío. Medido: un tramo que
+        "asomaba" 1.35 m era aire en 42 de sus 42 muestras, y el recorte era correcto.
+    La extensión de los vértices no los distingue; el sólido del modelo sí. Se compara la
+    densidad de material más allá del plano (pasada la esquina) con la del muro entero.
+    Sin sólido se responde que no (se recorta, como siempre).
+    """
+    vol = overshoot_past_plane_m(group, other, faces)
+    if vol is None or vol <= VOLADIZO_MAX_M:
+        return False
+    from core.services.plate_intersect import planos_definitivos, solido_actual
+
+    solido = solido_actual()
+    if solido is None or not planos_definitivos():
+        return False
+    import numpy as np
+
+    # Por CONTENIDO y no por ids ni índices: una fusión renumera las caras de todos los
+    # grupos y con ids la memoria no acertaba nunca. Y BARATA: armar la clave con todos
+    # los vértices costaba 4 s por clic de fusión (son miles de llamadas).
+    memo = solido.__dict__.setdefault("_memo_cruce", {})
+    clave = (_firma_rapida(group, faces), _firma_rapida(other, faces), round(vol, 4))
+    if clave in memo:
+        return memo[clave]
+    ng = normalize(group.representative_normal)
+    no = normalize(other.representative_normal)
+    d_g = _mid_plane_offset(group, faces, ng)
+    d_o = _mid_plane_offset(other, faces, no)
+    P = np.array([
+        (q.x, q.y, q.z) for fi in group.face_indices if 0 <= fi < len(faces)
+        for q in faces[fi].vertices
+    ])
+    ng_ = np.array([ng.x, ng.y, ng.z]); no_ = np.array([no.x, no.y, no.z])
+    u = no_ - (no_ @ ng_) * ng_
+    if np.linalg.norm(u) < 1e-6:
+        memo[clave] = False
+        return False
+    u /= np.linalg.norm(u)
+    v = np.cross(ng_, u)
+    a, b = P @ u, P @ v
+    paso = CRUCE_PASO_M
+    A, B = np.meshgrid(np.arange(a.min() + paso / 2, a.max(), paso),
+                       np.arange(b.min() + paso / 2, b.max(), paso))
+    pts = (A.reshape(-1, 1) * u + B.reshape(-1, 1) * v + d_g * ng_)
+    # Es una DENSIDAD: 200 muestras la estiman con ±3.5%, de sobra para separar aire de
+    # muro. Cada una cuesta ~0.25 ms en el modelo grande, y bastante más mientras el
+    # cálculo de fondo corre en paralelo: con 4000 un clic de fusión pagaba 4 s.
+    if len(pts) > CRUCE_MUESTRAS_MAX:
+        pts = pts[np.linspace(0, len(pts) - 1, CRUCE_MUESTRAS_MAX).astype(int)]
+    lado = pts @ no_ - d_o
+    proy = P @ no_
+    signo = -1.0 if (proy.min() + proy.max()) / 2.0 >= d_o else 1.0
+    mas_alla = signo * lado > VOLADIZO_MAX_M
+    if mas_alla.sum() < 4:
+        memo[clave] = False
+        return False
+    dentro = solido.contiene_varios(pts)
+    total = float(dentro.mean())
+    alla = float(dentro[mas_alla].mean())
+    r = total > 0 and alla >= CRUCE_DENSIDAD_RELATIVA * total
+    memo[clave] = bool(r)
+    return memo[clave]
 
 
 def choose_wall_wall_yielder(
