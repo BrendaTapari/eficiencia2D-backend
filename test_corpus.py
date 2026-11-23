@@ -90,6 +90,18 @@ LINEA_BASE = {
     # Los choques del verificador por muestreo pasan de 1/0 a 0/1: a 1:100 aparece un par
     # de placas montadas (A18/A19) que antes no veía. El verificador exacto, que es el que
     # manda, mide mejora en las dos escalas (ver LINEA_BASE_VEREDICTO).
+    # Plano medio por NIVELES de cara (`plate_intersect._extension_por_niveles`) y cierre
+    # de ranuras más finas que media placa (`recorte_csg._cerrar_ranuras_finas`). Más fiel
+    # al modelo (demo: plano en el material 88.3% -> 93.8% a 1:50); 1:50 mejora en todo.
+    # 1:100 EMPEORA y queda anotado como pendiente: las tres franjas de la fachada este
+    # (zócalo, franja, dintel) pasan a compartir el plano, y el muro que llega a esa
+    # esquina —sin unión detectada en el modelo, porque su arista apoya en las tres
+    # franjas pero sus vértices quedan fuera de cada una— choca con las tres en vez de con
+    # una. Detectar la esquina sólo contra una franja se probó y fue peor.
+    # Contactos medidos también a lo largo de las ARISTAS (`detect_contact_joints`): la
+    # esquina contra la fachada en tres franjas ahora tiene sus tres uniones. 1:100 vuelve
+    # a 1 choque y pasa de 5 a 2 uniones que no arman; 1:50 evalúa 6 esquinas más (3 bien,
+    # 3 mal) porque aparecen uniones que antes no existían.
     "demo.obj": {"piezas": {50.0: 32, 100.0: 29}, "choques": {50.0: 0, 100.0: 1}},
 }
 
@@ -384,7 +396,19 @@ LINEA_BASE_ENCAJE = {
     #
     # 1:100 pasa de (40, 22) a (46, 12) al fundir las placas paralelas que se pisan entre
     # media y una placa. 1:50 no cambia.
-    "demo.obj": {50.0: (44, 18), 100.0: (46, 12)},
+    # Plano medio por NIVELES de cara (`plate_intersect._extension_por_niveles`) y cierre
+    # de ranuras más finas que media placa (`recorte_csg._cerrar_ranuras_finas`). Más fiel
+    # al modelo (demo: plano en el material 88.3% -> 93.8% a 1:50); 1:50 mejora en todo.
+    # 1:100 EMPEORA y queda anotado como pendiente: las tres franjas de la fachada este
+    # (zócalo, franja, dintel) pasan a compartir el plano, y el muro que llega a esa
+    # esquina —sin unión detectada en el modelo, porque su arista apoya en las tres
+    # franjas pero sus vértices quedan fuera de cada una— choca con las tres en vez de con
+    # una. Detectar la esquina sólo contra una franja se probó y fue peor.
+    # Contactos medidos también a lo largo de las ARISTAS (`detect_contact_joints`): la
+    # esquina contra la fachada en tres franjas ahora tiene sus tres uniones. 1:100 vuelve
+    # a 1 choque y pasa de 5 a 2 uniones que no arman; 1:50 evalúa 6 esquinas más (3 bien,
+    # 3 mal) porque aparecen uniones que antes no existían.
+    "demo.obj": {50.0: (48, 20), 100.0: (50, 14)},
 }
 
 
@@ -509,7 +533,19 @@ LINEA_BASE_RESTRICCIONES = {
     # de lo que el grafo espera. Ver la nota de LINEA_BASE_ENCAJE.
     # 1:100 pasa a 43 evaluadas, 6 incumplidas y 0 conflictos al fundir las placas que
     # se pisan entre media y una placa: varias "vecinas" eran la misma pieza.
-    "demo.obj": {50.0: (47, 12, 2), 100.0: (43, 6, 0)},
+    # Plano medio por NIVELES de cara (`plate_intersect._extension_por_niveles`) y cierre
+    # de ranuras más finas que media placa (`recorte_csg._cerrar_ranuras_finas`). Más fiel
+    # al modelo (demo: plano en el material 88.3% -> 93.8% a 1:50); 1:50 mejora en todo.
+    # 1:100 EMPEORA y queda anotado como pendiente: las tres franjas de la fachada este
+    # (zócalo, franja, dintel) pasan a compartir el plano, y el muro que llega a esa
+    # esquina —sin unión detectada en el modelo, porque su arista apoya en las tres
+    # franjas pero sus vértices quedan fuera de cada una— choca con las tres en vez de con
+    # una. Detectar la esquina sólo contra una franja se probó y fue peor.
+    # Contactos medidos también a lo largo de las ARISTAS (`detect_contact_joints`): la
+    # esquina contra la fachada en tres franjas ahora tiene sus tres uniones. 1:100 vuelve
+    # a 1 choque y pasa de 5 a 2 uniones que no arman; 1:50 evalúa 6 esquinas más (3 bien,
+    # 3 mal) porque aparecen uniones que antes no existían.
+    "demo.obj": {50.0: (49, 10, 2), 100.0: (44, 7, 0)},
 }
 
 
@@ -712,8 +748,26 @@ def test_el_instructivo_muestra_exactamente_lo_que_se_corta(path, scale):
 # A 1:50 aparece una unión que no arma y NO es un empeoramiento: las piezas son idénticas.
 # A19 se corta en dos partes y el verificador sólo miraba la más grande; la otra choca.
 # Juzgadas las dos versiones con el verificador completo dan lo mismo.
+#   (64, 60, 1, 3)  (69, 63, 2, 4)
+#
+# Una unión "ok" menos en cada escala, y no se dejó de medir: era contacto con una losa que
+# NO existe. B5 es una losa en L de dos partes que se tocan en una esquina; el crecimiento
+# de bordes tendía la franja de lado a lado de la pieza, incluido el tramo de 4.9 m donde no
+# hay losa, y de esa astilla de 2 mm colgaba después una tira de 4.6 m (0.735 m²) sobre el
+# vacío. Ahora un borde crece sólo donde la pieza tiene material a menos de media placa.
+#   (63, 59, 1, 3)  (68, 62, 2, 4)   + el borde crece sólo donde hay material
+#   (63, 59, 1, 3)  (68, 62, 2, 4)
+#
+# Plano medio por niveles de cara y cierre de ranuras finas (ver la nota en LINEA_BASE):
+# 1:50 mejora (no arman 3 -> 2, nudos 11 -> 9); 1:100 empeora (no arman 4 -> 5) por la
+# esquina contra la fachada en tres franjas, que queda pendiente.
+#   (66, 63, 1, 2)  (73, 65, 3, 5)
+#
+# Contactos también a lo largo de las aristas: la esquina contra la fachada en franjas
+# tiene sus tres uniones y 1:100 vuelve a 2 que no arman.
+#   (68, 65, 1, 2)  (73, 68, 3, 2)
 LINEA_BASE_VEREDICTO = {
-    "demo.obj": {50.0: (64, 60, 1, 3, 14), 100.0: (69, 63, 2, 4, 10)},
+    "demo.obj": {50.0: (68, 65, 1, 2, 11), 100.0: (73, 68, 3, 2, 11)},
 }
 
 

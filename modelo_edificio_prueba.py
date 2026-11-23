@@ -197,6 +197,40 @@ def texto_casa(err=None) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Muro en dos tramos de distinto espesor, con la cara exterior a ras, y un tabique que
+# llega justo al encuentro. Es lo más común en un modelo real (un muro que cambia de
+# espesor de un lado de un tabique) y era la causa del 30 % de los problemas que el
+# instructivo atribuía al modelo.
+# ---------------------------------------------------------------------------
+
+def muro_en_tramos() -> "Obj":
+    o = Obj()
+
+    def caja(x0, x1, y0, y1, z0, z1):
+        o.solido(lambda s, v, t: (s, v, t), (x0, x1), (y0, y1), (z0, z1))
+
+    L, F, H, t = 8.0, 8.0, 2.8, 0.15
+    caja(0, L, -0.2, 0, 0, F)                 # platea
+    caja(0, L, 0, H, 0, 0.25)                 # norte
+    caja(0, L, 0, H, F - 0.25, F)             # sur
+    caja(L - 0.25, L, 0, H, 0.25, F - 0.25)   # este
+    # Oeste en dos tramos, cara exterior a ras en x = 0: 25 cm al norte del tabique y
+    # 20 cm al sur.
+    caja(0, 0.25, 0, H, 0.25, 4.0 - t / 2)
+    caja(0, 0.20, 0, H, 4.0 + t / 2, F - 0.25)
+    # Tabique de 15 cm que llega al encuentro, hasta la cara interior del tramo fino.
+    caja(0.20, L - 0.25, 0, H, 4.0 - t / 2, 4.0 + t / 2)
+    return o
+
+
+def texto_muro_en_tramos() -> str:
+    return muro_en_tramos().text(
+        "# Muro oeste en dos tramos (25 y 20 cm, cara exterior a ras) y un tabique que "
+        "llega al encuentro. Eje vertical: Y\n"
+    )
+
+
 # Aberturas CERRADAS del edificio correcto (las puertas tocan el borde: son mordidas, no
 # huecos). (ancho, alto) en metros.
 VENTANAS = {
